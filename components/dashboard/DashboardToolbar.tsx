@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { useRouter } from "next/navigation";
 import {
   Archive,
   BarChart3,
@@ -36,6 +37,7 @@ export function DashboardToolbar({
   canMutate,
   isAdmin,
 }: DashboardToolbarProps) {
+  const router = useRouter();
   const {
     toggleGuidelines,
     setUploadModalOpen,
@@ -218,6 +220,7 @@ export function DashboardToolbar({
         <Btn
           size="sm"
           className="border-slate-800 bg-slate-800 text-white hover:bg-slate-900"
+          onClick={() => router.push("/mcq-bank")}
         >
           <BarChart3 className="h-3 w-3" /> MCQ Bank
         </Btn>

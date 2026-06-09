@@ -1,0 +1,418 @@
+"use client";
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  AlertCircle,
+  ArrowLeft,
+  CheckCircle2,
+  ChevronDown,
+  ChevronUp,
+  Loader2,
+  Maximize2,
+  Minimize2,
+  RefreshCw,
+  Search,
+  Star,
+  Users,
+  X,
+  Zap,
+} from "lucide-react";
+
+interface DeptSopEntry {
+  sopId: string;
+  sopCode: string;
+  sopName: string;
+  department: string;
+  trainerName: string;
+  totalQuestions: number;
+  checkedCount: number;
+  reviewedCount: number;
+  similarCount: number;
+  mcqBanks: { id: string; language: string }[];
+  lastUpdated: string | null;
+}
+
+interface DeptStats {
+  totalQuestions: number;
+  checkedCount: number;
+  reviewedCount: number;
+  similarCount: number;
+  notChecked: number;
+}
+
+interface DeptDetailModalProps {
+  dept: string;
+  deptColor: { bg: string; badge: string };
+  onClose: () => void;
+  onViewMcqs?: (bankId: string) => void;
+}
+
+type SortKey = "sopCode" | "totalQuestions" | "checkedCount" | "reviewedCount" | "similarCount";
+
+// Map dept bg class → gradient (dark version for reference-style header)
+const DEPT_GRADIENT: Record<string, string> = {
+  "bg-violet-600":  "from-violet-600 via-violet-700 to-violet-800",
+  "bg-blue-600":    "from-blue-500 via-blue-600 to-blue-700",
+  "bg-orange-600":  "from-orange-500 via-orange-600 to-orange-700",
+  "bg-emerald-600": "from-emerald-500 via-emerald-600 to-emerald-700",
+  "bg-amber-600":   "from-amber-500 via-amber-600 to-amber-700",
+  "bg-cyan-600":    "from-cyan-500 via-cyan-600 to-cyan-700",
+  "bg-rose-600":    "from-rose-500 via-rose-600 to-rose-600",
+  "bg-slate-600":   "from-slate-500 via-slate-600 to-slate-700",
+};
+
+function fmt(n: number) { return n.toLocaleString(); }
+
+function StatusDot({ total, checked }: { total: number; checked: number }) {
+  if (total === 0) return <span className="inline-block h-2.5 w-2.5 rounded-full bg-white/10" />;
+  if (checked >= total) return <span className="inline-block h-2.5 w-2.5 rounded-full bg-emerald-400 shadow-[0_0_6px_#34d399]" />;
+  if (checked > 0) return <span className="inline-block h-2.5 w-2.5 rounded-full bg-amber-400" />;
+  return <span className="inline-block h-2.5 w-2.5 rounded-full bg-white/20" />;
+}
+
+export function DeptDetailModal({ dept, deptColor, onClose, onViewMcqs }: DeptDetailModalProps) {
+  const [sops, setSops] = useState<DeptSopEntry[]>([]);
+  const [stats, setStats] = useState<DeptStats | null>(null);
+  const [trainer, setTrainer] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [search, setSearch] = useState("");
+  const [sortKey, setSortKey] = useState<SortKey>("sopCode");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
+  const [isCinema, setIsCinema] = useState(false);
+
+  // Draggable modal
+  const [dragging, setDragging] = useState(false);
+  const [pos, setPos] = useState({ x: 0, y: 0 });
+  const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    if ((e.target as HTMLElement).closest("button") || (e.target as HTMLElement).closest("input")) return;
+    setDragging(true);
+    setDragStart({ x: e.clientX - pos.x, y: e.clientY - pos.y });
+  };
+  useEffect(() => {
+    if (!dragging) return;
+    const onMove = (e: MouseEvent) => setPos({ x: e.clientX - dragStart.x, y: e.clientY - dragStart.y });
+    const onUp = () => setDragging(false);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => { window.removeEventListener("mousemove", onMove); window.removeEventListener("mouseup", onUp); };
+  }, [dragging, dragStart]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      setLoading(true);
+      setError(null);
+      try {
+        const res = await fetch(`/api/mcq-bank/dept-sops?dept=${encodeURIComponent(dept)}`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error ?? "Failed");
+        if (!cancelled) { setSops(data.sops ?? []); setStats(data.stats ?? null); setTrainer(data.trainer ?? null); }
+      } catch (e) {
+        if (!cancelled) setError(e instanceof Error ? e.message : "Failed");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+    load();
+    return () => { cancelled = true; };
+  }, [dept]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const sorted = useMemo(() => {
+    const filtered = sops.filter((s) => {
+      if (!search) return true;
+      const lc = search.toLowerCase();
+      return s.sopCode.toLowerCase().includes(lc) || s.sopName.toLowerCase().includes(lc);
+    });
+    return [...filtered].sort((a, b) => {
+      const cmp = sortKey === "sopCode" ? a.sopCode.localeCompare(b.sopCode) : b[sortKey] - a[sortKey];
+      return sortDir === "desc" ? -cmp : cmp;
+    });
+  }, [sops, search, sortKey, sortDir]);
+
+  function toggleSort(key: SortKey) {
+    if (sortKey === key) setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    else { setSortKey(key); setSortDir("asc"); }
+  }
+
+  const gradient = DEPT_GRADIENT[deptColor.bg] ?? "from-slate-500 via-slate-600 to-slate-700";
+
+  function SortTh({ label, field }: { label: string; field: SortKey }) {
+    const active = sortKey === field;
+    return (
+      <button type="button" onClick={() => toggleSort(field)}
+        className="flex items-center gap-1 text-left text-[9px] font-black uppercase tracking-widest text-white/60 hover:text-white transition-colors">
+        {label}
+        {active
+          ? (sortDir === "asc" ? <ChevronUp className="h-3 w-3 text-white" /> : <ChevronDown className="h-3 w-3 text-white" />)
+          : null}
+      </button>
+    );
+  }
+
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 animate-in fade-in duration-300 sm:p-6 lg:p-8">
+      {/* Backdrop */}
+      <div className="absolute inset-0 cursor-pointer bg-black/60 backdrop-blur-sm" onClick={onClose} />
+
+      <div
+        className={`relative flex flex-col overflow-hidden border border-white/10 bg-[#0D1117] shadow-2xl transition-all duration-500 ${
+          isCinema ? "h-full w-full rounded-none" : "h-[92vh] w-full max-w-[90rem] rounded-[32px]"
+        }`}
+        style={!isCinema ? { transform: `translate(${pos.x}px, ${pos.y}px)` } : undefined}
+      >
+        {/* ── Gradient header ── */}
+        {!isCinema && (
+          <div
+            onMouseDown={handleMouseDown}
+            className={`relative shrink-0 cursor-grab overflow-hidden border-b border-white/5 bg-gradient-to-br px-8 py-6 shadow-lg active:cursor-grabbing animate-in slide-in-from-top duration-500 ${gradient}`}
+          >
+            <div className="relative flex items-start justify-between">
+              {/* Left: dept info */}
+              <div className="flex items-center gap-6">
+                <div className="flex h-14 w-14 items-center justify-center rounded-2xl border border-white/10 bg-white/20 shadow-[0_10px_30px_rgba(0,0,0,0.3)] text-3xl">
+                  📁
+                </div>
+
+                <div className="space-y-3">
+                  <div className="flex flex-wrap items-center gap-4">
+                    <h2 className="text-3xl font-black tracking-tight text-white leading-none">{dept}</h2>
+                    <div className="flex items-center gap-2">
+                      <span className="rounded-full border border-white/10 bg-white/10 px-3 py-1 text-[10px] font-bold uppercase tracking-widest text-white/50">
+                        Digital Repository
+                      </span>
+                      {trainer && (
+                        <div className="flex items-center gap-1.5 rounded-full border border-white/20 bg-white/10 px-3 py-1">
+                          <Users className="h-3 w-3 opacity-70 text-white" />
+                          <span className="text-[10px] font-bold uppercase tracking-widest text-white">{trainer}</span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-5">
+                    {stats && (
+                      <>
+                        <div className="flex items-center gap-2">
+                          <div className="h-1.5 w-1.5 rounded-full bg-indigo-400 shadow-[0_0_10px_#6366f1]" />
+                          <span className="text-[11px] font-bold uppercase tracking-widest text-white/60">
+                            <strong className="mr-1.5 text-white">{fmt(stats.totalQuestions)}</strong>Question Units
+                          </span>
+                        </div>
+                        <div className="h-1.5 w-1.5 rounded-full bg-white/10" />
+                        <div className="flex items-center gap-2">
+                          <div className="h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_10px_#10b981]" />
+                          <span className="text-[11px] font-bold uppercase tracking-widest text-white/60">
+                            <strong className="mr-1.5 text-white">{sops.length}</strong>Active SOPs
+                          </span>
+                        </div>
+                      </>
+                    )}
+                  </div>
+
+                  {/* Filter pill stats */}
+                  {stats && (
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {[
+                        { id: "approved", label: "Approved", count: stats.checkedCount,
+                          cls: "border-emerald-500/20 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20",
+                          icon: <CheckCircle2 className="h-3 w-3" /> },
+                        { id: "notChecked", label: "Not Checked", count: stats.notChecked,
+                          cls: "border-rose-500/20 bg-rose-500/10 text-rose-300 hover:bg-rose-500/20",
+                          icon: <AlertCircle className="h-3 w-3" /> },
+                        { id: "similar", label: "Similar", count: stats.similarCount,
+                          cls: "border-orange-500/20 bg-orange-500/10 text-orange-300 hover:bg-orange-500/20",
+                          icon: <AlertCircle className="h-3 w-3" /> },
+                        { id: "reviewed", label: "Reviewed", count: stats.reviewedCount,
+                          cls: "border-indigo-500/20 bg-indigo-500/10 text-indigo-300 hover:bg-indigo-500/20",
+                          icon: <Star className="h-3 w-3" /> },
+                      ].map((p) => (
+                        <span key={p.id}
+                          className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[8px] font-black uppercase tracking-[0.2em] transition-all ${p.cls}`}>
+                          {p.icon}
+                          {p.label}: {fmt(p.count)}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Right: actions */}
+              <div className="flex items-center gap-2">
+                <button type="button"
+                  className="flex items-center gap-2 rounded-lg border border-orange-500/20 bg-orange-500/10 px-4 py-2 text-[9px] font-bold uppercase tracking-widest text-orange-300 backdrop-blur-xl shadow-lg transition-all hover:bg-orange-500/20">
+                  <Zap className="h-3 w-3" />
+                  Bulk Smart Regen
+                </button>
+                <button type="button"
+                  className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/10 px-4 py-2 text-[9px] font-bold uppercase tracking-widest text-white backdrop-blur-xl shadow-lg transition-all hover:bg-white/20">
+                  <Star className="h-3 w-3 fill-amber-400 text-amber-400" />
+                  Review
+                </button>
+                <button type="button" onClick={() => setIsCinema(true)}
+                  className="rounded-lg border border-white/10 bg-white/5 p-2.5 shadow-md transition-all hover:bg-white/10 group">
+                  <Maximize2 className="h-4 w-4 text-white/70 transition-all duration-300 group-hover:text-white" />
+                </button>
+                <button type="button" onClick={onClose}
+                  className="rounded-lg border border-white/10 bg-white/5 p-2.5 shadow-md transition-all hover:border-rose-500/40 hover:bg-rose-500/20 group">
+                  <X className="h-4 w-4 text-white/70 transition-all duration-300 group-hover:rotate-90 group-hover:text-white" />
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ── Search / toolbar ── */}
+        <div className="shrink-0 flex items-center justify-between border-b border-white/5 bg-[#0D1117] px-6 py-3 shadow-md">
+          {isCinema && (
+            <div className="mr-4 flex items-center gap-3">
+              <button type="button" onClick={() => setIsCinema(false)}
+                className="rounded-lg border border-indigo-500/20 bg-indigo-500/10 p-2 text-indigo-400 transition-all hover:bg-indigo-500/20">
+                <Minimize2 className="h-4 w-4" />
+              </button>
+              <div>
+                <p className="text-[9px] font-black uppercase tracking-widest text-indigo-400 leading-none mb-0.5">{dept}</p>
+                <p className="text-[7px] font-bold uppercase tracking-tighter text-gray-600">Expand View Active</p>
+              </div>
+            </div>
+          )}
+
+          <div className="relative max-w-md flex-1">
+            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-500" />
+            <input type="text" value={search} onChange={(e) => setSearch(e.target.value)}
+              placeholder="Query SOPs, codes..."
+              className="w-full rounded-xl border border-white/10 bg-slate-800/40 py-2 pl-9 pr-8 text-xs text-white placeholder-gray-600 transition-all focus:border-indigo-500/50 focus:outline-none focus:ring-1 focus:ring-indigo-500/30" />
+            {search && (
+              <button type="button" onClick={() => setSearch("")}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-white transition-colors">
+                <X className="h-3 w-3" />
+              </button>
+            )}
+          </div>
+
+          <div className="ml-4 flex items-center gap-2">
+            {isCinema && (
+              <button type="button" onClick={onClose}
+                className="rounded-lg border border-white/10 bg-white/5 p-2 transition-all hover:border-rose-500/40 hover:bg-rose-500/20 group">
+                <X className="h-4 w-4 text-white/70 group-hover:text-white" />
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* ── Table ── */}
+        <div className="flex-1 overflow-auto bg-[#0D1117] p-6">
+          {loading ? (
+            <div className="flex h-64 items-center justify-center">
+              <div className="relative">
+                <div className="h-16 w-16 animate-spin rounded-full border-4 border-indigo-500/20 border-t-indigo-500" />
+                <div className="absolute inset-0 flex items-center justify-center">
+                  <Loader2 className="h-6 w-6 animate-pulse text-indigo-400" />
+                </div>
+              </div>
+            </div>
+          ) : error ? (
+            <div className="rounded-2xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-400">{error}</div>
+          ) : (
+            <div className="overflow-hidden rounded-2xl border border-white/5 bg-[#131722]">
+              <table className="w-full text-left">
+                <thead>
+                  <tr className="border-b border-white/5 bg-white/[0.02]">
+                    <th className="w-6 px-4 py-3" />
+                    <th className="px-4 py-3"><SortTh label="Protocol ID" field="sopCode" /></th>
+                    <th className="px-4 py-3 text-[9px] font-black uppercase tracking-widest text-white/60">SOP Name</th>
+                    <th className="px-4 py-3 text-center"><SortTh label="Units" field="totalQuestions" /></th>
+                    <th className="px-4 py-3 text-center"><SortTh label="Approved" field="checkedCount" /></th>
+                    <th className="px-4 py-3 text-center"><SortTh label="Reviewed" field="reviewedCount" /></th>
+                    <th className="px-4 py-3 text-center"><SortTh label="Similar" field="similarCount" /></th>
+                    <th className="px-4 py-3 text-[9px] font-black uppercase tracking-widest text-white/60">Lang</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-white/[0.03]">
+                  {sorted.length === 0 ? (
+                    <tr>
+                      <td colSpan={8} className="py-16 text-center text-sm text-gray-600">
+                        {search ? `No SOPs match "${search}"` : `No SOPs found for ${dept}`}
+                      </td>
+                    </tr>
+                  ) : (
+                    sorted.map((entry, idx) => (
+                      <tr key={`${entry.sopCode}-${idx}`}
+                        className="transition-colors hover:bg-white/[0.02]">
+                        <td className="px-4 py-3">
+                          <StatusDot total={entry.totalQuestions} checked={entry.checkedCount} />
+                        </td>
+                        <td className="whitespace-nowrap px-4 py-3">
+                          <span className="font-mono text-xs font-bold text-indigo-400">{entry.sopCode}</span>
+                        </td>
+                        <td className="max-w-[260px] px-4 py-3">
+                          <p className="line-clamp-2 text-xs font-medium text-gray-300">{entry.sopName}</p>
+                          {entry.trainerName && (
+                            <p className="truncate text-[10px] text-gray-600">{entry.trainerName}</p>
+                          )}
+                        </td>
+                        <td className="whitespace-nowrap px-4 py-3 text-center">
+                          <span className={`text-xs font-bold ${entry.totalQuestions > 0 ? "text-white" : "text-white/20"}`}>
+                            {entry.totalQuestions > 0 ? fmt(entry.totalQuestions) : "—"}
+                          </span>
+                        </td>
+                        <td className="whitespace-nowrap px-4 py-3 text-center">
+                          <span className={`text-xs font-semibold ${entry.checkedCount > 0 ? "text-emerald-400" : "text-white/20"}`}>
+                            {fmt(entry.checkedCount)}
+                          </span>
+                        </td>
+                        <td className="whitespace-nowrap px-4 py-3 text-center">
+                          <span className={`text-xs font-semibold ${entry.reviewedCount > 0 ? "text-indigo-400" : "text-white/20"}`}>
+                            {fmt(entry.reviewedCount)}
+                          </span>
+                        </td>
+                        <td className="whitespace-nowrap px-4 py-3 text-center">
+                          <span className={`text-xs font-semibold ${entry.similarCount > 0 ? "text-orange-400" : "text-white/20"}`}>
+                            {fmt(entry.similarCount)}
+                          </span>
+                        </td>
+                        <td className="whitespace-nowrap px-4 py-3">
+                          {entry.mcqBanks.length > 0 ? (
+                            <div className="flex items-center gap-1">
+                              {entry.mcqBanks.map((b) => (
+                                <button key={b.id} type="button"
+                                  onClick={() => onViewMcqs?.(b.id)}
+                                  className={`rounded-lg px-2.5 py-1 text-[9px] font-black uppercase tracking-widest transition-all border ${
+                                    b.language.toLowerCase() === "gujarati"
+                                      ? "border-orange-500/20 bg-orange-500/10 text-orange-400 hover:bg-orange-500/20"
+                                      : "border-indigo-500/20 bg-indigo-500/10 text-indigo-400 hover:bg-indigo-500/20"
+                                  }`}>
+                                  {b.language.toLowerCase() === "gujarati" ? "GU" : "EN"}
+                                </button>
+                              ))}
+                            </div>
+                          ) : (
+                            <span className="text-[10px] text-white/20">—</span>
+                          )}
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="shrink-0 border-t border-white/5 bg-[#0D1117] px-6 py-2 text-center text-[9px] font-bold uppercase tracking-widest text-gray-700">
+          {sorted.length} SOP{sorted.length !== 1 ? "s" : ""} · {dept} Department
+        </div>
+      </div>
+    </div>
+  );
+}
