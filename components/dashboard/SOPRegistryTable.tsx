@@ -32,6 +32,7 @@ import {
 import { formatUploaded } from "@/lib/sop-utils";
 import { useDashboardStore } from "@/lib/store/dashboard-store";
 import { Btn } from "./ui";
+import { DocPreviewModal } from "@/components/shared/DocPreviewModal";
 
 /* ─── SOP display helpers ────────────────────────────────────────────── */
 function displaySopCode(identifier: string): string {
@@ -48,7 +49,7 @@ function displaySopTitle(name: string, identifier: string): string {
   return stripped || name;
 }
 
-const registryTdBase = "px-1 py-px align-middle overflow-hidden max-w-0";
+const registryTdBase = "px-1 py-1 align-middle overflow-hidden max-w-0";
 
 /* ─── Media (video / slide) preview modal ────────────────────────────── */
 function isVideoUrl(url: string): boolean {
@@ -253,107 +254,6 @@ function MediaPill({
 }
 
 /* ─── Document preview modal ─────────────────────────────────────────── */
-function DocPreviewModal({
-  filePath,
-  label,
-  isPdf,
-  onClose,
-}: {
-  filePath: string;
-  label: string;
-  isPdf: boolean;
-  onClose: () => void;
-}) {
-  const origin = typeof window !== "undefined" ? window.location.origin : "";
-  const previewSrc = `/api/sops/preview?path=${encodeURIComponent(filePath)}&type=pdf`;
-  const officeEmbedSrc = !isPdf ? buildOfficeOnlineEmbedUrl(filePath, origin) : null;
-  const officeAvailable = !isPdf && isOfficePreviewAvailable(filePath, origin);
-  const downloadHref = buildPreviewHref(filePath);
-  const [iframeLoading, setIframeLoading] = useState(true);
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
-  useEffect(() => {
-    setIframeLoading(true);
-  }, [officeEmbedSrc, previewSrc]);
-
-  const modal = (
-    <div
-      className="fixed inset-0 z-100 flex items-center justify-center bg-black/60 p-4"
-      onClick={onClose}
-    >
-      <div
-        className="flex w-full max-w-5xl flex-col overflow-hidden rounded-lg bg-white shadow-2xl"
-        style={{ height: "min(90vh, 900px)" }}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="flex shrink-0 items-center justify-between border-b border-gray-200 px-4 py-2">
-          <span className="truncate text-sm font-semibold text-gray-800">{label}</span>
-          <div className="flex items-center gap-2">
-            <a
-              href={downloadHref}
-              download
-              className="inline-flex items-center gap-1 rounded border border-gray-300 bg-white px-2 py-1 text-[11px] font-medium text-gray-700 hover:bg-gray-50"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <Download className="h-3 w-3" />
-              Download
-            </a>
-            <button
-              type="button"
-              onClick={onClose}
-              className="rounded p-1 text-gray-500 hover:bg-gray-100"
-              title="Close preview"
-            >
-              <X className="h-4 w-4" />
-            </button>
-          </div>
-        </div>
-
-        <div className="relative min-h-0 flex-1 bg-white">
-          {!isPdf && !officeAvailable ? (
-            <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center text-sm text-gray-600">
-              <p>Office Online preview needs a public file URL.</p>
-              <p className="text-xs text-gray-500">
-                On localhost, use Download or deploy the app so Microsoft can reach the file.
-              </p>
-              <a
-                href={downloadHref}
-                download
-                className="inline-flex items-center gap-1 rounded border border-gray-300 bg-white px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-50"
-              >
-                <Download className="h-3.5 w-3.5" />
-                Download file
-              </a>
-            </div>
-          ) : (
-            <>
-              {iframeLoading && (
-                <div className="absolute inset-0 z-10 flex items-center justify-center bg-white text-sm text-gray-500">
-                  <Loader2 className="mr-2 h-5 w-5 animate-spin" />
-                  Loading preview…
-                </div>
-              )}
-              <iframe
-                src={isPdf ? previewSrc : officeEmbedSrc!}
-                className="absolute inset-0 h-full w-full border-0"
-                title={`Preview: ${label}`}
-                allowFullScreen
-                onLoad={() => setIframeLoading(false)}
-              />
-            </>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-
-  return createPortal(modal, document.body);
-}
 
 interface SOPRegistryTableProps {
   items: RegistrySOP[];
@@ -489,10 +389,10 @@ export function SOPRegistryTable({
               <col style={{ width: "2%" }} />
               <col style={{ width: "5.5%" }} />
               <col style={{ width: "2.5%" }} />
-              <col style={{ width: canMutate ? "16%" : "18%" }} />
+              <col style={{ width: canMutate ? "15%" : "17%" }} />
               <col style={{ width: "3.5%" }} />
               <col style={{ width: "5%" }} />
-              <col style={{ width: canMutate ? "10%" : "11%" }} />
+              <col style={{ width: canMutate ? "12%" : "13%" }} />
               <col style={{ width: "7.5%" }} />
               <col style={{ width: "3.5%" }} />
               <col style={{ width: "8.5%" }} />
@@ -571,19 +471,54 @@ export function SOPRegistryTable({
                   </div>
                 </th>
                 <th className={thBase} title="Current approved files: English first, then Gujarati when dual">
-                  <button type="button" className={sortBtn} onClick={() => onSort("fileType")}>
-                    Files <SortIcon field="fileType" />
-                  </button>
+                  <div className="flex flex-col gap-px">
+                    <button type="button" className={sortBtn} onClick={() => onSort("fileType")}>
+                      Files <SortIcon field="fileType" />
+                    </button>
+                    <select
+                      className={selBase}
+                      value={filters.fileType ?? ""}
+                      onChange={(e) => setFilter({ fileType: e.target.value || undefined })}
+                    >
+                      <option value="">All</option>
+                      <option value="DOCX">DOCX</option>
+                      <option value="No DOCX">No DOCX</option>
+                      <option value="PDF">PDF</option>
+                      <option value="No PDF">No PDF</option>
+                    </select>
+                  </div>
                 </th>
                 <th className={thBase}>
-                  <button type="button" className={sortBtn} onClick={() => onSort("videos")} title="Training videos">
-                    Video <SortIcon field="videos" />
-                  </button>
+                  <div className="flex flex-col gap-px">
+                    <button type="button" className={sortBtn} onClick={() => onSort("videos")} title="Training videos">
+                      Video <SortIcon field="videos" />
+                    </button>
+                    <select
+                      className={selBase}
+                      value={filters.media?.startsWith("Video") || filters.media?.startsWith("No Video") ? (filters.media ?? "") : ""}
+                      onChange={(e) => setFilter({ media: e.target.value || undefined })}
+                    >
+                      <option value="">All</option>
+                      <option value="Video">Has Video</option>
+                      <option value="No Video">No Video</option>
+                    </select>
+                  </div>
                 </th>
                 <th className={thBase}>
-                  <button type="button" className={sortBtn} onClick={() => onSort("slides")} title="Slide decks">
-                    Slides <SortIcon field="slides" />
-                  </button>
+                  <div className="flex flex-col gap-px">
+                    <button type="button" className={sortBtn} onClick={() => onSort("slides")} title="Slide decks">
+                      Slides <SortIcon field="slides" />
+                    </button>
+                    <select
+                      className={selBase}
+                      value={filters.media?.startsWith("Slides") || filters.media?.startsWith("No Slides") ? (filters.media ?? "") : ""}
+                      onChange={(e) => setFilter({ media: e.target.value || undefined })}
+                    >
+                      <option value="">All</option>
+                      <option value="Slides">Has Slides</option>
+                      <option value="No Slides">No Slides</option>
+                    </select>
+                  </div>
                 </th>
                 <th className={thBase}>
                   <button type="button" className={sortBtn} onClick={() => onSort("uploadedAt")} title="Upload date">
@@ -595,6 +530,18 @@ export function SOPRegistryTable({
                     <button type="button" className={sortBtn} onClick={() => onSort("expiryDate")}>
                       Expiry <SortIcon field="expiryDate" />
                     </button>
+                    <select
+                      className={selBase}
+                      value={filters.expiry ?? ""}
+                      onChange={(e) => setFilter({ expiry: e.target.value || undefined })}
+                    >
+                      <option value="">All</option>
+                      <option value="Expired">Expired</option>
+                      <option value="Near">Near (&lt;90d)</option>
+                      <option value="Medium">Medium</option>
+                      <option value="Low">Low</option>
+                      <option value="No Date">No Date</option>
+                    </select>
                   </div>
                 </th>
                 {canMutate && <th className={thBase}>Actions</th>}
@@ -670,9 +617,10 @@ const SOPRow = memo(function SOPRow({
     const absDays = Math.abs(diffDays);
     const months = Math.floor(absDays / 30);
     const remDays = absDays - months * 30;
+    const monthWord = months === 1 ? "month" : "months";
     const breakdown = months > 0 && remDays > 0
-      ? ` (${months} months ${remDays} days)`
-      : months > 0 ? ` (${months} months)` : remDays > 0 ? ` (${remDays} days)` : "";
+      ? ` (${months} ${monthWord} ${remDays} days)`
+      : months > 0 ? ` (${months} ${monthWord})` : "";
 
     let label: string;
     let colorClass: string;
@@ -814,9 +762,18 @@ const SOPRow = memo(function SOPRow({
 
         {/* Uploaded */}
         <td className={`${registryTdBase} text-[9px] leading-tight text-gray-600`}>
-          <span className="line-clamp-2 wrap-break-word" title={formatUploaded(sop.uploadedAt)}>
-            {formatUploaded(sop.uploadedAt)}
-          </span>
+          {(() => {
+            const full = formatUploaded(sop.uploadedAt);
+            const spaceIdx = full.lastIndexOf(" ");
+            const datePart = spaceIdx > 0 ? full.slice(0, spaceIdx) : full;
+            const timePart = spaceIdx > 0 ? full.slice(spaceIdx + 1) : null;
+            return (
+              <div className="flex flex-col leading-snug" title={full}>
+                <span>{datePart}</span>
+                {timePart && <span className="text-gray-400">{timePart}</span>}
+              </div>
+            );
+          })()}
         </td>
 
         {/* Expiry */}
@@ -1137,7 +1094,7 @@ function FileLink({
 
   return (
     <>
-      <div className="flex min-w-0 items-center gap-0.5 overflow-hidden">
+      <div className="flex min-w-0 items-center gap-px overflow-hidden">
         <button
           type="button"
           className="min-w-0 truncate font-bold text-[9px] text-green-600 hover:underline cursor-pointer"
@@ -1154,7 +1111,7 @@ function FileLink({
           title={`Download ${label}`}
           onClick={(e) => e.stopPropagation()}
         >
-          <Download className="h-2.5 w-2.5" />
+          <Download className="h-2 w-2" />
         </a>
       </div>
       {previewOpen && (
@@ -1170,70 +1127,89 @@ function FileLink({
 }
 
 /* ─── Prior versions cell ─────────────────────────────────────────────── */
-/** How many of the most recent prior versions to show per language. */
 const MAX_PRIOR_VERSIONS = 2;
 
-function PriorVersionsCell({ sop }: { sop: RegistrySOP }) {
-  const isDual = sop.language === "ENG-GUJ";
-  // priorVersions arrive newest-first; keep only the latest few per language.
-  const engVersions = sop.priorVersions.filter((pv) => pv.language === "ENG").slice(0, MAX_PRIOR_VERSIONS);
-  const gujVersions = sop.priorVersions.filter((pv) => pv.language === "GUJ").slice(0, MAX_PRIOR_VERSIONS);
-  const hasAny = sop.priorVersions.length > 0;
+type PriorVersion = RegistrySOP["priorVersions"][0];
 
-  if (!hasAny) {
+function PriorVersionEntry({ pv }: { pv: PriorVersion }) {
+  if (pv.missing) {
+    return (
+      <span className="inline-flex items-center gap-px leading-none whitespace-nowrap">
+        <span className="text-[9px] font-bold text-gray-400 line-through">V{pv.version}</span>
+        <span className="ml-0.5 text-[8px] italic text-amber-600">miss</span>
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex items-center gap-px leading-none whitespace-nowrap">
+      <span className="shrink-0 text-[9px] font-bold text-green-700">V{pv.version}</span>
+      <span className="mx-0.5 shrink-0 text-[8px] font-bold">
+        {pv.docx ? <FileLink filePath={pv.docx} label="DOCX" /> : <span className="text-red-500">DOCX</span>}
+      </span>
+      <span className="select-none text-[8px] text-gray-400">/</span>
+      <span className="mx-0.5 shrink-0 text-[8px] font-bold">
+        {pv.pdf ? <FileLink filePath={pv.pdf} label="PDF" isPdf /> : <span className="text-red-500">PDF</span>}
+      </span>
+    </span>
+  );
+}
+
+/* Version slot width: wide enough for "V12 DOCX / PDF" at 8-9px font */
+const PRIOR_SLOT_W = "5.5rem";
+const PRIOR_LABEL_W = "2rem";
+
+function PriorLangRow({ pvs, label }: { pvs: PriorVersion[]; label: string }) {
+  if (pvs.length === 0) return null;
+  const slots = Array.from({ length: MAX_PRIOR_VERSIONS }, (_, i) => pvs[i] ?? null);
+  return (
+    <div
+      className="grid items-center leading-none"
+      style={{ gridTemplateColumns: `${PRIOR_LABEL_W} repeat(${MAX_PRIOR_VERSIONS}, ${PRIOR_SLOT_W})` }}
+    >
+      <span className="text-[8px] font-bold uppercase text-gray-400 tabular-nums">{label}</span>
+      {slots.map((pv, i) =>
+        pv ? (
+          <div key={`${pv.version}-${pv.language}`} style={{ width: PRIOR_SLOT_W }} className="overflow-hidden">
+            <PriorVersionEntry pv={pv} />
+          </div>
+        ) : (
+          <div key={i} style={{ width: PRIOR_SLOT_W }} />
+        )
+      )}
+    </div>
+  );
+}
+
+function sortPriorDesc(pvs: PriorVersion[]): PriorVersion[] {
+  return [...pvs].sort((a, b) => (parseFloat(b.version) || 0) - (parseFloat(a.version) || 0));
+}
+
+function PriorVersionsCell({ sop }: { sop: RegistrySOP }) {
+  if (sop.priorVersions.length === 0) {
     return <span className="text-[8px] text-gray-400">—</span>;
   }
 
-  const renderVersionRow = (pvs: typeof sop.priorVersions, subLabel: string) => {
-    if (pvs.length === 0) return null;
-    return (
-      <div className="flex min-w-0 flex-row items-center gap-x-1.5 leading-none">
-        <span className="w-4.5 shrink-0 text-[8px] font-bold uppercase leading-none text-gray-400">{subLabel}</span>
-        <div className="flex min-w-0 flex-1 flex-row flex-wrap gap-x-2 gap-y-0.5 items-center">
-          {pvs.map((pv) =>
-            pv.missing ? (
-              <div
-                key={`${pv.version}-${pv.language}`}
-                className="flex min-w-0 max-w-full flex-row items-center gap-0.5"
-                title={`Version ${pv.version} was never uploaded`}
-              >
-                <span className="shrink-0 text-[9px] font-bold leading-none text-gray-400 line-through">V{pv.version}</span>
-                <span className="truncate text-[8px] font-semibold italic leading-none text-amber-600">not found</span>
-              </div>
-            ) : (
-              <div key={`${pv.version}-${pv.language}`} className="flex min-w-0 max-w-full flex-row items-center gap-1">
-                <span className="shrink-0 text-[9px] font-bold leading-none text-green-700">V{pv.version}</span>
-                <div className="flex items-center gap-0.5 leading-none text-[8px] font-bold">
-                  {pv.docx ? (
-                    <FileLink filePath={pv.docx} label="DOCX" />
-                  ) : <span className="text-red-500" title="DOCX missing">DOCX</span>}
-                  <span className="text-gray-300 select-none">/</span>
-                  {pv.pdf ? (
-                    <FileLink filePath={pv.pdf} label="PDF" isPdf />
-                  ) : <span className="text-red-500" title="PDF missing">PDF</span>}
-                </div>
-              </div>
-            ),
-          )}
-        </div>
-      </div>
-    );
-  };
+  const isDual = sop.language === "ENG-GUJ";
+  const all = sortPriorDesc(sop.priorVersions);
 
   if (isDual) {
-    const fallback = sop.priorVersions.slice(0, MAX_PRIOR_VERSIONS);
+    const eng = all.filter((pv) => pv.language === "ENG").slice(0, MAX_PRIOR_VERSIONS);
+    const guj = all.filter((pv) => pv.language === "GUJ").slice(0, MAX_PRIOR_VERSIONS);
     return (
-      <div className="flex min-w-0 flex-col gap-1 py-0 leading-none">
-        {engVersions.length > 0 && renderVersionRow(engVersions, "ENG")}
-        {gujVersions.length > 0 && renderVersionRow(gujVersions, "GUJ")}
-        {engVersions.length === 0 && gujVersions.length === 0 && renderVersionRow(fallback, "ENG")}
+      <div className="flex flex-col gap-0.5">
+        <PriorLangRow pvs={eng} label="ENG" />
+        <PriorLangRow pvs={guj} label="GUJ" />
       </div>
     );
   }
 
-  const subLabel = sop.language === "GUJ" ? "GUJ" : "ENG";
-  const single = sop.priorVersions.slice(0, MAX_PRIOR_VERSIONS);
-  return renderVersionRow(single, subLabel);
+  const langCode = sop.language === "GUJ" ? "GUJ" : "ENG";
+  const label = langCode;
+  // Include entries matching the SOP language, plus any untagged legacy entries
+  const pvs = all
+    .filter((pv) => pv.language === langCode || !pv.language)
+    .slice(0, MAX_PRIOR_VERSIONS);
+  return <PriorLangRow pvs={pvs} label={label} />;
 }
 
 /* ─── Shared helper: render media pills for one language row ─────────── */

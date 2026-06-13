@@ -3,8 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "node scripts/seed-admin.mjs && next dev",
+    "dev": "node scripts/seed-admin.mjs && node scripts/seed-lms.mjs && next dev",
     "seed:admin": "node scripts/seed-admin.mjs",
+    "seed:lms": "node scripts/seed-lms.mjs",
     "build": "next build",
     "start": "next start",
     "lint": "eslint"

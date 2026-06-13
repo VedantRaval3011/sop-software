@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { connectDB } from "@/lib/mongodb";
 import SOP from "@/models/SOP";
-import { buildDashboardStats, groupSOPRecords } from "@/lib/sop-utils";
+import { buildDashboardStats, groupSOPRecords, sortByDeptOrder } from "@/lib/sop-utils";
 import {
   getServerGroupedCache,
   setServerGroupedCache,
@@ -21,9 +21,9 @@ export async function GET() {
       setServerGroupedCache(registry);
     }
     const stats = buildDashboardStats(registry);
-    const departments = [
+    const departments = sortByDeptOrder([
       ...new Set(registry.filter((r) => !r.isObsolete).map((r) => r.department)),
-    ].sort();
+    ]);
 
     return NextResponse.json({ ...stats, departmentList: departments });
   } catch (error) {

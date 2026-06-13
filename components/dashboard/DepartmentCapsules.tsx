@@ -118,15 +118,19 @@ function LangPairPills({
 /* ─── Format-labelled lang pair sub-row (DOCX/PDF + EN/GJ pills) ──────── */
 function FormatLangPairRow({
   formatLabel, l1, f1, m1, l2, f2, m2,
+  onF1, onM1, onF2, onM2,
 }: {
   formatLabel: string;
   l1: string; f1: number; m1: number;
   l2: string; f2: number; m2: number;
+  onF1?: () => void; onM1?: () => void;
+  onF2?: () => void; onM2?: () => void;
 }) {
   return (
     <div className="mt-0.5 flex min-h-[20px] w-full items-center justify-between gap-1 px-1 py-0 text-[9px]">
       <span className="inline-block w-[30px] shrink-0 font-medium text-gray-400">{formatLabel}</span>
-      <LangPairPills l1={l1} f1={f1} m1={m1} l2={l2} f2={f2} m2={m2} />
+      <LangPairPills l1={l1} f1={f1} m1={m1} l2={l2} f2={f2} m2={m2}
+        onF1={onF1} onM1={onM1} onF2={onF2} onM2={onM2} />
     </div>
   );
 }
@@ -268,11 +272,19 @@ function DepartmentCard({
           formatLabel="DOCX"
           l1="EN" f1={cap.docx.en.found} m1={cap.docx.en.missing}
           l2="GJ" f2={cap.docx.gu.found} m2={cap.docx.gu.missing}
+          onF1={() => onFilter({ fileType: "DOCX", language: "ENG" })}
+          onM1={() => onFilter({ fileType: "No DOCX", language: "ENG" })}
+          onF2={() => onFilter({ fileType: "DOCX", language: "GUJ" })}
+          onM2={() => onFilter({ fileType: "No DOCX", language: "GUJ" })}
         />
         <FormatLangPairRow
           formatLabel="PDF"
           l1="EN" f1={cap.pdf.en.found} m1={cap.pdf.en.missing}
           l2="GJ" f2={cap.pdf.gu.found} m2={cap.pdf.gu.missing}
+          onF1={() => onFilter({ fileType: "PDF", language: "ENG" })}
+          onM1={() => onFilter({ fileType: "No PDF", language: "ENG" })}
+          onF2={() => onFilter({ fileType: "PDF", language: "GUJ" })}
+          onM2={() => onFilter({ fileType: "No PDF", language: "GUJ" })}
         />
 
         {/* Version Dates */}
@@ -287,6 +299,10 @@ function DepartmentCard({
         <LangPairPills
           l1="ENG" f1={cap.versionDate.en?.found ?? 0} m1={cap.versionDate.en?.missing ?? 0}
           l2="GUJ" f2={cap.versionDate.gu?.found ?? 0} m2={cap.versionDate.gu?.missing ?? 0}
+          onF1={() => onFilter({ versionDate: "found", language: "ENG" })}
+          onM1={() => onFilter({ versionDate: "missing", language: "ENG" })}
+          onF2={() => onFilter({ versionDate: "found", language: "GUJ" })}
+          onM2={() => onFilter({ versionDate: "missing", language: "GUJ" })}
         />
 
         {/* Videos */}
@@ -311,6 +327,46 @@ function DepartmentCard({
           onF2={() => onFilter({ media: "Video", language: "GUJ" })}
           onM2={() => onFilter({ media: "No Video", language: "GUJ" })}
         />
+        {/* Explainer (EX) + Brief (BR) side by side — clickable */}
+        <div className="flex min-h-5.5 w-full items-center justify-between gap-1 px-1 py-0 text-[9px]">
+          {(["EX", "BR"] as const).map((tag) => {
+            const isEx = tag === "EX";
+            const counts = isEx ? cap.explainerVideos : cap.briefVideos;
+            const foundFilter = isEx ? "Explainer" : "Brief";
+            const missingFilter = isEx ? "No Explainer" : "No Brief";
+            return (
+              <div key={tag} className="flex items-center gap-0.5">
+                <button
+                  type="button"
+                  onClick={(e) => { e.preventDefault(); e.stopPropagation(); onFilter({ videoType: foundFilter }); }}
+                  className="min-w-fit cursor-pointer rounded px-0.5 text-[9px] font-medium text-gray-500 hover:text-purple-700 focus:outline-none focus:ring-1 focus:ring-purple-400"
+                  title={`Show SOPs with ${tag === "EX" ? "Explainer" : "Brief"} video`}
+                >
+                  {tag}
+                </button>
+                <div className="inline-flex shrink-0 items-center gap-0.5 rounded-md border border-gray-200/80 bg-white/90 px-0.5 py-0.5 shadow-sm tabular-nums">
+                  <button
+                    type="button"
+                    onClick={(e) => { e.preventDefault(); e.stopPropagation(); onFilter({ videoType: foundFilter }); }}
+                    className="min-w-[1.3rem] cursor-pointer rounded px-0.5 py-0 text-center text-[10px] font-bold leading-tight text-emerald-700 hover:bg-emerald-50 focus:outline-none focus:ring-1 focus:ring-emerald-400"
+                    title={`${counts?.found ?? 0} SOPs have ${tag === "EX" ? "Explainer" : "Brief"} video`}
+                  >
+                    {counts?.found ?? 0}
+                  </button>
+                  <span className="select-none text-[7px] leading-tight text-gray-300">|</span>
+                  <button
+                    type="button"
+                    onClick={(e) => { e.preventDefault(); e.stopPropagation(); onFilter({ videoType: missingFilter }); }}
+                    className="min-w-[1.3rem] cursor-pointer rounded px-0.5 py-0 text-center text-[10px] font-bold leading-tight text-red-600 hover:bg-red-50 focus:outline-none focus:ring-1 focus:ring-red-400"
+                    title={`${counts?.missing ?? 0} SOPs missing ${tag === "EX" ? "Explainer" : "Brief"} video`}
+                  >
+                    {counts?.missing ?? 0}
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
 
         {/* Slides */}
         <div className="h-1" />
@@ -346,6 +402,7 @@ export function DepartmentCapsules({ capsules }: DepartmentCapsulesProps) {
       expiry: undefined,
       fileType: undefined,
       media: undefined,
+      videoType: undefined,
       versionStatus: undefined,
       versionDate: undefined,
       dualLanguage: undefined,

@@ -65,7 +65,7 @@ import {
   ChevronRight,
 } from 'lucide-react';
 import * as XLSX from 'xlsx';
-import { buildViewDocHref } from '@/lib/viewDocLinks';
+import { DocPreviewModal } from '@/components/shared/DocPreviewModal';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -5139,6 +5139,60 @@ export default function TrainingMatrixPage() {
     );
   }
 
+  function DocxPreviewButtons({
+    sopCode,
+    docIdentifier,
+    engDocxPath,
+    gujDocxPath,
+    isDualLanguage,
+  }: {
+    sopCode: string;
+    docIdentifier?: string;
+    engDocxPath?: string;
+    gujDocxPath?: string;
+    isDualLanguage?: boolean;
+  }) {
+    const [preview, setPreview] = useState<{ path: string; label: string } | null>(null);
+    return (
+      <div className="flex flex-col items-start justify-center leading-none min-w-0">
+        {engDocxPath ? (
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); setPreview({ path: engDocxPath, label: `${docIdentifier || sopCode} — English` }); }}
+            className="text-[9px] font-bold text-emerald-700 hover:underline whitespace-nowrap"
+            title={`Preview ENG DOCX for ${sopCode}`}
+          >
+            ENG DOCX
+          </button>
+        ) : (
+          <span className="text-[9px] font-bold text-black whitespace-nowrap" title="No ENG DOCX">ENG —</span>
+        )}
+        {isDualLanguage ? (
+          gujDocxPath ? (
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); setPreview({ path: gujDocxPath, label: `${docIdentifier || sopCode} — Gujarati` }); }}
+              className="text-[9px] font-bold text-emerald-700 hover:underline whitespace-nowrap"
+              title={`Preview GUJ DOCX for ${sopCode}`}
+            >
+              GUJ DOCX
+            </button>
+          ) : (
+            <span className="text-[9px] font-bold text-black whitespace-nowrap" title="No GUJ DOCX">GUJ —</span>
+          )
+        ) : null}
+        {preview && (
+          <DocPreviewModal
+            filePath={preview.path}
+            label={preview.label}
+            isPdf={false}
+            onClose={() => setPreview(null)}
+          />
+        )}
+      </div>
+    );
+  }
+
   function SopRowGrid({
     accent,
     bgTint,
@@ -5221,38 +5275,13 @@ export default function TrainingMatrixPage() {
           <span className={`text-[10px] font-semibold truncate ${trainer ? 'text-emerald-700' : 'text-red-500'}`} title={trainer || 'No Trainer'}>
             {trainer || 'No Trainer'}
           </span>
-          <div className="flex flex-col items-start justify-center leading-none min-w-0">
-            {engDocxPath ? (
-              <a
-                href={buildViewDocHref(engDocxPath, docIdentifier || sopCode, 'English')}
-                target="_blank"
-                rel="noopener noreferrer"
-                onClick={(e) => e.stopPropagation()}
-                className="text-[9px] font-bold text-emerald-700 hover:underline whitespace-nowrap"
-                title={`Open ENG DOCX for ${sopCode}`}
-              >
-                ENG DOCX
-              </a>
-            ) : (
-              <span className="text-[9px] font-bold text-black whitespace-nowrap" title="No ENG DOCX">ENG —</span>
-            )}
-            {isDualLanguage ? (
-              gujDocxPath ? (
-                <a
-                  href={buildViewDocHref(gujDocxPath, docIdentifier || sopCode, 'Gujarati')}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  onClick={(e) => e.stopPropagation()}
-                  className="text-[9px] font-bold text-emerald-700 hover:underline whitespace-nowrap"
-                  title={`Open GUJ DOCX for ${sopCode}`}
-                >
-                  GUJ DOCX
-                </a>
-              ) : (
-                <span className="text-[9px] font-bold text-black whitespace-nowrap" title="No GUJ DOCX">GUJ —</span>
-              )
-            ) : null}
-          </div>
+          <DocxPreviewButtons
+            sopCode={sopCode}
+            docIdentifier={docIdentifier}
+            engDocxPath={engDocxPath}
+            gujDocxPath={gujDocxPath}
+            isDualLanguage={isDualLanguage}
+          />
           {mcqMetrics}
           <span
             className={`text-[9px] font-semibold text-center truncate ${targetDate

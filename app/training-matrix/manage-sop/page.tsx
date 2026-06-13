@@ -136,8 +136,10 @@ interface ManageSOPViewResponse {
 }
 
 const MANAGE_SOP_VIEW_LOCAL_CACHE_KEY = 'manage_sop_view_cache_v3';
-const ESTIMATED_ROW_HEIGHT = 132;
-const ROW_OVERSCAN = 5;
+// Initial guess only — the real estimate is measured from rendered rows at runtime
+// (see rowHeightEstimate) because row heights vary with view mode and content.
+const ESTIMATED_ROW_HEIGHT = 176;
+const ROW_OVERSCAN = 6;
 
 function readManageSopLocalCache(): ManageSOPViewResponse | null {
   try {
@@ -211,11 +213,17 @@ const GrandTotalText = memo(function GrandTotalText() {
 export default function ManageSOPDashboard() {
   useAuthGuard();
 
-  // Synchronous first paint from localStorage (hard refresh feels instant).
-  const [viewData, setViewData] = useState<ManageSOPViewResponse | null>(() => readManageSopLocalCache());
-  const [loading, setLoading] = useState(() => readManageSopLocalCache() === null);
+  // Start with null/loading=true (matches SSR output) then hydrate from localStorage
+  // on the client in the effect below. Initializing from localStorage inside useState
+  // causes a hydration mismatch because the server always sees window=undefined (null)
+  // while the client may find cached data — the two renders produce different HTML.
+  const [viewData, setViewData] = useState<ManageSOPViewResponse | null>(null);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [search, setSearch] = useState('');
+  // Department filter — '' = all departments, otherwise only SOPs that belong to the
+  // selected department are shown.
+  const [deptFilter, setDeptFilter] = useState('');
   const [sortKey, setSortKey] = useState<SortKey>('sr');
   const [sortDir, setSortDir] = useState<SortDir>('asc');
   // Card filter — drives which SOPs the table shows when the user clicks a stat card.
@@ -757,9 +765,16 @@ export default function ManageSOPDashboard() {
   };
 
   useEffect(() => {
+    // Hydrate from localStorage first so the page feels instant — this runs only on
+    // the client, after hydration, so it can't cause a server/client HTML mismatch.
+    const cached = readManageSopLocalCache();
+    if (cached) {
+      setViewData(cached);
+      setLoading(false);
+    }
+
     const fetchData = async (refresh = false) => {
       try {
-        if (!viewData) setLoading(true);
         const url = `/api/training-matrix/manage-sop-view?year=all${refresh ? '&refresh=1' : ''}`;
         const res = await fetch(url, { cache: 'no-store' });
         if (!res.ok) throw new Error('Failed to fetch');
@@ -774,7 +789,7 @@ export default function ManageSOPDashboard() {
         }
         setError('');
       } catch (err) {
-        if (!viewData) {
+        if (!cached) {
           setError(err instanceof Error ? err.message : 'Unknown error');
         }
         console.error(err);
@@ -824,6 +839,19 @@ export default function ManageSOPDashboard() {
       return resolved;
     };
 
+    const departmentsList = viewData.departments || [];
+    const deptsToSearch = deptFilter ? [deptFilter] : departmentsList;
+    const employeesByDept = viewData.employeesByDept || EMPTY_EMP_BY_DEPT;
+
+    // "Belongs to" a department when the SOP is scheduled / assigned / has training
+    // records there, or the dept is its registry primary. Mirrors countsForDept, which
+    // is declared later in the component, so we inline the predicate to stay in-scope.
+    const belongsToDept = (sop: ManageSOPViewResponse['sops'][0], dept: string): boolean => {
+      const ds = sop.deptStats.find(s => s.department === dept);
+      if (ds?.isScheduled || ds?.isAssigned || (ds?.total || 0) > 0) return true;
+      return sop.primaryDepartment === dept;
+    };
+
     const base = viewData.sops.filter(sop => {
       const code = (sop.sopCode || '').trim();
       const name = (sop.sopName || '').trim();
@@ -835,48 +863,36 @@ export default function ManageSOPDashboard() {
       if (cardFilter === 'unassigned' && !unassignedSet.has(code.toUpperCase())) return false;
       if (cardFilter === 'assigned' && unassignedSet.has(code.toUpperCase())) return false;
 
+      // Department filter — show only SOPs that belong to the selected department.
+      if (deptFilter && !belongsToDept(sop, deptFilter)) return false;
+
       if (q) {
-        const textMatch =
-          code.toLowerCase().includes(q) || name.toLowerCase().includes(q);
-        if (textMatch) return true;
+        // 1) Direct SOP code / name match.
+        if (code.toLowerCase().includes(q) || name.toLowerCase().includes(q)) return true;
 
-        // Employee-name search should match only when that employee is actually
-        // allocated (training checked + at least one selected month in that dept).
-        const sopOverrides = overrides[sop.sopCode] || EMPTY_INNER;
-        const sopMonth = monthCells[sop.sopCode] || EMPTY_INNER;
-        const sopManual = viewData.manualAllocations?.[sop.sopCode.toUpperCase()] || EMPTY_MANUAL;
+        // 2) Employee-name match. An SOP is "related to" an employee when that
+        // employee's designation is assigned/trained for this SOP in the employee's
+        // department. This intentionally does NOT require a month to be selected, so a
+        // plain name search like "Baldev" surfaces every SOP that person is responsible
+        // for — not just ones already allocated.
         const sopManualDesigs =
-          viewData.manualDesignations?.[sop.sopCode.toUpperCase()] || EMPTY_MANUAL_DESIG;
-        const employeesByDept = viewData.employeesByDept || EMPTY_EMP_BY_DEPT;
+          viewData.manualDesignations?.[code.toUpperCase()] || EMPTY_MANUAL_DESIG;
 
-        for (const dept of viewData.departments || []) {
+        for (const dept of deptsToSearch) {
+          const emps = employeesByDept[dept];
+          if (!emps || emps.length === 0) continue;
+          const nameMatches = emps.filter(emp => norm(emp.name).includes(q));
+          if (nameMatches.length === 0) continue;
+
           const deptStat = sop.deptStats.find(s => s.department === dept);
-          const manualMonths = sopManual[dept] || [];
-          let hasSelectedMonth = false;
-          for (let m = 1; m <= 12; m++) {
-            const key = cellInnerKey(dept, m);
-            const persisted = manualMonths.includes(m) || deptStat?.scheduledMonth === m;
-            const selected = key in sopMonth ? !!sopMonth[key] : persisted;
-            if (selected) { hasSelectedMonth = true; break; }
+          const assignedDesigs = new Set<string>();
+          for (const d of deptStat?.designations || []) {
+            if (d.isAssigned || (d.count || 0) > 0) assignedDesigs.add(norm(d.designation));
           }
-          if (!hasSelectedMonth) continue;
+          for (const d of sopManualDesigs[dept] || []) assignedDesigs.add(norm(d));
+          if (assignedDesigs.size === 0) continue;
 
-          const selectedDesigs = new Set(
-            allDesignationsRef.current.filter((fullName) => {
-              const key = desigKey(dept, fullName);
-              if (key in sopOverrides) return !!sopOverrides[key];
-              return (deptStat?.designations || []).some(
-                (d) => d.designation === fullName && (d.isAssigned || (d.count || 0) > 0),
-              ) || (sopManualDesigs[dept] || []).some((d) => d === fullName);
-            }).map(norm),
-          );
-
-          if (selectedDesigs.size === 0) continue;
-          const emps = employeesByDept[dept] || [];
-          const hasEmpMatch = emps.some((emp) =>
-            norm(emp.name).includes(q) && selectedDesigs.has(norm(emp.designation)),
-          );
-          if (hasEmpMatch) return true;
+          if (nameMatches.some(emp => assignedDesigs.has(norm(emp.designation)))) return true;
         }
         return false;
       }
@@ -906,10 +922,27 @@ export default function ManageSOPDashboard() {
           va = (a.sopName || '').toLowerCase();
           vb = (b.sopName || '').toLowerCase();
           break;
-        case 'dept':
-          va = primaryDeptForSort(a).toLowerCase();
-          vb = primaryDeptForSort(b).toLowerCase();
-          break;
+        case 'dept': {
+          // Use canonical department order (same as server-side SR sort) so clicking
+          // DEPT shows QA → QC → Microbiology → Production → Store → Engineering →
+          // Personnel instead of alphabetical order. SOPs with no resolved primary
+          // department are ranked last so all known-dept SOPs appear first.
+          const DEPT_RANK: Record<string, number> = {
+            QA: 0, QC: 1, Microbiology: 2, Production: 3,
+            Store: 4, Engineering: 5, Personnel: 6,
+          };
+          const da = primaryDeptForSort(a);
+          const db = primaryDeptForSort(b);
+          const ra = da ? (DEPT_RANK[da] ?? 7) : 8;
+          const rb = db ? (DEPT_RANK[db] ?? 7) : 8;
+          if (ra !== rb) return sortDir === 'asc' ? ra - rb : rb - ra;
+          // Tie-break within the same department: sort by sopCode
+          const ca = (a.sopCode || '').toLowerCase();
+          const cb = (b.sopCode || '').toLowerCase();
+          if (ca < cb) return sortDir === 'asc' ? -1 : 1;
+          if (ca > cb) return sortDir === 'asc' ? 1 : -1;
+          return 0;
+        }
         case 'designation':
           va = designationCount(a);
           vb = designationCount(b);
@@ -929,7 +962,10 @@ export default function ManageSOPDashboard() {
     };
 
     return sortKey === 'sr' ? base : [...base].sort(cmp);
-  }, [viewData, deferredSearch, sortKey, sortDir, cardFilter, unassignedSet, overrides, monthCells, EMPTY_INNER, EMPTY_MANUAL, EMPTY_MANUAL_DESIG, EMPTY_EMP_BY_DEPT]);
+    // Search now derives employee matches from persisted assignment data (viewData),
+    // not the live `overrides` / `monthCells` edit state — so typing in the search box
+    // (or ticking checkboxes) no longer forces a full re-filter + re-window of the list.
+  }, [viewData, deferredSearch, deptFilter, sortKey, sortDir, cardFilter, unassignedSet, EMPTY_MANUAL_DESIG, EMPTY_EMP_BY_DEPT]);
 
   // Per-SOP per-dept "counts toward this department" predicate.
   // True if the SOP is scheduled for the dept, OR assigned to the dept, OR if the dept
@@ -1271,21 +1307,25 @@ export default function ManageSOPDashboard() {
   const [scrollWidth, setScrollWidth] = useState(0);
   const [tableScrollTop, setTableScrollTop] = useState(0);
   const [tableViewportHeight, setTableViewportHeight] = useState(720);
+  // Measured average row height — keeps the virtualizer's spacer padding accurate so
+  // the scrollbar geometry matches reality and the view doesn't jump while scrolling.
+  const [rowHeightEstimate, setRowHeightEstimate] = useState(ESTIMATED_ROW_HEIGHT);
   const syncing = useRef<'main' | 'proxy' | null>(null);
+  const scrollRafRef = useRef<number | null>(null);
 
   const windowedRange = useMemo(() => {
     const total = filteredSops.length;
     if (total === 0) return { start: 0, end: 0, topPad: 0, bottomPad: 0 };
-    const start = Math.max(0, Math.floor(tableScrollTop / ESTIMATED_ROW_HEIGHT) - ROW_OVERSCAN);
-    const visibleCount = Math.ceil(tableViewportHeight / ESTIMATED_ROW_HEIGHT) + ROW_OVERSCAN * 2;
+    const start = Math.max(0, Math.floor(tableScrollTop / rowHeightEstimate) - ROW_OVERSCAN);
+    const visibleCount = Math.ceil(tableViewportHeight / rowHeightEstimate) + ROW_OVERSCAN * 2;
     const end = Math.min(total, start + visibleCount);
     return {
       start,
       end,
-      topPad: start * ESTIMATED_ROW_HEIGHT,
-      bottomPad: Math.max(0, (total - end) * ESTIMATED_ROW_HEIGHT),
+      topPad: start * rowHeightEstimate,
+      bottomPad: Math.max(0, (total - end) * rowHeightEstimate),
     };
-  }, [filteredSops.length, tableScrollTop, tableViewportHeight]);
+  }, [filteredSops.length, tableScrollTop, tableViewportHeight, rowHeightEstimate]);
 
   const windowedSops = useMemo(
     () => filteredSops.slice(windowedRange.start, windowedRange.end),
@@ -1304,7 +1344,42 @@ export default function ManageSOPDashboard() {
     const ro = new ResizeObserver(update);
     ro.observe(el);
     return () => ro.disconnect();
-  }, [viewData, sortKey, sortDir, search, filteredSops.length]);
+  }, [viewData, filteredSops.length]);
+
+  // Measure rendered rows and feed the average height back into the virtualizer. Row
+  // heights vary widely (employee view, wrapped SOP names, 7-department stacks), so a
+  // fixed estimate makes the top/bottom spacers wrong and the scroll position drift.
+  //
+  // IMPORTANT: this must NOT re-run as a consequence of rowHeightEstimate changing,
+  // or it feeds back on itself (estimate → window slice → measured average → estimate)
+  // and never converges ("Maximum update depth exceeded"). So we deliberately key it
+  // only on inputs that are independent of the estimate — view mode, result-set size,
+  // and viewport height — and read the current window via the ref instead of deps.
+  useLayoutEffect(() => {
+    const el = tableScrollRef.current;
+    if (!el) return;
+    const rows = el.querySelectorAll('tr[data-sop-row="1"]');
+    let sum = 0;
+    let count = 0;
+    rows.forEach((r) => {
+      const h = (r as HTMLElement).offsetHeight;
+      if (h > 0) { sum += h; count += 1; }
+    });
+    if (count === 0) return;
+    const avg = sum / count;
+    // Only commit meaningfully different averages so this can't loop on sub-pixel noise.
+    setRowHeightEstimate(prev => (Math.abs(prev - avg) > 4 ? avg : prev));
+  }, [viewMode, filteredSops.length, tableViewportHeight]);
+
+  // Land on the first matching row whenever the result set changes (search / filters /
+  // sort), instead of keeping a stale — and now meaningless — scroll offset.
+  // useLayoutEffect (not useEffect) so the DOM scroll resets before the browser paints —
+  // otherwise the virtualizer renders one frame with the old scroll position, which
+  // shows only the 1–2 rows that happened to be visible at the bottom of the list.
+  useLayoutEffect(() => {
+    if (tableScrollRef.current) tableScrollRef.current.scrollTop = 0;
+    setTableScrollTop(0);
+  }, [deferredSearch, deptFilter, cardFilter, sortKey, sortDir]);
 
   const mirrorScroll = (source: 'main' | 'proxy', from: HTMLDivElement | null) => {
     if (!from) return;
@@ -1316,7 +1391,14 @@ export default function ManageSOPDashboard() {
   const onMainScroll = () => {
     if (syncing.current && syncing.current !== 'main') { syncing.current = null; return; }
     mirrorScroll('main', tableScrollRef.current);
-    if (tableScrollRef.current) setTableScrollTop(tableScrollRef.current.scrollTop);
+    // Coalesce vertical-scroll updates to one per animation frame. The windowing math
+    // keys off tableScrollTop, so updating it on every raw scroll event caused a
+    // re-render storm and the laggy scrolling users reported.
+    if (scrollRafRef.current != null) return;
+    scrollRafRef.current = requestAnimationFrame(() => {
+      scrollRafRef.current = null;
+      if (tableScrollRef.current) setTableScrollTop(tableScrollRef.current.scrollTop);
+    });
   };
   const onProxyScroll = () => {
     if (syncing.current && syncing.current !== 'proxy') { syncing.current = null; return; }
@@ -1405,15 +1487,30 @@ export default function ManageSOPDashboard() {
               <Search className="absolute left-3 top-2.5 text-gray-400 w-5 h-5" />
               <input
                 type="text"
-                placeholder="Search SOP No or Name..."
+                placeholder="Search SOP No, Name or Employee..."
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
                 className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg bg-white text-gray-900 placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
               />
             </div>
-            <button className="p-2 border border-gray-300 rounded hover:bg-gray-50 text-gray-600">
-              <Filter className="w-4 h-4" />
-            </button>
+            <div className="relative">
+              <Filter className="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 pointer-events-none" />
+              <select
+                value={deptFilter}
+                onChange={(e) => setDeptFilter(e.target.value)}
+                className={`pl-8 pr-3 py-2 border rounded-lg bg-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 ${
+                  deptFilter ? 'border-blue-500 text-blue-700 font-medium' : 'border-gray-300 text-gray-700'
+                }`}
+                title="Filter SOPs by department"
+              >
+                <option value="">All Departments</option>
+                {departments.map((dept) => (
+                  <option key={`deptopt-${dept}`} value={dept}>
+                    {DEPT_ABBR[dept] || dept}
+                  </option>
+                ))}
+              </select>
+            </div>
             <button
               onClick={applyChanges}
               disabled={applying}
@@ -1445,8 +1542,22 @@ export default function ManageSOPDashboard() {
               <Download className="w-4 h-4" />
               Export
             </button>
-            <div className="text-sm text-gray-600">
-              {filteredSops.length} SOPs
+            <div className="flex items-center gap-2">
+              <div className={`text-sm font-medium ${filteredSops.length < (viewData?.sops?.length ?? 0) ? 'text-amber-600' : 'text-gray-600'}`}>
+                {filteredSops.length} SOPs
+                {filteredSops.length < (viewData?.sops?.length ?? 0) && (
+                  <span className="ml-1 text-xs text-amber-500">(filtered)</span>
+                )}
+              </div>
+              {(cardFilter !== 'all' || deptFilter || search) && (
+                <button
+                  type="button"
+                  onClick={() => { setCardFilter('all'); setDeptFilter(''); setSearch(''); }}
+                  className="text-xs text-blue-600 hover:text-blue-800 underline"
+                >
+                  Clear filters
+                </button>
+              )}
             </div>
           </div>
 
@@ -2187,8 +2298,8 @@ const SopRow = memo(function SopRow({
 
   return (
     <tr
+      data-sop-row="1"
       className={`border-b border-gray-200 ${rowHover} align-top`}
-      style={{ contentVisibility: 'auto', containIntrinsicSize: `auto ${ESTIMATED_ROW_HEIGHT}px` }}
     >
       {/* SR NO */}
       <td className={`w-10 px-2 py-3 text-center font-medium text-gray-900 ${rowBg} align-top`}>

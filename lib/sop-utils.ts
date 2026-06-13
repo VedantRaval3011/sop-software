@@ -25,6 +25,28 @@ import {
 } from "@/lib/sop-name-resolution";
 import { nameFromFilename } from "@/lib/sop-filename";
 
+export const DEPARTMENT_ORDER = [
+  "QA",
+  "QC",
+  "Microbiology",
+  "Production",
+  "Store",
+  "Engineering and Maintenance",
+  "Warehouse/Store",
+  "Personnel",
+];
+
+export function sortByDeptOrder(departments: string[]): string[] {
+  return [...departments].sort((a, b) => {
+    const ai = DEPARTMENT_ORDER.indexOf(a);
+    const bi = DEPARTMENT_ORDER.indexOf(b);
+    if (ai === -1 && bi === -1) return a.localeCompare(b);
+    if (ai === -1) return 1;
+    if (bi === -1) return -1;
+    return ai - bi;
+  });
+}
+
 const NEAR_EXPIRY_DAYS = 90;
 const MEDIUM_EXPIRY_DAYS = 180;
 
@@ -455,7 +477,33 @@ export function groupSOPRecords(records: ISOP[]): RegistrySOP[] {
     );
 
     const hasVersion = group.some((r) => r.version || versionFromIdentifier(r.identifier));
-    const hasVersionDate = currentRecords.some((r) => r.effectiveDate);
+
+    // Version date = every prior-version DOCX for a language has a real effectiveDate.
+    // "Real" means it differs from uploadedAt by >10 s (rules out the upload-timestamp
+    // placeholder that was auto-stamped on old records).
+    const currentVersionNum = versionNumber(currentVersion);
+    const isRealDate = (r: ISOP): boolean => {
+      if (!r.effectiveDate) return false;
+      return (
+        Math.abs(new Date(r.effectiveDate).getTime() - new Date(r.uploadedAt).getTime()) > 10_000
+      );
+    };
+    const priorDocxEn = group.filter(
+      (r) => recordVersionNum(r) < currentVersionNum && r.fileType === "docx" && r.language !== "Gujarati",
+    );
+    const priorDocxGu = group.filter(
+      (r) => recordVersionNum(r) < currentVersionNum && r.fileType === "docx" && r.language === "Gujarati",
+    );
+    // every() on an empty array is vacuously true — SOPs with no prior history
+    // are not "missing" version dates; only SOPs whose prior DOCXs exist but
+    // lack a real effectiveDate count as missing.
+    const hasVersionDateEn = priorDocxEn.every(isRealDate);
+    const hasVersionDateGu = priorDocxGu.every(isRealDate);
+    const hasVersionDate = (() => {
+      const langNeedsEn = language === "ENG" || language === "ENG-GUJ";
+      const langNeedsGu = language === "GUJ" || language === "ENG-GUJ";
+      return (langNeedsEn ? hasVersionDateEn : true) && (langNeedsGu ? hasVersionDateGu : true);
+    })();
     const priorVersions = buildPriorVersions(group, currentVersion);
 
     const displayIdentifier =
@@ -492,9 +540,16 @@ export function groupSOPRecords(records: ISOP[]): RegistrySOP[] {
         const { videos, slides } = collectMediaUrls(currentRecords);
         return { videos, slides };
       })(),
+      videoFileNames: currentRecords.flatMap(
+        (r) => (r.sopDocuments ?? [])
+          .filter((d) => d.fileType?.toLowerCase() === "video" && d.fileName)
+          .map((d) => d.fileName!.toLowerCase()),
+      ),
       priorVersions,
       hasVersion,
       hasVersionDate,
+      hasVersionDateEn,
+      hasVersionDateGu,
       expiryTier: getExpiryTier(expiryDate),
       mcqCount: currentRecords.reduce((sum, r) => sum + (r.mcqCount ?? 0), 0),
     });
@@ -506,27 +561,20 @@ export function groupSOPRecords(records: ISOP[]): RegistrySOP[] {
 function buildPriorVersions(group: ISOP[], currentVersion: string) {
   const currentNum = versionNumber(currentVersion);
 
-  // Map uploaded prior-version files by "<versionNumber>-<lang>".
-  const uploaded = new Map<string, { docx?: string; pdf?: string }>();
+  // Collect every uploaded prior-version file, keyed by "<versionNum>-<lang>".
+  const uploaded = new Map<string, { versionNum: number; version: string; lang: string; docx?: string; pdf?: string }>();
   for (const record of group) {
     const num = recordVersionNum(record);
     if (num >= currentNum) continue;
     const lang = record.language === "Gujarati" ? "GUJ" : "ENG";
     const key = `${num}-${lang}`;
-    const entry = uploaded.get(key) ?? {};
+    const entry = uploaded.get(key) ?? { versionNum: num, version: recordVersion(record), lang };
     applyRecordFileLinks(record, entry);
     uploaded.set(key, entry);
   }
 
-  // Always surface the two versions immediately below the current one (e.g. v5 → v4, v3),
-  // per language the SOP family uses. Uploaded versions get file links; the rest are flagged
-  // as missing so the table can show "not found". This updates automatically as new versions
-  // are uploaded (the previous current version drops in here with its files).
-  const familyLang = resolveLanguage(group);
-  const familyLangs = familyLang === "ENG-GUJ" ? ["ENG", "GUJ"] : [familyLang];
-  const top = Math.floor(currentNum) - 1;
-  const bottom = Math.max(1, top - 1);
-
+  // Build result from every actually-uploaded prior version (no synthetic "missing" entries).
+  // Each language tracks its own independent version sequence.
   const result: Array<{
     version: string;
     language: string;
@@ -535,18 +583,12 @@ function buildPriorVersions(group: ISOP[], currentVersion: string) {
     missing?: boolean;
   }> = [];
 
-  for (const lang of familyLangs) {
-    for (let v = top; v >= bottom; v--) {
-      const files = uploaded.get(`${v}-${lang}`);
-      if (files && (files.docx || files.pdf)) {
-        result.push({ version: String(v), language: lang, docx: files.docx, pdf: files.pdf });
-      } else {
-        result.push({ version: String(v), language: lang, missing: true });
-      }
-    }
+  for (const { version, lang, docx, pdf } of uploaded.values()) {
+    if (!docx && !pdf) continue;
+    result.push({ version, language: lang, docx, pdf });
   }
 
-  // Newest first.
+  // Newest first — guarantees correct descending order for every language independently.
   return result.sort((a, b) => versionNumber(b.version) - versionNumber(a.version));
 }
 
@@ -597,10 +639,28 @@ export function applyFilters(items: RegistrySOP[], filters: SOPFilters): Registr
     result = result.filter((s) => matchMedia(s, filters.media!));
   }
 
+  if (filters.videoType) {
+    result = result.filter((s) => matchVideoType(s, filters.videoType!));
+  }
+
   if (filters.versionStatus === "found") {
-    result = result.filter((s) => s.hasVersion);
+    result = result.filter((s) => {
+      const needsEn = s.language === "ENG" || s.language === "ENG-GUJ";
+      const needsGu = s.language === "GUJ" || s.language === "ENG-GUJ";
+      return (
+        (needsEn ? hasFile(s.files.docx, "en") && hasFile(s.files.pdf, "en") : true) &&
+        (needsGu ? hasFile(s.files.docx, "gu") && hasFile(s.files.pdf, "gu") : true)
+      );
+    });
   } else if (filters.versionStatus === "missing") {
-    result = result.filter((s) => !s.hasVersion);
+    result = result.filter((s) => {
+      const needsEn = s.language === "ENG" || s.language === "ENG-GUJ";
+      const needsGu = s.language === "GUJ" || s.language === "ENG-GUJ";
+      return !(
+        (needsEn ? hasFile(s.files.docx, "en") && hasFile(s.files.pdf, "en") : true) &&
+        (needsGu ? hasFile(s.files.docx, "gu") && hasFile(s.files.pdf, "gu") : true)
+      );
+    });
   }
 
   if (filters.versionDate === "found") {
@@ -686,9 +746,37 @@ function matchMedia(s: RegistrySOP, media: string): boolean {
   }
 }
 
+function hasVideoKeyword(sop: RegistrySOP, keyword: string): boolean {
+  const strs = [
+    ...(sop.mediaUrls?.videos?.en ?? []).map((u) => u.toLowerCase()),
+    ...(sop.mediaUrls?.videos?.gu ?? []).map((u) => u.toLowerCase()),
+    ...(sop.videoFileNames ?? []),
+  ];
+  return strs.some((s) => s.includes(keyword));
+}
+
+function matchVideoType(s: RegistrySOP, videoType: string): boolean {
+  switch (videoType) {
+    case "Explainer": return hasVideoKeyword(s, "explainer");
+    case "No Explainer": return !hasVideoKeyword(s, "explainer");
+    case "Brief": return hasVideoKeyword(s, "brief");
+    case "No Brief": return !hasVideoKeyword(s, "brief");
+    default: return true;
+  }
+}
+
+function deptOrderCompare(a: string, b: string): number {
+  const ai = DEPARTMENT_ORDER.indexOf(a);
+  const bi = DEPARTMENT_ORDER.indexOf(b);
+  if (ai === -1 && bi === -1) return a.localeCompare(b);
+  if (ai === -1) return 1;
+  if (bi === -1) return -1;
+  return ai - bi;
+}
+
 function sortRegistry(
   items: RegistrySOP[],
-  sortBy = "identifier",
+  sortBy = "department",
   sortDir: "asc" | "desc" = "asc",
 ): RegistrySOP[] {
   const dir = sortDir === "desc" ? -1 : 1;
@@ -699,8 +787,10 @@ function sortRegistry(
     switch (sortBy) {
       case "name":
         return compare(a.name.toLowerCase(), b.name.toLowerCase());
-      case "department":
-        return compare(a.department, b.department);
+      case "department": {
+        const deptCmp = deptOrderCompare(a.department, b.department) * dir;
+        return deptCmp !== 0 ? deptCmp : a.identifier.localeCompare(b.identifier);
+      }
       case "location":
         return compare(a.location ?? "", b.location ?? "");
       case "version":
@@ -758,6 +848,8 @@ function buildCapsule(department: string, sops: RegistrySOP[]): DepartmentCapsul
       en: { available: 0, missing: 0 },
       gu: { available: 0, missing: 0 },
     },
+    explainerVideos: { found: 0, missing: 0 },
+    briefVideos: { found: 0, missing: 0 },
     slides: {
       available: 0,
       required: sops.length,
@@ -788,17 +880,21 @@ function buildCapsule(department: string, sops: RegistrySOP[]): DepartmentCapsul
       }
     }
 
-    if (sop.hasVersion) capsule.version.found++;
+    const hasCompleteFiles =
+      (needsEn(sop) ? hasFile(sop.files.docx, "en") && hasFile(sop.files.pdf, "en") : true) &&
+      (needsGu(sop) ? hasFile(sop.files.docx, "gu") && hasFile(sop.files.pdf, "gu") : true);
+    if (hasCompleteFiles) capsule.version.found++;
     else capsule.version.missing++;
 
-    if (sop.hasVersionDate) {
-      capsule.versionDate.found++;
-      if (needsEn(sop)) capsule.versionDate.en.found++;
-      if (needsGu(sop)) capsule.versionDate.gu.found++;
-    } else {
-      capsule.versionDate.missing++;
-      if (needsEn(sop)) capsule.versionDate.en.missing++;
-      if (needsGu(sop)) capsule.versionDate.gu.missing++;
+    if (sop.hasVersionDate) capsule.versionDate.found++;
+    else capsule.versionDate.missing++;
+    if (needsEn(sop)) {
+      if (sop.hasVersionDateEn) capsule.versionDate.en.found++;
+      else capsule.versionDate.en.missing++;
+    }
+    if (needsGu(sop)) {
+      if (sop.hasVersionDateGu) capsule.versionDate.gu.found++;
+      else capsule.versionDate.gu.missing++;
     }
 
     const totalVideos = sop.media.videos.en + sop.media.videos.gu;
@@ -817,6 +913,18 @@ function buildCapsule(department: string, sops: RegistrySOP[]): DepartmentCapsul
     capsule.slides.en.missing += needsEn(sop) && sop.media.slides.en === 0 ? 1 : 0;
     capsule.slides.gu.available += sop.media.slides.gu;
     capsule.slides.gu.missing += needsGu(sop) && sop.media.slides.gu === 0 ? 1 : 0;
+
+    const allVideoStrings = [
+      ...(sop.mediaUrls?.videos?.en ?? []).map((u) => u.toLowerCase()),
+      ...(sop.mediaUrls?.videos?.gu ?? []).map((u) => u.toLowerCase()),
+      ...(sop.videoFileNames ?? []),
+    ];
+    const hasExplainer = allVideoStrings.some((s) => s.includes("explainer"));
+    const hasBrief = allVideoStrings.some((s) => s.includes("brief"));
+    if (hasExplainer) capsule.explainerVideos.found++;
+    else capsule.explainerVideos.missing++;
+    if (hasBrief) capsule.briefVideos.found++;
+    else capsule.briefVideos.missing++;
   }
 
   return capsule;
@@ -824,7 +932,7 @@ function buildCapsule(department: string, sops: RegistrySOP[]): DepartmentCapsul
 
 export function buildDashboardStats(registry: RegistrySOP[]): DashboardStats {
   const active = registry.filter((s) => !s.isObsolete);
-  const departments = [...new Set(active.map((s) => s.department))].sort();
+  const departments = sortByDeptOrder([...new Set(active.map((s) => s.department))]);
   const deptCapsules = departments.map((d) =>
     buildCapsule(d, active.filter((s) => s.department === d)),
   );
@@ -860,6 +968,7 @@ export function parseFiltersFromSearchParams(params: URLSearchParams): SOPFilter
     language: params.get("language") ?? undefined,
     fileType: params.get("fileType") ?? undefined,
     media: params.get("media") ?? undefined,
+    videoType: params.get("videoType") ?? undefined,
     expiry: params.get("expiry") ?? undefined,
     versionStatus: params.get("versionStatus") ?? undefined,
     versionDate: params.get("versionDate") ?? undefined,
@@ -869,7 +978,7 @@ export function parseFiltersFromSearchParams(params: URLSearchParams): SOPFilter
     dateFrom: params.get("dateFrom") ?? undefined,
     dateTo: params.get("dateTo") ?? undefined,
     locations: params.getAll("location"),
-    sortBy: params.get("sortBy") ?? "identifier",
+    sortBy: params.get("sortBy") ?? "department",
     sortDir: (params.get("sortDir") as "asc" | "desc") ?? "asc",
     page: parseInt(params.get("page") ?? "1", 10),
     limit: parseInt(params.get("limit") ?? "50", 10),

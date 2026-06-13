@@ -184,7 +184,6 @@ export async function processSopUpload(formData: FormData) {
         sop = await SOP.create({
           ...sharedFields,
           expiryDate: dateFields.expiryDate ?? defaultExpiryDate(24),
-          effectiveDate: dateFields.effectiveDate ?? new Date(),
           status: "uploaded",
           pipelineStatus: generateMcq ? "mcq_generating" : "idle",
         });

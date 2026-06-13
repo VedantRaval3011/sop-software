@@ -369,18 +369,13 @@ async function buildManageSopViewResponse(
 
     // Exact DB SOP universe from Training Matrix overview (dbSopCount, e.g. 427).
     const overviewDbSopCodes = new Map<string, string>();
-    const overviewByDept = (
-      overviewCached as {
-        totalCard?: {
-          dbSopsByDept?: Record<
-            string,
-            Array<{ sopCode?: string; title?: string }>
-          >;
-        };
-      } | null
-    )?.totalCard?.dbSopsByDept;
-    if (overviewByDept) {
-      for (const list of Object.values(overviewByDept)) {
+    const populateOverviewDbSopCodes = (
+      dbSopsByDept?:
+        | Record<string, Array<{ sopCode?: string; title?: string }>>
+        | null,
+    ): void => {
+      if (!dbSopsByDept) return;
+      for (const list of Object.values(dbSopsByDept)) {
         if (!Array.isArray(list)) continue;
         for (const item of list) {
           const base = stripVersion(String(item?.sopCode || ""));
@@ -388,6 +383,51 @@ async function buildManageSopViewResponse(
           overviewDbSopCodes.set(base, String(item?.title || "").trim());
         }
       }
+    };
+
+    // Resolve the Training Matrix overview payload. BOTH the row universe
+    // (canonicalEntries below) and the Total card (dbSopCount) must come from THIS
+    // payload's dbSop universe. Otherwise, when the overview cache is cold, the rows
+    // fall back to the larger dashboard-registry / training-record set while the Total
+    // card uses the overview's dbSopCount — and the two disagree (e.g. 428 rows vs 418
+    // total). So we hydrate it HERE, before building the rows, rather than later.
+    let overviewData: any = overviewCached || null;
+    populateOverviewDbSopCodes(
+      (
+        overviewCached as {
+          totalCard?: {
+            dbSopsByDept?: Record<
+              string,
+              Array<{ sopCode?: string; title?: string }>
+            >;
+          };
+        } | null
+      )?.totalCard?.dbSopsByDept,
+    );
+    if (overviewDbSopCodes.size === 0) {
+      if (!overviewData) {
+        try {
+          const overviewRes = await fetch(
+            `${request.nextUrl.origin}/api/training-matrix/overview`,
+            { cache: "no-store" },
+          );
+          if (overviewRes.ok) overviewData = await overviewRes.json();
+        } catch {
+          // Non-fatal — rows fall back to canonicalRows / sopSet below.
+        }
+      }
+      populateOverviewDbSopCodes(
+        (
+          overviewData as {
+            totalCard?: {
+              dbSopsByDept?: Record<
+                string,
+                Array<{ sopCode?: string; title?: string }>
+              >;
+            };
+          } | null
+        )?.totalCard?.dbSopsByDept,
+      );
     }
 
     // Build designation set per department AND count employees per dept per designation,
@@ -837,38 +877,9 @@ async function buildManageSopViewResponse(
     //   • perDept[d].excelDeptSplit.unknownMissing → unknown-owner red counts
     //   • perDept[d].missingFromExcelList         → the actual codes those reds represent
     // The Manage SOP page just mirrors these.
-    // If the overview cache is cold, hydrate once from the overview API route so
-    // Manage SOP cards/filters stay aligned with Training Matrix.
-    let overviewData: any = overviewCached || null;
-    if (!overviewData) {
-      try {
-        const overviewRes = await fetch(
-          `${request.nextUrl.origin}/api/training-matrix/overview`,
-          { cache: "no-store" },
-        );
-        if (overviewRes.ok) overviewData = await overviewRes.json();
-      } catch {
-        // Non-fatal; we'll still derive fallbacks below.
-      }
-    }
-
-    // Rebuild dbSop universe from overview payload when cache did not provide it.
-    if (overviewDbSopCodes.size === 0) {
-      const dbSopsByDept =
-        (overviewData as {
-          totalCard?: {
-            dbSopsByDept?: Record<string, Array<{ sopCode?: string; title?: string }>>;
-          };
-        } | null)?.totalCard?.dbSopsByDept || {};
-      for (const list of Object.values(dbSopsByDept)) {
-        if (!Array.isArray(list)) continue;
-        for (const item of list) {
-          const base = stripVersion(String(item?.sopCode || ""));
-          if (!base || overviewDbSopCodes.has(base)) continue;
-          overviewDbSopCodes.set(base, String(item?.title || "").trim());
-        }
-      }
-    }
+    // overviewData (and the overviewDbSopCodes universe derived from it) was already
+    // resolved above — before the rows were built — so the row count and the Total
+    // card stay aligned. Nothing more to hydrate here.
 
     const overviewDbSopCount = (
       overviewData as { totalCard?: { dbSopCount?: number } } | null

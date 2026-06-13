@@ -8,6 +8,7 @@ import {
   Volume2, Trophy, X, Award,
 } from 'lucide-react';
 import type { JourneyStep } from '@/app/api/lms/journey/[sopCode]/route';
+import { buildOfficeOnlineEmbedUrl, buildPreviewHref } from '@/lib/file-urls';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -293,10 +294,11 @@ function PdfStep({
   }
 
   const isDocx = step.fileType === 'docx' || step.url.toLowerCase().endsWith('.docx');
-  // Office Online requires a publicly accessible URL — works on deployed instances.
+  const origin = typeof window !== 'undefined' ? window.location.origin : '';
+  // Office Online requires a publicly accessible URL routed through the file proxy.
   const viewerSrc = isDocx
-    ? `https://view.officeapps.live.com/op/embed.aspx?src=${encodeURIComponent(step.url)}`
-    : step.url;
+    ? buildOfficeOnlineEmbedUrl(step.url, origin)
+    : buildPreviewHref(step.url);
 
   return (
     <div className="flex flex-1 flex-col gap-3">

@@ -44,7 +44,7 @@ interface DashboardState {
 
 const defaultFilters: SOPFilters = {
   searchField: "All",
-  sortBy: "identifier",
+  sortBy: "department",
   sortDir: "asc",
   page: 1,
   // No pagination — the table scrolls internally, so load every match.

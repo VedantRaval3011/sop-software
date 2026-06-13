@@ -43,9 +43,12 @@ export interface RegistrySOP {
     videos: MediaFileLinks;
     slides: MediaFileLinks;
   };
+  videoFileNames: string[];
   priorVersions: PriorVersion[];
   hasVersion: boolean;
   hasVersionDate: boolean;
+  hasVersionDateEn: boolean;
+  hasVersionDateGu: boolean;
   expiryTier: ExpiryTier;
   mcqCount: number;
 }
@@ -133,6 +136,8 @@ export interface DepartmentCapsule {
     en: { available: number; missing: number };
     gu: { available: number; missing: number };
   };
+  explainerVideos: { found: number; missing: number };
+  briefVideos: { found: number; missing: number };
   slides: {
     available: number;
     required: number;
@@ -164,6 +169,7 @@ export interface SOPFilters {
   language?: string;
   fileType?: string;
   media?: string;
+  videoType?: string;
   expiry?: string;
   versionStatus?: string;
   versionDate?: string;
