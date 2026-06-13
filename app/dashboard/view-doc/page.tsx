@@ -1,125 +1,101 @@
 'use client';
 
-import { Suspense, useState } from 'react';
-import { useSearchParams } from 'next/navigation';
-import { Download, Loader2, ExternalLink } from 'lucide-react';
-import { buildOfficeOnlineEmbedUrl, buildPublicFileUrl, isOfficePreviewAvailable } from '@/lib/file-urls';
-import { buildDocxDownloadHref, buildPdfDownloadHref } from '@/lib/viewDocLinks';
+import { useSearchParams, useRouter } from 'next/navigation';
+import { useAuthGuard } from '@/hooks/useAuthGuard';
+import { useEffect, Suspense } from 'react';
+import Link from 'next/link';
+import DocxPreviewClient, { type DocxViewerPreference } from '../components/DocxPreviewClient';
+import PdfPreviewClient from '../components/PdfPreviewClient';
 
-function ViewDocContent() {
-  const params = useSearchParams();
-  const path = params.get('path') ?? '';
-  const identifier = params.get('identifier') ?? '';
-  const language = params.get('language') ?? '';
-  const [iframeLoading, setIframeLoading] = useState(true);
+function pathLooksPdf(p: string | null): boolean {
+  if (!p) return false;
+  const base = p.trim().split(/[?#]/)[0].toLowerCase();
+  return base.endsWith('.pdf');
+}
 
-  const origin = typeof window !== 'undefined' ? window.location.origin : '';
-  const isPdf = path.toLowerCase().endsWith('.pdf');
-  const isDocx = path.toLowerCase().endsWith('.docx') || path.toLowerCase().endsWith('.doc');
-
-  const publicFileUrl = buildPublicFileUrl(path, origin);
-  const officeEmbedSrc = isDocx ? buildOfficeOnlineEmbedUrl(path, origin) : null;
-  const officeAvailable = isDocx && isOfficePreviewAvailable(path, origin);
-  const pdfSrc = isPdf ? `/api/sops/file?path=${encodeURIComponent(path)}` : null;
-
-  const downloadHref = isDocx
-    ? (buildDocxDownloadHref(path, identifier || null, language || null) ?? publicFileUrl)
-    : buildPdfDownloadHref(path, identifier || undefined, language || undefined);
-
-  const title = [identifier, language].filter(Boolean).join(' — ') || 'Document Preview';
-
-  if (!path) {
-    return (
-      <div className="flex h-screen items-center justify-center text-gray-500">
-        No document path provided.
-      </div>
-    );
-  }
-
+/** Side-by-side EN+GUJ preview removed — redirect to single-language view (English default). */
+function DualLegacyRedirect({ identifier }: { identifier: string }) {
+  const router = useRouter();
+  useEffect(() => {
+    router.replace(`/dashboard/view-doc?identifier=${encodeURIComponent(identifier)}`);
+  }, [identifier, router]);
   return (
-    <div className="flex h-screen flex-col bg-white">
-      {/* Header */}
-      <div className="flex shrink-0 items-center justify-between border-b border-gray-200 bg-white px-4 py-2 shadow-sm">
-        <span className="truncate text-sm font-semibold text-gray-800">{title}</span>
-        <div className="flex items-center gap-2">
-          {isDocx && officeEmbedSrc && (
-            <a
-              href={officeEmbedSrc}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center gap-1 rounded border border-gray-300 bg-white px-2 py-1 text-[11px] font-medium text-gray-700 hover:bg-gray-50"
-            >
-              <ExternalLink className="h-3 w-3" />
-              Office Online
-            </a>
-          )}
-          <a
-            href={downloadHref}
-            download
-            className="inline-flex items-center gap-1 rounded border border-gray-300 bg-white px-2 py-1 text-[11px] font-medium text-gray-700 hover:bg-gray-50"
-          >
-            <Download className="h-3 w-3" />
-            Download
-          </a>
-        </div>
-      </div>
-
-      {/* Viewer */}
-      <div className="relative min-h-0 flex-1 bg-gray-100">
-        {isDocx && !officeAvailable && (
-          <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center text-sm text-gray-600">
-            <p className="font-medium">Office Online preview requires a public URL.</p>
-            <p className="text-xs text-gray-500">
-              On localhost, Microsoft cannot reach the file server. Download the file or deploy the
-              app to preview it online.
-            </p>
-            <a
-              href={downloadHref}
-              download
-              className="inline-flex items-center gap-1.5 rounded border border-gray-300 bg-white px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-50"
-            >
-              <Download className="h-3.5 w-3.5" />
-              Download file
-            </a>
-          </div>
-        )}
-
-        {(isPdf || (isDocx && officeAvailable)) && (
-          <>
-            {iframeLoading && (
-              <div className="absolute inset-0 z-10 flex items-center justify-center bg-white text-sm text-gray-500">
-                <Loader2 className="mr-2 h-5 w-5 animate-spin" />
-                Loading preview…
-              </div>
-            )}
-            <iframe
-              src={isPdf ? pdfSrc! : officeEmbedSrc!}
-              className="absolute inset-0 h-full w-full border-0"
-              title={title}
-              allowFullScreen
-              onLoad={() => setIframeLoading(false)}
-            />
-          </>
-        )}
-
-        {!isPdf && !isDocx && (
-          <div className="flex h-full items-center justify-center text-sm text-gray-500">
-            Unsupported file type. <a href={publicFileUrl} className="ml-1 text-blue-600 underline">Open directly</a>
-          </div>
-        )}
-      </div>
+    <div className="flex min-h-screen flex-col items-center justify-center gap-3 bg-gray-100 p-6">
+      <div className="h-9 w-9 animate-spin rounded-full border-4 border-purple-600 border-t-transparent" />
+      <p className="text-center text-sm text-gray-600">
+        Opening document preview… Use the <strong>English</strong> or <strong>Gujarati</strong> DOCX/PDF link from the registry
+        for the language you need.
+      </p>
+      <Link href="/dashboard" className="text-sm font-semibold text-purple-600 hover:underline">
+        ← Back to Dashboard
+      </Link>
     </div>
   );
 }
 
-export default function ViewDocPage() {
+function SingleDocView() {
+  const searchParams = useSearchParams();
+  const pathParam = searchParams.get('path');
+  const identifierParam = searchParams.get('identifier');
+  const languageParam = searchParams.get('language');
+  const v = (searchParams.get('viewer') || '').toLowerCase();
+  const viewerPreference: DocxViewerPreference = v === 'google' ? 'google' : 'office';
+
+  if (pathParam && pathLooksPdf(pathParam)) {
+    return (
+      <PdfPreviewClient
+        pathParam={pathParam}
+        identifierParam={identifierParam}
+        languageParam={languageParam}
+      />
+    );
+  }
+
   return (
-    <Suspense fallback={
-      <div className="flex h-screen items-center justify-center text-gray-500">
-        <Loader2 className="mr-2 h-5 w-5 animate-spin" />
-        Loading…
-      </div>
-    }>
+    <DocxPreviewClient
+      pathParam={pathParam}
+      identifierParam={identifierParam}
+      languageParam={languageParam}
+      viewerPreference={viewerPreference}
+    />
+  );
+}
+
+function ViewDocContent() {
+  const searchParams = useSearchParams();
+  const dual = searchParams.get('dual') === '1';
+  const identifier = searchParams.get('identifier')?.trim();
+
+  if (dual) {
+    if (!identifier) {
+      return (
+        <div className="flex min-h-screen items-center justify-center bg-gray-100 p-4">
+          <div className="max-w-md text-center text-sm text-gray-600">
+            Add <code className="rounded bg-gray-200 px-1">identifier</code> to open a document, or use DOCX/PDF links from the
+            registry.
+            <Link href="/dashboard" className="mt-4 block font-semibold text-purple-600 hover:underline">
+              ← Back to Dashboard
+            </Link>
+          </div>
+        </div>
+      );
+    }
+    return <DualLegacyRedirect identifier={identifier} />;
+  }
+
+  return <SingleDocView />;
+}
+
+export default function ViewDocPage() {
+  useAuthGuard();
+  return (
+    <Suspense
+      fallback={
+        <div className="flex min-h-screen items-center justify-center bg-gray-100">
+          <div className="h-10 w-10 animate-spin rounded-full border-4 border-purple-600 border-t-transparent" />
+        </div>
+      }
+    >
       <ViewDocContent />
     </Suspense>
   );
