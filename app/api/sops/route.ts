@@ -15,6 +15,8 @@ import {
 } from "@/lib/cache";
 import { requireAuth } from "@/lib/withAuth";
 
+export const dynamic = "force-dynamic";
+
 export async function GET(request: NextRequest) {
   const auth = await requireAuth(["admin", "trainer", "viewer"]);
   if (auth.error) return auth.error;
@@ -31,12 +33,10 @@ export async function GET(request: NextRequest) {
     const filtered = applyFilters(grouped, filters);
     const { items, total } = paginate(filtered, filters.page, filters.limit);
 
-    return NextResponse.json({
-      items,
-      total,
-      page: filters.page,
-      limit: filters.limit,
-    });
+    return NextResponse.json(
+      { items, total, page: filters.page, limit: filters.limit },
+      { headers: { "Cache-Control": "no-store" } },
+    );
   } catch (error) {
     console.error("GET /api/sops error:", error);
     return NextResponse.json(

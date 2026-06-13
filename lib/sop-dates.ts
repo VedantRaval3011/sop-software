@@ -181,7 +181,17 @@ export function resolveSopDatesFromContent(content: string): ResolvedSopDates {
   let reviewDate = extracted.reviewDate;
 
   if (!expiryDate && reviewDate) {
-    expiryDate = reviewDate;
+    const now = new Date();
+    if (reviewDate > now) {
+      // Future review date = the document's stated next-review / expiry date.
+      expiryDate = reviewDate;
+    } else {
+      // Past review date = the date the SOP was last reviewed (effectively its
+      // version date). Compute the actual expiry by adding the validity period
+      // from the best available anchor date.
+      const anchor = effectiveDate ?? reviewDate;
+      expiryDate = addMonths(anchor, validityPeriod);
+    }
   }
 
   if (!expiryDate && effectiveDate) {

@@ -37,6 +37,15 @@ export function DashboardClient() {
   const userIsAdmin = isAdmin(role);
   const [stats, setStats] = useState<DashboardStats | null>(null);
   const [departmentList, setDepartmentList] = useState<string[]>([]);
+
+  const handleDepartmentAdded = useCallback((name: string) => {
+    setDepartmentList((prev) => (prev.includes(name) ? prev : [...prev, name]));
+  }, []);
+
+  const handleDepartmentDeleted = useCallback((name: string) => {
+    setDepartmentList((prev) => prev.filter((d) => d !== name));
+  }, []);
+
   const [items, setItems] = useState<RegistrySOP[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -68,12 +77,16 @@ export function DashboardClient() {
   const query = useMemo(() => filtersToQuery(filters), [filters]);
 
   const fetchStats = useCallback(async () => {
-    const res = await fetch("/api/sops/stats");
-    if (!res.ok) throw new Error("Failed to load stats");
-    const data = await res.json();
-    setStats(data);
-    setDepartmentList(data.departmentList ?? []);
-    writeClientCache(DASHBOARD_STATS_CACHE_KEY, "stats", data);
+    try {
+      const res = await fetch(`/api/sops/stats?_t=${Date.now()}`, { cache: "no-store" });
+      if (!res.ok) throw new Error(`Stats fetch failed: ${res.status}`);
+      const data = await res.json();
+      setStats(data);
+      setDepartmentList(data.departmentList ?? []);
+      writeClientCache(DASHBOARD_STATS_CACHE_KEY, "stats", data);
+    } catch (e) {
+      console.error("fetchStats error:", e);
+    }
   }, []);
 
   const fetchSops = useCallback(async () => {
@@ -116,7 +129,7 @@ export function DashboardClient() {
 
   const refresh = useCallback(async () => {
     bustDashboardCache();
-    await Promise.all([fetchStats(), fetchSops()]);
+    await Promise.allSettled([fetchStats(), fetchSops()]);
   }, [fetchStats, fetchSops]);
 
   useEffect(() => {
@@ -207,18 +220,24 @@ export function DashboardClient() {
       )}
 
       {stats && (
-        <DepartmentCapsules capsules={stats.departments} />
+        <DepartmentCapsules
+          capsules={stats.departments}
+          onDepartmentAdded={handleDepartmentAdded}
+          onDepartmentDeleted={handleDepartmentDeleted}
+        />
       )}
 
-      <SOPRegistryTable
-        items={items}
-        total={total}
-        loading={loading}
-        departments={departmentList}
-        onSort={handleSort}
-        onRefresh={refresh}
-        canMutate={userCanMutate}
-      />
+      <div id="sop-registry">
+        <SOPRegistryTable
+          items={items}
+          total={total}
+          loading={loading}
+          departments={departmentList}
+          onSort={handleSort}
+          onRefresh={refresh}
+          canMutate={userCanMutate}
+        />
+      </div>
 
       <FilterSidebar sops={items} />
       <GuidelinesPanel />

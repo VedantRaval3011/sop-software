@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ImageIcon, Loader2, Pencil, Presentation, Video, X } from "lucide-react";
 import type { EditSOPFormData, EditSOPPayload } from "@/lib/types";
 import { useDashboardStore } from "@/lib/store/dashboard-store";
@@ -61,7 +61,18 @@ export function EditSOPModal({
   const [newSlides, setNewSlides] = useState<File[]>([]);
   const [newThumbnail, setNewThumbnail] = useState<File[]>([]);
 
-  const allDepts = [...new Set([...DEPARTMENTS, ...departmentList])];
+  // Keep latest callbacks in refs so the load effect doesn't depend on them.
+  // Without this, an inline onClose prop would cause the form to re-fetch and
+  // reset while the user is mid-edit whenever the parent re-renders.
+  const onCloseRef = useRef(onClose);
+  const showToastRef = useRef(showToast);
+  useEffect(() => { onCloseRef.current = onClose; }, [onClose]);
+  useEffect(() => { showToastRef.current = showToast; }, [showToast]);
+
+  const allDepts = useMemo(
+    () => [...new Set([...DEPARTMENTS, ...departmentList])],
+    [departmentList],
+  );
   const existingVideos = useMemo(
     () => [...(form.videos.en ?? []), ...(form.videos.gu ?? [])],
     [form.videos],
@@ -94,8 +105,8 @@ export function EditSOPModal({
       })
       .catch((err) => {
         if (!cancelled) {
-          showToast(err instanceof Error ? err.message : "Failed to load SOP");
-          onClose();
+          showToastRef.current(err instanceof Error ? err.message : "Failed to load SOP");
+          onCloseRef.current();
         }
       })
       .finally(() => {
@@ -105,7 +116,7 @@ export function EditSOPModal({
     return () => {
       cancelled = true;
     };
-  }, [open, identifier, onClose, showToast]);
+  }, [open, identifier]); // intentionally excludes onClose/showToast — use refs above
 
   const updateField = <K extends keyof EditSOPFormData>(key: K, value: EditSOPFormData[K]) => {
     setForm((prev) => ({ ...prev, [key]: value }));
@@ -336,7 +347,7 @@ export function EditSOPModal({
               <label className={`block ${labelClass}`}>
                 Remarks
                 <textarea
-                  className={`${inputClass} min-h-[72px] resize-y`}
+                  className={`${inputClass} min-h-18 resize-y`}
                   value={form.remarks ?? ""}
                   onChange={(e) => updateField("remarks", e.target.value)}
                   placeholder="Add any notes or remarks about this SOP..."

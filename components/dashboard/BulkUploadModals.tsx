@@ -175,6 +175,7 @@ export function SopFolderUploadModal({
   const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
   const [results, setResults] = useState<UploadResult[]>([]);
   const [department, setDepartment] = useState("");
+  const [uploadLang, setUploadLang] = useState<"English" | "Gujarati">("English");
   const [generateMcq, setGenerateMcq] = useState(false);
 
   const reset = () => {
@@ -182,6 +183,7 @@ export function SopFolderUploadModal({
     setResults([]);
     setUploadProgress(null);
     setDepartment("");
+    setUploadLang("English");
     setGenerateMcq(false);
   };
 
@@ -199,7 +201,7 @@ export function SopFolderUploadModal({
     try {
       const uploadResults = await uploadSopBatch(
         files,
-        "English",
+        uploadLang,
         department,
         generateMcq,
         (completed, total) => setUploadProgress({ completed, total }),
@@ -302,15 +304,28 @@ export function SopFolderUploadModal({
         onChange={handleFileChange}
         uploading={uploading}
       />
-      <label className="block text-[10px] font-semibold uppercase tracking-wide text-slate-400">
-        Department override (optional)
-        <input
-          className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-1.5 text-xs text-slate-700 focus:border-violet-400 focus:outline-none"
-          placeholder="e.g. QA, QC"
-          value={department}
-          onChange={(e) => setDepartment(e.target.value)}
-        />
-      </label>
+      <div className="flex gap-3">
+        <label className="flex-1 block text-[10px] font-semibold uppercase tracking-wide text-slate-400">
+          Language
+          <select
+            className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-1.5 text-xs text-slate-700 focus:border-violet-400 focus:outline-none"
+            value={uploadLang}
+            onChange={(e) => setUploadLang(e.target.value as "English" | "Gujarati")}
+          >
+            <option value="English">English</option>
+            <option value="Gujarati">Gujarati</option>
+          </select>
+        </label>
+        <label className="flex-1 block text-[10px] font-semibold uppercase tracking-wide text-slate-400">
+          Department override (optional)
+          <input
+            className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-1.5 text-xs text-slate-700 focus:border-violet-400 focus:outline-none"
+            placeholder="e.g. QA, QC"
+            value={department}
+            onChange={(e) => setDepartment(e.target.value)}
+          />
+        </label>
+      </div>
       <label className="flex cursor-pointer items-center gap-2 text-xs text-slate-700">
         <input
           type="checkbox"

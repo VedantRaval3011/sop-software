@@ -237,16 +237,73 @@ export function DashboardToolbar({
 
         {/* Admin Tools – admin only (includes Fix SOP Names backfill) */}
         {isAdmin && (
-          <Btn
-            size="sm"
-            className="border-sky-200 bg-sky-50 text-sky-700 hover:bg-sky-100"
-            onClick={() => setAdminOpen(true)}
-            title="Admin tools: fix SOP names, migrate files, delete versioned SOPs"
-          >
-            <Wrench className="h-3 w-3" /> Admin Tools
-          </Btn>
+          <>
+            <Btn
+              size="sm"
+              className="border-sky-200 bg-sky-50 text-sky-700 hover:bg-sky-100"
+              onClick={() => setAdminOpen(true)}
+              title="Admin tools: fix SOP names, migrate files, delete versioned SOPs"
+            >
+              <Wrench className="h-3 w-3" /> Admin Tools
+            </Btn>
+            <RetagLanguageBtn onSuccess={onRefresh} showToast={showToast} />
+          </>
         )}
       </div>
+    </div>
+  );
+}
+
+/* ── Re-tag language button ── */
+function RetagLanguageBtn({
+  onSuccess,
+  showToast,
+}: {
+  onSuccess: () => void;
+  showToast: (msg: string) => void;
+}) {
+  const [running, setRunning] = useState(false);
+  const [prefix, setPrefix] = useState("");
+
+  const run = async () => {
+    setRunning(true);
+    try {
+      const res = await fetch("/api/admin/retag-language", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prefix }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? "Retag failed");
+      showToast(`Scanned ${data.scanned} record(s), re-tagged ${data.retagged} with correct language.`);
+      if (data.retagged > 0) onSuccess();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "Retag failed");
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  return (
+    <div className="flex items-center gap-1">
+      <input
+        className="w-20 rounded border border-slate-200 px-2 py-1 text-[10px] text-slate-600 placeholder:text-slate-400 focus:border-sky-400 focus:outline-none"
+        placeholder="prefix e.g. MAGE"
+        value={prefix}
+        onChange={(e) => setPrefix(e.target.value.toUpperCase())}
+        disabled={running}
+        title="SOP code prefix to re-tag (leave blank for all)"
+      />
+      <Btn
+        size="sm"
+        className="border-orange-200 bg-orange-50 text-orange-700 hover:bg-orange-100"
+        onClick={run}
+        disabled={running}
+        title="Re-detect language from file content and fix mislabelled records"
+      >
+        <Languages className="h-3 w-3" />
+        {running ? "Re-tagging…" : "Fix Language"}
+      </Btn>
     </div>
   );
 }

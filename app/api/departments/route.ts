@@ -1,19 +1,44 @@
 import { NextRequest, NextResponse } from "next/server";
 import { connectDB } from "@/lib/mongodb";
 import SOP from "@/models/SOP";
+import Department from "@/models/Department";
+import { sortByDeptOrder } from "@/lib/sop-utils";
+
+export async function GET() {
+  try {
+    await connectDB();
+    const [sopDepts, persistedDepts] = await Promise.all([
+      SOP.distinct("department") as Promise<string[]>,
+      Department.distinct("name") as Promise<string[]>,
+    ]);
+    const merged = sortByDeptOrder([...new Set([...sopDepts, ...persistedDepts])]);
+    return NextResponse.json({ departments: merged });
+  } catch (error) {
+    return NextResponse.json(
+      { error: error instanceof Error ? error.message : "Failed to fetch departments" },
+      { status: 500 },
+    );
+  }
+}
 
 export async function POST(request: NextRequest) {
   try {
     await connectDB();
     const { name } = await request.json();
-    if (!name?.trim()) {
+    const trimmed = name?.trim();
+    if (!trimmed) {
       return NextResponse.json({ error: "Department name required" }, { status: 400 });
     }
-    const exists = await SOP.findOne({ department: name.trim() });
-    if (exists) {
-      return NextResponse.json({ department: name.trim(), created: false });
+
+    // Check if department already exists in SOP records
+    const inSops = await SOP.exists({ department: trimmed });
+    if (inSops) {
+      return NextResponse.json({ department: trimmed, created: false });
     }
-    return NextResponse.json({ department: name.trim(), created: true });
+
+    // Upsert into the Department collection so it persists even with 0 SOPs
+    await Department.updateOne({ name: trimmed }, { $setOnInsert: { name: trimmed } }, { upsert: true });
+    return NextResponse.json({ department: trimmed, created: true });
   } catch (error) {
     return NextResponse.json(
       { error: error instanceof Error ? error.message : "Failed to add department" },
@@ -22,14 +47,64 @@ export async function POST(request: NextRequest) {
   }
 }
 
-export async function GET() {
+export async function PATCH(request: NextRequest) {
   try {
     await connectDB();
-    const departments = await SOP.distinct("department");
-    return NextResponse.json({ departments: departments.sort() });
+    const { oldName, newName } = await request.json();
+    const trimmedOld = oldName?.trim();
+    const trimmedNew = newName?.trim();
+    if (!trimmedOld || !trimmedNew) {
+      return NextResponse.json({ error: "Both oldName and newName are required" }, { status: 400 });
+    }
+    if (trimmedOld === trimmedNew) {
+      return NextResponse.json({ error: "New name is the same as the current name" }, { status: 400 });
+    }
+
+    // Check new name doesn't already exist
+    const exists = await Department.exists({ name: trimmedNew });
+    const inSops = await SOP.exists({ department: trimmedNew });
+    if (exists || inSops) {
+      return NextResponse.json({ error: "A department with that name already exists" }, { status: 409 });
+    }
+
+    // Rename in Department collection and all SOPs atomically
+    await Promise.all([
+      Department.updateOne({ name: trimmedOld }, { $set: { name: trimmedNew } }),
+      SOP.updateMany({ department: trimmedOld }, { $set: { department: trimmedNew } }),
+    ]);
+
+    return NextResponse.json({ oldName: trimmedOld, newName: trimmedNew, renamed: true });
   } catch (error) {
     return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Failed to fetch departments" },
+      { error: error instanceof Error ? error.message : "Failed to rename department" },
+      { status: 500 },
+    );
+  }
+}
+
+export async function DELETE(request: NextRequest) {
+  try {
+    await connectDB();
+    const { name } = await request.json();
+    const trimmed = name?.trim();
+    if (!trimmed) {
+      return NextResponse.json({ error: "Department name required" }, { status: 400 });
+    }
+
+    // Refuse deletion if any active SOPs still belong to this department
+    const sopCount = await SOP.countDocuments({ department: trimmed, isObsolete: { $ne: true } });
+    if (sopCount > 0) {
+      return NextResponse.json(
+        { error: `Cannot delete: ${sopCount} SOP(s) still assigned to this department` },
+        { status: 409 },
+      );
+    }
+
+    await Department.deleteOne({ name: trimmed });
+    return NextResponse.json({ department: trimmed, deleted: true });
+  } catch (error) {
+    return NextResponse.json(
+      { error: error instanceof Error ? error.message : "Failed to delete department" },
       { status: 500 },
     );
   }

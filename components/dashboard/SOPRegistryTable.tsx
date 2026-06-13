@@ -280,6 +280,8 @@ export function SOPRegistryTable({
   const [deleteTarget, setDeleteTarget] = useState<RegistrySOP | null>(null);
   const [deleting, setDeleting] = useState(false);
 
+  const handleEditClose = useCallback(() => setEditIdentifier(null), []);
+
   const SortIcon = ({ field }: { field: string }) => {
     if (filters.sortBy !== field)
       return <ArrowUpDown className="h-3 w-3 text-gray-400 ml-0.5 inline opacity-60" />;
@@ -326,7 +328,7 @@ export function SOPRegistryTable({
         open={editIdentifier !== null}
         identifier={editIdentifier}
         departmentList={departments}
-        onClose={() => setEditIdentifier(null)}
+        onClose={handleEditClose}
         onSuccess={onRefresh}
       />
       <ConfirmDialog

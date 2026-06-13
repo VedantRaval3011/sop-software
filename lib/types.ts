@@ -122,7 +122,12 @@ export interface DepartmentCapsule {
   noDate: number;
   docx: { found: number; missing: number; en: { found: number; missing: number }; gu: { found: number; missing: number } };
   pdf: { found: number; missing: number; en: { found: number; missing: number }; gu: { found: number; missing: number } };
-  version: { found: number; missing: number };
+  version: {
+    found: number;
+    missing: number;
+    docx: { en: { found: number; missing: number }; gu: { found: number; missing: number } };
+    pdf: { en: { found: number; missing: number }; gu: { found: number; missing: number } };
+  };
   versionDate: {
     found: number;
     missing: number;
