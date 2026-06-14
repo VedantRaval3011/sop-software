@@ -70,6 +70,11 @@ export async function GET(req: NextRequest) {
 
     const assignmentKeys = new Set<string>();
     const assignments: ScheduleAssignment[] = [];
+    // Departments whose month is fixed by the latest Excel upload. The Excel
+    // snapshot is the source of truth (it drives the matrix), so manual
+    // record allocations must not add extra months for a department that is
+    // already assigned via Excel.
+    const excelAssignedDepts = new Set<string>();
 
     const addAssignment = (department: string, monthName: string, year: number) => {
       const dept = normalizeDept(department);
@@ -107,6 +112,7 @@ export async function GET(req: NextRequest) {
         const b = stripVersion(rawKey);
         if (b !== base) continue;
         addAssignment(dept, monthName, year);
+        if (dept) excelAssignedDepts.add(dept);
         if (!baseToRawKeys[b]) baseToRawKeys[b] = [];
         baseToRawKeys[b].push(rawKey);
       }
@@ -139,6 +145,8 @@ export async function GET(req: NextRequest) {
       monthName?: string;
       year?: number;
     }>) {
+      // Skip manual allocations for departments already pinned by Excel.
+      if (excelAssignedDepts.has(normalizeDept(r.department))) continue;
       const monthName = r.monthName || MONTH_NAMES[(r.month || 1) - 1] || '';
       addAssignment(String(r.department || ''), monthName, r.year ?? new Date().getFullYear());
     }

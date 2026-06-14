@@ -3,16 +3,12 @@ import { connectDB } from "@/lib/mongodb";
 import SOP from "@/models/SOP";
 import {
   applyFilters,
-  groupSOPRecords,
   paginate,
   parseFiltersFromSearchParams,
   sopVersionFields,
 } from "@/lib/sop-utils";
-import {
-  getServerGroupedCache,
-  invalidateDashboardSopsCache,
-  setServerGroupedCache,
-} from "@/lib/cache";
+import { invalidateDashboardSopsCache } from "@/lib/cache";
+import { loadGroupedRegistry } from "@/lib/dashboardRegistrySource";
 import { requireAuth } from "@/lib/withAuth";
 
 export const dynamic = "force-dynamic";
@@ -23,13 +19,7 @@ export async function GET(request: NextRequest) {
 
   try {
     const filters = parseFiltersFromSearchParams(request.nextUrl.searchParams);
-    let grouped = getServerGroupedCache();
-    if (!grouped) {
-      await connectDB();
-      const records = await SOP.find({}).select("-content").sort({ updatedAt: -1 }).lean();
-      grouped = groupSOPRecords(records as never[]);
-      setServerGroupedCache(grouped);
-    }
+    const grouped = await loadGroupedRegistry();
     const filtered = applyFilters(grouped, filters);
     const { items, total } = paginate(filtered, filters.page, filters.limit);
 

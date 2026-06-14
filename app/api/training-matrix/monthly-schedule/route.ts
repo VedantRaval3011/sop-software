@@ -39,11 +39,17 @@ type ScheduleAssignment = {
   year: number;
 };
 
+type UploadSnap = {
+  sopMonthMap?: Record<string, string>;
+  sopCodes?: string[];
+  employees?: Array<{ training?: Record<string, boolean> }>;
+};
+
 // GET /api/training-matrix/monthly-schedule?sopCode=QAGE01-10
 //
 // Returns month-wise employee counts plus every (department, month) assignment
-// for the SOP — including multiple months per department when versioned Excel
-// columns or manual Manage SOP allocations map the same base code differently.
+// for the SOP from the latest Excel upload per department (matching overview)
+// plus manual Manage SOP allocations from TrainingMatrixRecord.
 export async function GET(req: NextRequest) {
   try {
     await connectDB();
@@ -56,10 +62,10 @@ export async function GET(req: NextRequest) {
     const sopCodePattern = new RegExp(`^${base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(-\\d+)?$`, 'i');
 
     const [uploads, records] = await Promise.all([
-      TrainingMatrixUpload.find(
-        { 'snapshot.sopMonthMap': { $exists: true } },
-        { department: 1, year: 1, snapshot: 1 },
-      ).lean(),
+      TrainingMatrixUpload.find({ 'snapshot.sopMonthMap': { $exists: true } })
+        .sort({ uploadedAt: -1 })
+        .select('department year snapshot uploadedAt')
+        .lean(),
       TrainingMatrixRecord.find({
         status: { $ne: 'na' },
         sopCode: sopCodePattern,
@@ -70,6 +76,11 @@ export async function GET(req: NextRequest) {
 
     const assignmentKeys = new Set<string>();
     const assignments: ScheduleAssignment[] = [];
+    // Departments whose month is fixed by the latest Excel upload. The Excel
+    // snapshot is the source of truth (it drives the matrix), so manual
+    // TrainingMatrixRecord allocations must not add extra months for a
+    // department that is already assigned via Excel.
+    const excelAssignedDepts = new Set<string>();
 
     const addAssignment = (department: string, monthName: string, year: number) => {
       const dept = normalizeDept(department);
@@ -91,44 +102,51 @@ export async function GET(req: NextRequest) {
       { month: number; year: number; monthName: string; count: number }
     >();
 
-    for (const upload of uploads) {
-      const snap = (upload as any).snapshot as {
-        sopMonthMap?: Record<string, string>;
-        employees?: Array<{ training?: Record<string, boolean> }>;
-      } | undefined;
+    // Keep only the newest upload per department — same rule as overview route.
+    const latestByDept = new Map<string, { department: string; year?: number; snapshot?: UploadSnap }>();
+    for (const upload of uploads as Array<{ department: string; year?: number; snapshot?: UploadSnap }>) {
+      const dept = normalizeDept(upload.department);
+      if (!dept || latestByDept.has(dept)) continue;
+      latestByDept.set(dept, upload);
+    }
 
+    for (const upload of latestByDept.values()) {
+      const snap = upload.snapshot;
       if (!snap?.sopMonthMap || !snap?.employees) continue;
 
-      const dept = normalizeDept((upload as any).department);
-      const year: number = (upload as any).year ?? new Date().getFullYear();
+      const dept = normalizeDept(upload.department);
+      const year: number = upload.year ?? new Date().getFullYear();
 
-      const baseToRawKeys: Record<string, string[]> = {};
-      for (const [rawKey, monthName] of Object.entries(snap.sopMonthMap)) {
-        const b = stripVersion(rawKey);
-        if (b !== base) continue;
-        addAssignment(dept, monthName, year);
-        if (!baseToRawKeys[b]) baseToRawKeys[b] = [];
-        baseToRawKeys[b].push(rawKey);
+      // Normalize sopMonthMap to one month per base code — same as overview route.
+      const sopMonthMap: Record<string, string> = {};
+      for (const [k, m] of Object.entries(snap.sopMonthMap)) {
+        const b = stripVersion(k);
+        if (b && m) sopMonthMap[b] = m;
       }
 
-      const rawKeys = new Set<string>(baseToRawKeys[base] ?? []);
-      rawKeys.add(base);
-      if (!rawKeys.size) continue;
+      const excelCodes = new Set<string>((snap.sopCodes || []).map(stripVersion).filter(Boolean));
+      const monthName = sopMonthMap[base];
+      const inExcel = excelCodes.has(base);
 
-      for (const [rawKey, monthName] of Object.entries(snap.sopMonthMap)) {
-        if (!rawKeys.has(rawKey)) continue;
+      if (!monthName && !inExcel) continue;
+
+      if (monthName) {
+        addAssignment(dept, monthName, year);
+        if (dept) excelAssignedDepts.add(dept);
 
         const monthNum = MONTH_NAME_TO_NUM[monthName.toLowerCase()];
-        if (!monthNum) continue;
+        if (monthNum) {
+          const key = `${monthNum}-${year}`;
+          const empCount = snap.employees.filter((e) =>
+            Object.entries(e.training || {}).some(([k, v]) => stripVersion(k) === base && v === true),
+          ).length;
 
-        const key = `${monthNum}-${year}`;
-        const empCount = snap.employees.filter((e) => e.training?.[rawKey] === true).length;
-
-        const existing = byMonthYear.get(key);
-        if (existing) {
-          existing.count += empCount;
-        } else {
-          byMonthYear.set(key, { month: monthNum, year, monthName, count: empCount });
+          const existing = byMonthYear.get(key);
+          if (existing) {
+            existing.count += empCount;
+          } else {
+            byMonthYear.set(key, { month: monthNum, year, monthName, count: empCount });
+          }
         }
       }
     }
@@ -139,6 +157,8 @@ export async function GET(req: NextRequest) {
       monthName?: string;
       year?: number;
     }>) {
+      // Skip manual allocations for departments already pinned by Excel.
+      if (excelAssignedDepts.has(normalizeDept(r.department))) continue;
       const monthName = r.monthName || MONTH_NAMES[(r.month || 1) - 1] || '';
       addAssignment(String(r.department || ''), monthName, r.year ?? new Date().getFullYear());
     }

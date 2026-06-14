@@ -23,6 +23,37 @@ function rosterKey(department: string, name: string): string {
   return `${department}||${name}`.trim().toLowerCase();
 }
 
+// The roster sync scans the whole training matrix and issues a bulk upsert on
+// every employees-page load, which is wasteful when nothing has changed. Throttle
+// it so repeated reads within a short window skip the heavy work.
+const SYNC_THROTTLE_MS = 30_000;
+
+declare global {
+  // eslint-disable-next-line no-var
+  var __lastEmployeeMatrixSyncAt: number | undefined;
+}
+
+/**
+ * Runs {@link syncEmployeesFromMatrix} at most once per throttle window. Returns
+ * `true` when the sync actually ran, `false` when it was skipped. Never throws —
+ * a sync hiccup must not block listing employees.
+ */
+export async function syncEmployeesFromMatrixThrottled(): Promise<boolean> {
+  const now = Date.now();
+  const last = global.__lastEmployeeMatrixSyncAt ?? 0;
+  if (now - last < SYNC_THROTTLE_MS) return false;
+  global.__lastEmployeeMatrixSyncAt = now;
+  try {
+    await syncEmployeesFromMatrix();
+    return true;
+  } catch (err) {
+    // Allow a retry on the next request rather than waiting out the window.
+    global.__lastEmployeeMatrixSyncAt = last;
+    console.error('Auto-sync from matrix failed:', err);
+    return false;
+  }
+}
+
 /**
  * Mirrors the live training-matrix roster into the Employee collection.
  *

@@ -501,29 +501,58 @@ export default function EmployeesPage() {
   const [deleting,   setDeleting]   = useState<Employee | null>(null);
   const [togglingId,     setTogglingId]     = useState<string | null>(null);
   const [trainingMap,    setTrainingMap]    = useState<Map<string, TrainingStatus>>(new Map());
+  const [assignmentsLoading, setAssignmentsLoading] = useState(true);
+  const [trainingLoading,    setTrainingLoading]    = useState(true);
   const [generating, setGenerating] = useState(false);
   const [syncResult, setSyncResult] = useState<string | null>(null);
   const [generatedCreds, setGeneratedCreds] = useState<GeneratedCredential[] | null>(null);
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  // Heavy fields (assigned SOPs + training progress) are scanned across the
+  // whole training matrix, so we fetch the bare roster first to paint the table
+  // instantly, then stream the slow columns in. Each slow column shows its own
+  // loading state instead of blocking the whole page.
+  const loadAssignments = useCallback(async () => {
+    setAssignmentsLoading(true);
     try {
-      const [empRes, trainingRes] = await Promise.all([
-        fetch('/api/employees?includeInactive=1&includeAssignments=1'),
-        fetch('/api/lms/admin/training-status'),
-      ]);
-      const empJson      = await empRes.json();
-      const trainingJson = await trainingRes.json();
-      setEmployees(empJson.employees || []);
+      const res  = await fetch('/api/employees?includeInactive=1&includeAssignments=1');
+      const json = await res.json();
+      if (Array.isArray(json.employees)) setEmployees(json.employees);
+    } finally {
+      setAssignmentsLoading(false);
+    }
+  }, []);
+
+  const loadTraining = useCallback(async () => {
+    setTrainingLoading(true);
+    try {
+      const res  = await fetch('/api/lms/admin/training-status');
+      const json = await res.json();
       const map = new Map<string, TrainingStatus>();
-      for (const r of (trainingJson.records ?? []) as TrainingStatus[]) {
+      for (const r of (json.records ?? []) as TrainingStatus[]) {
         map.set(r.employeeId, r);
       }
       setTrainingMap(map);
     } finally {
-      setLoading(false);
+      setTrainingLoading(false);
     }
   }, []);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setAssignmentsLoading(true);
+    setTrainingLoading(true);
+    try {
+      // Fast first paint: bare roster, skipping the matrix sync + assignments scan.
+      const res  = await fetch('/api/employees?includeInactive=1&skipSync=1');
+      const json = await res.json();
+      setEmployees(json.employees || []);
+    } finally {
+      setLoading(false);
+    }
+    // Stream in the heavy columns in parallel without blocking the table.
+    void loadAssignments();
+    void loadTraining();
+  }, [loadAssignments, loadTraining]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -621,7 +650,7 @@ export default function EmployeesPage() {
           </div>
           <div className="flex items-center gap-2">
             <button suppressHydrationWarning onClick={load} disabled={loading} className="flex items-center gap-1 rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50">
-              <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
+              <RefreshCw className={`h-3.5 w-3.5 ${loading || assignmentsLoading || trainingLoading ? 'animate-spin' : ''}`} />
             </button>
             <button
               suppressHydrationWarning
@@ -771,10 +800,23 @@ export default function EmployeesPage() {
                       )}
                     </td>
                     <td className="px-4 py-3 align-top">
-                      <AssignmentBadge employeeName={emp.name} assignments={emp.assignments || []} />
+                      {emp.assignments === undefined && assignmentsLoading ? (
+                        <span className="inline-flex items-center gap-1.5 text-xs text-gray-400">
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading…
+                        </span>
+                      ) : (
+                        <AssignmentBadge employeeName={emp.name} assignments={emp.assignments || []} />
+                      )}
                     </td>
                     <td className="px-4 py-3">
                       {(() => {
+                        if (trainingLoading && !trainingMap.has(emp._id)) {
+                          return (
+                            <span className="inline-flex items-center gap-1.5 text-xs text-gray-400">
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading…
+                            </span>
+                          );
+                        }
                         const t = trainingMap.get(emp._id);
                         if (!t || t.totalSops === 0) return <span className="text-xs text-gray-300">—</span>;
                         return (
