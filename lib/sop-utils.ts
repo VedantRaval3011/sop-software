@@ -925,11 +925,11 @@ function buildCapsule(department: string, sops: RegistrySOP[]): DepartmentCapsul
     if (sop.hasVersionDate) capsule.versionDate.found++;
     else capsule.versionDate.missing++;
     if (needsEn(sop)) {
-      if (sop.hasVersionDateEn) capsule.versionDate.en.found++;
+      if (sop.hasVersionDate) capsule.versionDate.en.found++;
       else capsule.versionDate.en.missing++;
     }
     if (needsGu(sop)) {
-      if (sop.hasVersionDateGu) capsule.versionDate.gu.found++;
+      if (sop.hasVersionDate) capsule.versionDate.gu.found++;
       else capsule.versionDate.gu.missing++;
     }
 
