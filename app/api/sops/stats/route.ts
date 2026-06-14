@@ -1,12 +1,8 @@
 import { NextResponse } from "next/server";
 import { connectDB } from "@/lib/mongodb";
-import SOP from "@/models/SOP";
 import Department from "@/models/Department";
-import { buildDashboardStats, groupSOPRecords, sortByDeptOrder } from "@/lib/sop-utils";
-import {
-  getServerGroupedCache,
-  setServerGroupedCache,
-} from "@/lib/cache";
+import { buildDashboardStats, sortByDeptOrder } from "@/lib/sop-utils";
+import { loadGroupedRegistry } from "@/lib/dashboardRegistrySource";
 import { requireAuth } from "@/lib/withAuth";
 
 export const dynamic = "force-dynamic";
@@ -18,12 +14,7 @@ export async function GET() {
   try {
     await connectDB();
 
-    let registry = getServerGroupedCache();
-    if (!registry) {
-      const records = await SOP.find({}).select("-content").lean();
-      registry = groupSOPRecords(records as never[]);
-      setServerGroupedCache(registry);
-    }
+    const registry = await loadGroupedRegistry();
 
     // Fetch persisted department names (empty departments created via the UI)
     const persistedDepts = (await Department.distinct("name")) as string[];

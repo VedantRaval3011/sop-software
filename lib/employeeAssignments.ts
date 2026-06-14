@@ -92,7 +92,52 @@ async function buildSopNameMap(): Promise<Map<string, string>> {
   return map;
 }
 
-export async function getEmployeeAssignmentsMap(): Promise<Map<string, EmployeeSopAssignment[]>> {
+// Building the assignments map scans the whole training-matrix + SOP
+// collections, so it is by far the heaviest part of the employees page. The
+// employees list and the training-status endpoints both need it and fire within
+// milliseconds of each other, so a short-lived in-memory cache lets the second
+// caller reuse the first one's work instead of recomputing it from scratch.
+const ASSIGNMENTS_CACHE_TTL_MS = 15_000;
+
+interface AssignmentsCache {
+  expiresAt: number;
+  promise: Promise<Map<string, EmployeeSopAssignment[]>>;
+}
+
+declare global {
+  // eslint-disable-next-line no-var
+  var __employeeAssignmentsCache: AssignmentsCache | undefined;
+}
+
+export function invalidateEmployeeAssignmentsCache(): void {
+  global.__employeeAssignmentsCache = undefined;
+}
+
+export function getEmployeeAssignmentsMap(
+  opts?: { force?: boolean },
+): Promise<Map<string, EmployeeSopAssignment[]>> {
+  const now = Date.now();
+  const cached = global.__employeeAssignmentsCache;
+  if (!opts?.force && cached && cached.expiresAt > now) {
+    return cached.promise;
+  }
+
+  const promise = computeEmployeeAssignmentsMap().catch((err) => {
+    // Never cache a failed computation.
+    if (global.__employeeAssignmentsCache?.promise === promise) {
+      global.__employeeAssignmentsCache = undefined;
+    }
+    throw err;
+  });
+
+  global.__employeeAssignmentsCache = {
+    expiresAt: now + ASSIGNMENTS_CACHE_TTL_MS,
+    promise,
+  };
+  return promise;
+}
+
+async function computeEmployeeAssignmentsMap(): Promise<Map<string, EmployeeSopAssignment[]>> {
   // empKey → (sopCode → kept assignment). One entry per SOP per employee.
   const byEmp = new Map<string, Map<string, EmployeeSopAssignment>>();
   const nameByBase = await buildSopNameMap();

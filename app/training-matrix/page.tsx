@@ -61,21 +61,6 @@ function buildSopAssignedMonths(
   return out.sort((a, b) => a.dept.localeCompare(b.dept) || a.month.localeCompare(b.month));
 }
 
-function mergeSopAssignedMonths(
-  primary: SopAssignedMonth[],
-  extra: SopAssignedMonth[],
-): SopAssignedMonth[] {
-  const seen = new Set<string>();
-  const out: SopAssignedMonth[] = [];
-  for (const row of [...primary, ...extra]) {
-    const key = `${row.dept}|${row.month}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(row);
-  }
-  return out.sort((a, b) => a.dept.localeCompare(b.dept) || a.month.localeCompare(b.month));
-}
-
 function buildSopDetailEmployees(
   sopCode: string,
   deptList: readonly string[],
@@ -3940,7 +3925,7 @@ export default function TrainingMatrixPage() {
             if (!prev || prev.kind !== 'sop' || prev.sopCode !== sopCode) return prev;
             return {
               ...prev,
-              assignedMonths: mergeSopAssignedMonths(prev.assignedMonths || assignedMonths, fromApi),
+              assignedMonths: fromApi,
             };
           });
         })
@@ -5771,7 +5756,7 @@ export default function TrainingMatrixPage() {
               );
 
               const q = sopDetailSearch.trim().toLowerCase();
-              const filterRows = (rows: Array<{ name: string; designation?: string; department?: string }>) =>
+              const filterRows = (rows: SopDetailEmployee[]) =>
                 rows.filter((r) => !q || r.name.toLowerCase().includes(q) || (r.designation || '').toLowerCase().includes(q));
 
               const foundRows = filterRows(detailModal.foundEmployees || []).sort(sortFn);
