@@ -2,9 +2,10 @@
 
 import { useEffect, useMemo, useState } from "react";
 import type { RegistrySOP } from "@/lib/types";
+import type { VersionDiagnosticsReport } from "@/lib/version-diagnostics";
 import { useDashboardStore } from "@/lib/store/dashboard-store";
 import { ComplianceFullViewer } from "./ComplianceFullViewer";
-import { Btn, Modal } from "./ui";
+import { Badge, Btn, Modal } from "./ui";
 
 interface GuidelineItem {
   _id: string;
@@ -261,7 +262,95 @@ export function AdminToolsModal({
   const [deletingVersioned, setDeletingVersioned] = useState(false);
   const [backfillingNames, setBackfillingNames] = useState(false);
 
+  // ── Version files diagnostic ──
+  const [diagDept, setDiagDept] = useState("");
+  const [diagCheckBunny, setDiagCheckBunny] = useState(true);
+  const [diagRunning, setDiagRunning] = useState(false);
+  const [diagReport, setDiagReport] = useState<VersionDiagnosticsReport | null>(null);
+  const [diagError, setDiagError] = useState("");
+  const [reconciling, setReconciling] = useState(false);
+  const [relinkDept, setRelinkDept] = useState("");
+  const [relinking, setRelinking] = useState(false);
+
   if (!isAdmin) return null;
+
+  const runRelinkBunny = async () => {
+    setRelinking(true);
+    setMessage(`Checking missing version files${relinkDept.trim() ? ` for ${relinkDept.trim()}` : ""} in Bunny…`);
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 300_000);
+      const res = await fetch("/api/admin/relink-bunny-versions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          department: relinkDept.trim() || undefined,
+          refreshIndex: true,
+        }),
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      const data = await res.json();
+      if (!res.ok) {
+        setMessage(data.error ?? "Relink failed");
+        return;
+      }
+      setMessage(
+        `Checked ${data.missingSlotsChecked} missing file slots (Bunny index: ${data.bunnyIndexSize ?? "?"} files) — linked ${data.linked}, created ${data.created}, ${data.notFoundInBunny} not in Bunny. Refresh the dashboard to see updated counts.`,
+      );
+      onSuccess?.();
+    } catch (err) {
+      if (err instanceof Error && err.name === "AbortError") {
+        setMessage("Relink timed out after 5 minutes. Try again with a single department filter.");
+      } else {
+        setMessage(err instanceof Error ? err.message : "Relink failed");
+      }
+    } finally {
+      setRelinking(false);
+    }
+  };
+
+  const runReconcileVersions = async () => {
+    setReconciling(true);
+    setMessage("Reconciling SOP version grouping…");
+    try {
+      const res = await fetch("/api/admin/reconcile-sop-versions", { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) {
+        setMessage(data.error ?? "Reconcile failed");
+        return;
+      }
+      setMessage(
+        `Reconcile done: ${data.updated} records re-grouped, ${data.cleaned} prior-version file links cleaned (of ${data.total}).`,
+      );
+      onSuccess?.();
+    } finally {
+      setReconciling(false);
+    }
+  };
+
+  const runDiagnostics = async () => {
+    setDiagRunning(true);
+    setDiagReport(null);
+    setDiagError("");
+    try {
+      const res = await fetch("/api/admin/version-diagnostics", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ checkBunny: diagCheckBunny, department: diagDept.trim() || undefined }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setDiagError(data.error ?? "Diagnostic failed");
+        return;
+      }
+      setDiagReport(data as VersionDiagnosticsReport);
+    } catch {
+      setDiagError("Network error. Please try again.");
+    } finally {
+      setDiagRunning(false);
+    }
+  };
 
   const runBackfillNames = async () => {
     setBackfillingNames(true);
@@ -320,7 +409,7 @@ export function AdminToolsModal({
   };
 
   return (
-    <Modal open={open} onClose={onClose} title="Admin Tools">
+    <Modal open={open} onClose={onClose} title="Admin Tools" wide>
       <div className="space-y-2">
         {[
           "Recheck Files",
@@ -351,6 +440,156 @@ export function AdminToolsModal({
         >
           {backfillingNames ? "Extracting names…" : "Fix SOP Names (backfill from files & content)"}
         </button>
+
+        <hr className="border-slate-200" />
+
+        {/* ── Version files diagnostic ── */}
+        <div className="rounded border border-amber-200 bg-amber-50/60 p-3">
+          <p className="text-xs font-bold text-amber-900">Version Files Diagnostic</p>
+          <p className="mt-0.5 text-[10px] leading-snug text-amber-800">
+            Finds the exact file (version · language · DOCX/PDF) missing for every SOP the
+            dashboard counts as an incomplete version, and checks whether it already exists in
+            Bunny storage (uploaded but not linked) or is genuinely absent.
+          </p>
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <input
+              value={diagDept}
+              onChange={(e) => setDiagDept(e.target.value)}
+              placeholder="Department (blank = all)"
+              className="w-48 rounded border border-amber-300 bg-white px-2 py-1 text-[11px] focus:border-amber-500 focus:outline-none"
+            />
+            <label className="flex items-center gap-1 text-[11px] text-amber-900">
+              <input
+                type="checkbox"
+                checked={diagCheckBunny}
+                onChange={(e) => setDiagCheckBunny(e.target.checked)}
+              />
+              Cross-check Bunny storage
+            </label>
+            <Btn variant="primary" disabled={diagRunning} onClick={runDiagnostics}>
+              {diagRunning ? "Scanning…" : "Run Diagnostic"}
+            </Btn>
+            <Btn disabled={reconciling} onClick={runReconcileVersions}>
+              {reconciling ? "Reconciling…" : "Reconcile Version Grouping"}
+            </Btn>
+            <div className="flex flex-wrap items-center gap-2">
+              <input
+                value={relinkDept}
+                onChange={(e) => setRelinkDept(e.target.value)}
+                placeholder="Department (blank = all)"
+                className="w-36 rounded border border-amber-300 bg-white px-2 py-1 text-[11px] focus:border-amber-500 focus:outline-none"
+              />
+              <Btn variant="primary" disabled={relinking} onClick={runRelinkBunny}>
+                {relinking ? "Linking…" : "Link Version Files from Bunny"}
+              </Btn>
+            </div>
+          </div>
+
+          {diagError && <p className="mt-2 text-[11px] text-red-600">{diagError}</p>}
+
+          {diagReport && (
+            <div className="mt-3 space-y-2">
+              <div className="flex flex-wrap gap-1.5">
+                <Badge variant="gray">Active SOPs: {diagReport.totalActive}</Badge>
+                <Badge variant="green">Complete: {diagReport.versionComplete}</Badge>
+                <Badge variant="red">Incomplete: {diagReport.versionIncomplete}</Badge>
+                <Badge variant="amber">Missing DOCX: {diagReport.summary.missingDocx}</Badge>
+                <Badge variant="amber">Missing PDF: {diagReport.summary.missingPdf}</Badge>
+                <Badge variant="blue">Current: {diagReport.summary.missingCurrent}</Badge>
+                <Badge variant="blue">Prior: {diagReport.summary.missingPrior}</Badge>
+              </div>
+
+              {diagReport.bunnyChecked ? (
+                <div className="flex flex-wrap gap-1.5">
+                  <Badge variant="green">
+                    In Bunny (relinkable): {diagReport.summary.relinkableFromBunny}
+                  </Badge>
+                  <Badge variant="red">
+                    Not in Bunny (re-upload): {diagReport.summary.notInBunny}
+                  </Badge>
+                </div>
+              ) : (
+                <p className="text-[10px] text-slate-500">
+                  {diagReport.bunnyConfigured
+                    ? "Bunny cross-check was skipped."
+                    : "Bunny storage is not configured, so the storage cross-check was skipped."}
+                </p>
+              )}
+
+              <div className="max-h-72 overflow-y-auto rounded border border-slate-200">
+                <table className="w-full text-left text-[10px]">
+                  <thead className="sticky top-0 bg-slate-100 text-slate-600">
+                    <tr>
+                      <th className="px-2 py-1 font-bold">SOP</th>
+                      <th className="px-2 py-1 font-bold">Dept</th>
+                      <th className="px-2 py-1 font-bold">Missing files</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {diagReport.incompleteSops.length === 0 ? (
+                      <tr>
+                        <td colSpan={3} className="px-2 py-3 text-center text-slate-400">
+                          No incomplete version sets found.
+                        </td>
+                      </tr>
+                    ) : (
+                      diagReport.incompleteSops.map((s) => (
+                        <tr key={s.identifier} className="border-t border-slate-100 align-top">
+                          <td className="px-2 py-1 font-mono font-bold text-violet-700">
+                            {s.identifier}
+                            <span className="ml-1 font-sans text-[9px] font-normal text-slate-400">
+                              v{s.currentVersion} · {s.language}
+                            </span>
+                          </td>
+                          <td className="px-2 py-1 text-slate-600">{s.department}</td>
+                          <td className="px-2 py-1">
+                            <div className="flex flex-wrap gap-1">
+                              {s.missing.map((m, i) => (
+                                <span
+                                  key={i}
+                                  title={
+                                    m.inBunny === true
+                                      ? `In Bunny: ${m.bunnyUrl ?? ""}`
+                                      : m.inBunny === false
+                                        ? "Not found in Bunny storage"
+                                        : undefined
+                                  }
+                                  className={`inline-flex items-center gap-0.5 rounded border px-1 py-px font-semibold ${
+                                    m.inBunny === true
+                                      ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+                                      : m.inBunny === false
+                                        ? "border-red-200 bg-red-50 text-red-700"
+                                        : "border-slate-200 bg-slate-50 text-slate-600"
+                                  }`}
+                                >
+                                  {m.scope === "prior" ? `v${m.version}` : "cur"} {m.lang}{" "}
+                                  {m.format.toUpperCase()}
+                                  {m.inBunny === true && " ✓"}
+                                  {m.inBunny === false && " ✗"}
+                                </span>
+                              ))}
+                            </div>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+              <p className="text-[10px] leading-snug text-slate-500">
+                <span className="font-semibold text-emerald-700">Green ✓</span> = a matching file
+                already exists in Bunny storage but isn’t linked to this SOP in the database — your
+                upload reached storage, only the DB link is missing. Re-uploading that file through
+                the app will attach it (the upload matches by SOP code + version + language).{" "}
+                <span className="font-semibold text-red-700">Red ✗</span> = no matching file in
+                Bunny, so it still needs to be uploaded.{" "}
+                <span className="font-semibold text-slate-600">“Reconcile Version Grouping”</span>{" "}
+                only repairs how existing records are grouped into versions (sopBaseId / versionNum)
+                — useful when an uploaded version shows as a separate SOP instead of a prior version.
+              </p>
+            </div>
+          )}
+        </div>
 
         <hr className="border-slate-200" />
 

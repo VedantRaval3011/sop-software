@@ -8,6 +8,7 @@ import {
   BookOpen,
   CalendarDays,
   ChevronDown,
+  Cloud,
   CloudUpload,
   FileUp,
   FolderUp,
@@ -238,6 +239,14 @@ export function DashboardToolbar({
         {/* Admin Tools – admin only (includes Fix SOP Names backfill) */}
         {isAdmin && (
           <>
+            <Btn
+              size="sm"
+              className="border-orange-200 bg-orange-50 text-orange-700 hover:bg-orange-100"
+              onClick={() => router.push("/bunny-files")}
+              title="Browse all files stored in Bunny CDN storage"
+            >
+              <Cloud className="h-3 w-3" /> Bunny Files
+            </Btn>
             <Btn
               size="sm"
               className="border-sky-200 bg-sky-50 text-sky-700 hover:bg-sky-100"

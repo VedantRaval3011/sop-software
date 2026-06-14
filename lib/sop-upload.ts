@@ -14,6 +14,8 @@ import {
   sopVersionFields,
   versionFromIdentifier,
 } from "@/lib/sop-utils";
+import { normalizeSopIdentifierKey, sopIdentifierMatchFilter } from "@/lib/sopIdentifierNormalize";
+import { reconcileSopVersions } from "@/lib/reconcile-sop-versions";
 import { resolveUploadLanguage } from "@/lib/sop-filename";
 import {
   contentScriptMismatch,
@@ -64,10 +66,11 @@ export async function processSopUpload(formData: FormData) {
 
       const relativePath = paths[index] || file.name;
       const pathMeta = parseUploadPathMetadata(relativePath);
-      const identifier =
+      const rawIdentifier =
         identifierInput ||
         pathMeta.identifierFromPath ||
         extractIdentifierFromFilename(pathMeta.fileName || file.name);
+      const identifier = normalizeSopIdentifierKey(rawIdentifier);
 
       const version =
         versionInput ||
@@ -121,14 +124,15 @@ export async function processSopUpload(formData: FormData) {
         versionNum,
         language: lang,
         fileType,
+        isObsolete: { $ne: true },
       });
 
       if (!existing) {
-        const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
         existing = await SOP.findOne({
-          identifier: new RegExp(`^${escaped}$`, "i"),
+          ...sopIdentifierMatchFilter(identifier),
           language: lang,
           fileType,
+          isObsolete: { $ne: true },
         });
       }
 
@@ -222,6 +226,18 @@ export async function processSopUpload(formData: FormData) {
   }
 
   invalidateDashboardSopsCache();
+
+  // Re-group version fields so newly uploaded prior-version files attach to the
+  // correct SOP family immediately (fixes QAGE01-05 vs QAGE1-05 split families).
+  const successCount = results.filter((r) => r.success).length;
+  if (successCount > 0) {
+    try {
+      await reconcileSopVersions();
+    } catch (e) {
+      console.error("post-upload reconcile error:", e);
+    }
+  }
+
   return NextResponse.json({ results });
 }
 

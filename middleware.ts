@@ -15,5 +15,6 @@ export const config = {
     "/compliance/:path*",
     "/sop-scheduler/:path*",
     "/training-content/:path*",
+    "/bunny-files/:path*",
   ],
 };
