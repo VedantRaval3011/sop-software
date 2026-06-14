@@ -10,7 +10,8 @@ import {
   readClientCache,
   writeClientCache,
 } from "@/lib/cache";
-import { filtersToQuery, useDashboardStore } from "@/lib/store/dashboard-store";
+import { useDashboardStore } from "@/lib/store/dashboard-store";
+import { applyFilters, paginate } from "@/lib/sop-utils";
 import { canMutate, isAdmin } from "@/lib/roles";
 import type { AppRole } from "@/lib/auth";
 import { DashboardHeader } from "./DashboardHeader";
@@ -46,8 +47,10 @@ export function DashboardClient() {
     setDepartmentList((prev) => prev.filter((d) => d !== name));
   }, []);
 
-  const [items, setItems] = useState<RegistrySOP[]>([]);
-  const [total, setTotal] = useState(0);
+  // The full grouped registry (active + obsolete). Fetched once and filtered
+  // entirely on the client, so capsule/pill clicks update the table instantly
+  // without a network round-trip per filter change.
+  const [allItems, setAllItems] = useState<RegistrySOP[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -74,7 +77,13 @@ export function DashboardClient() {
     setAdminOpen,
   } = useDashboardStore();
 
-  const query = useMemo(() => filtersToQuery(filters), [filters]);
+  // Derived view: filter + sort + paginate the cached registry locally. This runs
+  // in a few ms even for the whole collection, so every capsule/pill/department
+  // click is instant.
+  const { items, total } = useMemo(() => {
+    const filtered = applyFilters(allItems, filters);
+    return paginate(filtered, filters.page, filters.limit);
+  }, [allItems, filters]);
 
   const fetchStats = useCallback(async () => {
     try {
@@ -91,41 +100,33 @@ export function DashboardClient() {
 
   const fetchSops = useCallback(async () => {
     setError(null);
-    // Stale-while-revalidate: paint cached rows instantly, then refetch.
-    const cached = readClientCache<{ items: RegistrySOP[]; total: number }>(
-      DASHBOARD_CACHE_KEY,
-      query,
-    );
+    // Stale-while-revalidate: paint the cached registry instantly, then refetch
+    // the full set once in the background. All filtering happens client-side.
+    const cached = readClientCache<RegistrySOP[]>(DASHBOARD_CACHE_KEY, "all");
     if (cached) {
-      setItems(cached.items);
-      setTotal(cached.total);
+      setAllItems(cached);
       setLoading(false);
     } else {
       setLoading(true);
     }
     try {
-      const res = await fetch(`/api/sops?${query}`);
+      const res = await fetch(`/api/sops?all=1`);
       if (!res.ok) {
         const err = await res.json();
         throw new Error(err.error ?? "Failed to load SOPs");
       }
       const data = await res.json();
-      setItems(data.items);
-      setTotal(data.total);
-      writeClientCache(DASHBOARD_CACHE_KEY, query, {
-        items: data.items,
-        total: data.total,
-      });
+      setAllItems(data.items);
+      writeClientCache(DASHBOARD_CACHE_KEY, "all", data.items);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load");
       if (!cached) {
-        setItems([]);
-        setTotal(0);
+        setAllItems([]);
       }
     } finally {
       setLoading(false);
     }
-  }, [query]);
+  }, []);
 
   const refresh = useCallback(async () => {
     bustDashboardCache();
@@ -145,11 +146,8 @@ export function DashboardClient() {
   }, [fetchStats]);
 
   useEffect(() => {
-    const timer = setTimeout(() => {
-      fetchSops();
-    }, filters.search ? 300 : 0);
-    return () => clearTimeout(timer);
-  }, [fetchSops, filters.search]);
+    fetchSops();
+  }, [fetchSops]);
 
   const handleSort = (field: string) => {
     setFilter({

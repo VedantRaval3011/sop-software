@@ -18,8 +18,19 @@ export async function GET(request: NextRequest) {
   if (auth.error) return auth.error;
 
   try {
-    const filters = parseFiltersFromSearchParams(request.nextUrl.searchParams);
     const grouped = await loadGroupedRegistry();
+
+    // `all=1` returns the entire grouped registry (active + obsolete) unfiltered so
+    // the dashboard can filter/sort/paginate client-side. This makes capsule and pill
+    // clicks instant: they no longer trigger a network round-trip per filter change.
+    if (request.nextUrl.searchParams.get("all") === "1") {
+      return NextResponse.json(
+        { items: grouped, total: grouped.length, page: 1, limit: grouped.length },
+        { headers: { "Cache-Control": "no-store" } },
+      );
+    }
+
+    const filters = parseFiltersFromSearchParams(request.nextUrl.searchParams);
     const filtered = applyFilters(grouped, filters);
     const { items, total } = paginate(filtered, filters.page, filters.limit);
 

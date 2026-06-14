@@ -1,7 +1,7 @@
 import type { RegistrySOP } from "@/lib/types";
 
-export const DASHBOARD_CACHE_KEY = "sop-dashboard-cache-v2";
-export const DASHBOARD_STATS_CACHE_KEY = "sop-dashboard-stats-v8";
+export const DASHBOARD_CACHE_KEY = "sop-dashboard-cache-v3";
+export const DASHBOARD_STATS_CACHE_KEY = "sop-dashboard-stats-v9";
 
 /* ─── Server-side cache ──────────────────────────────────────────────────
  * Caches the expensive step — querying every SOP and grouping the records

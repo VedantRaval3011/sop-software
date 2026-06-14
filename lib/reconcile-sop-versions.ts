@@ -2,9 +2,9 @@ import { connectDB } from "@/lib/mongodb";
 import SOP from "@/models/SOP";
 import { invalidateDashboardSopsCache } from "@/lib/cache";
 import {
-  baseIdentifierFromIdentifier,
   maxVersionInGroup,
   recordsForVersion,
+  sopFamilyGroupKey,
   sopVersionFields,
 } from "@/lib/sop-utils";
 import type { ISOP } from "@/models/SOP";
@@ -12,8 +12,7 @@ import type { ISOP } from "@/models/SOP";
 export function groupRecordsByBase(records: ISOP[]) {
   const grouped = new Map<string, ISOP[]>();
   for (const record of records) {
-    const base = record.sopBaseId ?? record.identifier;
-    const key = baseIdentifierFromIdentifier(base).toUpperCase();
+    const key = sopFamilyGroupKey(record);
     const bucket = grouped.get(key) ?? [];
     bucket.push(record);
     grouped.set(key, bucket);

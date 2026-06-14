@@ -24,6 +24,11 @@ import {
   resolveSopFamilyNames,
 } from "@/lib/sop-name-resolution";
 import { nameFromFilename } from "@/lib/sop-filename";
+import {
+  normalizeSopIdentifierKey,
+  sopFamilyKeyFromIdentifier,
+  sopIdentifierMatchFilter,
+} from "@/lib/sopIdentifierNormalize";
 
 export const DEPARTMENT_ORDER = [
   "QA",
@@ -112,11 +117,17 @@ function versionNumber(version: string): number {
   return parseFloat(version) || 0;
 }
 
-function sopGroupKey(record: ISOP): string {
-  // Always normalize through baseIdentifierFromIdentifier so records where sopBaseId was
-  // mistakenly stored as the full versioned identifier (e.g. "PEGE01-05") still group correctly.
+/** Stable family key for grouping all revisions of one SOP (QAGE01-11 ≡ QAGE1-11). */
+export function sopFamilyGroupKey(record: Pick<ISOP, "identifier" | "sopBaseId">): string {
+  const normalized = normalizeSopIdentifierKey(record.identifier);
+  const fam = sopFamilyKeyFromIdentifier(normalized);
+  if (fam) return fam;
   const base = record.sopBaseId ?? record.identifier;
   return baseIdentifierFromIdentifier(base).toUpperCase();
+}
+
+function sopGroupKey(record: ISOP): string {
+  return sopFamilyGroupKey(record);
 }
 
 function recordVersionNum(record: ISOP): number {
@@ -1348,10 +1359,11 @@ export function resolveVersionForRecord(
 }
 
 export function sopVersionFields(identifier: string, storedVersion?: string | null, pathVersion?: string | null) {
-  const version = resolveVersionForRecord(identifier, storedVersion, pathVersion);
+  const normalized = normalizeSopIdentifierKey(identifier);
+  const version = resolveVersionForRecord(normalized, storedVersion, pathVersion);
   return {
     version,
-    sopBaseId: baseIdentifierFromIdentifier(identifier),
+    sopBaseId: baseIdentifierFromIdentifier(normalized),
     versionNum: versionNumber(version),
   };
 }

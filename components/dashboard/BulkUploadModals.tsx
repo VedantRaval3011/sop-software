@@ -209,8 +209,28 @@ export function SopFolderUploadModal({
       setResults(uploadResults);
       const count = uploadResults.filter((r) => r.success).length;
       if (count > 0) {
-        showToast(`Uploaded ${count} file(s) successfully`);
+        showToast(`Uploaded ${count} file(s) — linking version files…`);
         clearFiles();
+        try {
+          const relinkRes = await fetch("/api/admin/relink-bunny-versions", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ department: department.trim() || undefined }),
+          });
+          const relinkData = await relinkRes.json();
+          if (relinkRes.ok) {
+            const parts = [
+              `${count} uploaded`,
+              relinkData.linked ? `${relinkData.linked} linked` : null,
+              relinkData.created ? `${relinkData.created} new records` : null,
+            ].filter(Boolean);
+            showToast(parts.join(", ") + " — refresh dashboard to see updated counts");
+          } else {
+            showToast(`Uploaded ${count} file(s); link step: ${relinkData.error ?? "failed"}`);
+          }
+        } catch {
+          showToast(`Uploaded ${count} file(s) successfully`);
+        }
         onSuccess();
         if (uploadResults.every((r) => r.success)) handleClose();
       } else {
@@ -226,16 +246,22 @@ export function SopFolderUploadModal({
 
   const handleRescan = async () => {
     try {
-      const [deptRes, versionRes] = await Promise.all([
+      const [deptRes, versionRes, relinkRes] = await Promise.all([
         fetch("/api/admin/reconcile-departments", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ onlyGeneral: true }),
         }),
         fetch("/api/admin/reconcile-sop-versions", { method: "POST" }),
+        fetch("/api/admin/relink-bunny-versions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ department: department.trim() || undefined }),
+        }),
       ]);
       const deptData = await deptRes.json();
       const versionData = await versionRes.json();
+      const relinkData = await relinkRes.json();
       if (!deptRes.ok) throw new Error(deptData.error ?? "Rescan failed");
       if (!versionRes.ok) throw new Error(versionData.error ?? "Version rescan failed");
 
@@ -249,7 +275,12 @@ export function SopFolderUploadModal({
             (versionData.cleaned > 0 ? `, cleaned ${versionData.cleaned} prior file link(s)` : ""),
         );
       }
-      showToast(messages.length ? messages.join(". ") : "No changes needed");
+          if (relinkRes.ok && (relinkData.linked > 0 || relinkData.created > 0)) {
+        messages.push(
+          `Linked ${relinkData.linked + relinkData.created} version file(s) from Bunny (${relinkData.missingSlotsChecked ?? "?"} slots checked)`,
+        );
+      }
+      showToast(messages.length ? messages.join(". ") : "No changes needed — refresh dashboard");
       onSuccess();
     } catch (err) {
       showToast(err instanceof Error ? err.message : "Rescan failed");
