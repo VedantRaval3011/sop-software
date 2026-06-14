@@ -125,27 +125,32 @@ export async function GET(req: NextRequest) {
       }
 
       const excelCodes = new Set<string>((snap.sopCodes || []).map(stripVersion).filter(Boolean));
-      const monthName = sopMonthMap[base];
+      const monthNameRaw = sopMonthMap[base];
+      const monthNames = monthNameRaw
+        ? monthNameRaw.split(',').map((s) => s.trim()).filter(Boolean)
+        : [];
       const inExcel = excelCodes.has(base);
 
-      if (!monthName && !inExcel) continue;
+      if (monthNames.length === 0 && !inExcel) continue;
 
-      if (monthName) {
-        addAssignment(dept, monthName, year);
+      if (monthNames.length > 0) {
         if (dept) excelAssignedDepts.add(dept);
+        const empCount = snap.employees.filter((e) =>
+          Object.entries(e.training || {}).some(([k, v]) => stripVersion(k) === base && v === true),
+        ).length;
 
-        const monthNum = MONTH_NAME_TO_NUM[monthName.toLowerCase()];
-        if (monthNum) {
-          const key = `${monthNum}-${year}`;
-          const empCount = snap.employees.filter((e) =>
-            Object.entries(e.training || {}).some(([k, v]) => stripVersion(k) === base && v === true),
-          ).length;
+        for (const monthName of monthNames) {
+          addAssignment(dept, monthName, year);
 
-          const existing = byMonthYear.get(key);
-          if (existing) {
-            existing.count += empCount;
-          } else {
-            byMonthYear.set(key, { month: monthNum, year, monthName, count: empCount });
+          const monthNum = MONTH_NAME_TO_NUM[monthName.toLowerCase()];
+          if (monthNum) {
+            const key = `${monthNum}-${year}`;
+            const existing = byMonthYear.get(key);
+            if (existing) {
+              existing.count += empCount;
+            } else {
+              byMonthYear.set(key, { month: monthNum, year, monthName, count: empCount });
+            }
           }
         }
       }

@@ -223,6 +223,19 @@ const GrandTotalText = memo(function GrandTotalText() {
   return <>({c.grandTotal()})</>;
 });
 
+function highlightText(text: string, query: string): React.ReactNode {
+  if (!query.trim()) return text;
+  const idx = text.toLowerCase().indexOf(query.trim().toLowerCase());
+  if (idx === -1) return text;
+  return (
+    <>
+      {text.slice(0, idx)}
+      <mark className="bg-yellow-200 text-yellow-900 rounded-sm px-0">{text.slice(idx, idx + query.trim().length)}</mark>
+      {text.slice(idx + query.trim().length)}
+    </>
+  );
+}
+
 export default function ManageSOPDashboard() {
   useAuthGuard();
   const searchParams = useSearchParams();
@@ -230,9 +243,10 @@ export default function ManageSOPDashboard() {
     ? '/induction-training-matrix'
     : '/training-matrix';
 
-  // Synchronous first paint from localStorage (hard refresh feels instant).
-  const [viewData, setViewData] = useState<ManageSOPViewResponse | null>(() => readManageSopLocalCache());
-  const [loading, setLoading] = useState(() => readManageSopLocalCache() === null);
+  // Always start with null/true so the server and client render the same initial HTML
+  // (localStorage is client-only; reading it in useState initializer causes hydration mismatch).
+  const [viewData, setViewData] = useState<ManageSOPViewResponse | null>(null);
+  const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState('');
   const [search, setSearch] = useState('');
@@ -572,6 +586,7 @@ export default function ManageSOPDashboard() {
     setApplyMsg(null);
 
     const designationsByDept = viewData.designationsByDept || {};
+    const manualDesignations = viewData.manualDesignations || {};
     const currentYear = new Date().getFullYear();
     const grouped = new Map<
       string,
@@ -604,13 +619,15 @@ export default function ManageSOPDashboard() {
         // ("0 updates").
         const deptStat = sop.deptStats.find(s => s.department === dept);
         const allDeptDesigs = sortDesignations(designationsByDept[dept] || []);
+        const manualDesigList = (manualDesignations[sopCode.toUpperCase()]?.[dept] || []);
         const realDesigs = allDeptDesigs.filter(fullName => {
           const key = desigKey(dept, fullName);
           if (key in sopOverrides) return !!sopOverrides[key];
-          // Fallback: MatrixSOPAssignment says it's assigned for this designation
+          // Fallback: match the same 3-way logic the month-cell "active" check uses,
+          // so a month cell that the UI allows clicking always produces an insertion.
           return (deptStat?.designations || []).some(
-            d => d.designation === fullName && d.isAssigned
-          );
+            d => d.designation === fullName && (d.isAssigned || (d.count || 0) > 0)
+          ) || manualDesigList.includes(fullName);
         });
 
         // Explicitly unchecked month cell => remove all manual allocations for that cell.
@@ -702,7 +719,7 @@ export default function ManageSOPDashboard() {
       setAppliedMonthCells({ ...monthCells });
       setApplyMsg({
         kind: 'ok',
-        text: `Updated training records: ${data.inserted || 0} added${data.removed ? `, ${data.removed} removed` : ''}${data.unchanged ? `; ${data.unchanged} already existed` : ''}.`,
+        text: `Updated training records: ${data.inserted || 0} added${data.updated ? `, ${data.updated} updated` : ''}${data.removed ? `, ${data.removed} removed` : ''}${data.unchanged ? `; ${data.unchanged} already existed` : ''}${data.inserted === 0 && !data.updated && !data.removed && !data.unchanged ? ' — no matching employees or records found' : ''}.`,
       });
 
       // Both matrix pages cache overview payloads in localStorage for 5 minutes.
@@ -714,15 +731,42 @@ export default function ManageSOPDashboard() {
         }
       } catch { /* storage unavailable — non-fatal */ }
 
-      // Refetch so the table reflects the updated counts from the DB.
-      // Intentionally preserve overrides / monthCells (and their applied snapshots)
-      // so the user's ticked designation + month checkboxes — and the assigned
-      // department colors in the month section — remain visible after Update.
-      const refresh = await fetch(`/api/training-matrix/manage-sop-view?year=all&refresh=1`, { cache: 'no-store' });
-      if (refresh.ok) {
-        const fresh = await refresh.json();
-        setViewData(fresh);
-      }
+      // Optimistically update manualAllocations/manualDesignations so that the
+      // highlighted cells survive a page reload without waiting for a full rebuild.
+      setViewData(prev => {
+        if (!prev) return prev;
+        const newAllocs: Record<string, Record<string, number[]>> = JSON.parse(JSON.stringify(prev.manualAllocations || {}));
+        const newDesigs: Record<string, Record<string, string[]>> = JSON.parse(JSON.stringify(prev.manualDesignations || {}));
+
+        for (const removal of removals) {
+          const code = removal.sopCode.toUpperCase();
+          if (!newAllocs[code]?.[removal.department]) continue;
+          newAllocs[code][removal.department] = newAllocs[code][removal.department].filter(m => !removal.months.includes(m));
+        }
+        for (const entry of entries) {
+          const code = entry.sopCode.toUpperCase();
+          if (!newAllocs[code]) newAllocs[code] = {};
+          const existing = newAllocs[code][entry.department] || [];
+          newAllocs[code][entry.department] = [...new Set([...existing, ...entry.months])];
+          if (entry.designations.length > 0) {
+            if (!newDesigs[code]) newDesigs[code] = {};
+            const existingDesigs = newDesigs[code][entry.department] || [];
+            newDesigs[code][entry.department] = [...new Set([...existingDesigs, ...entry.designations])];
+          }
+        }
+
+        return { ...prev, manualAllocations: newAllocs, manualDesignations: newDesigs };
+      });
+
+      // Background refresh to update count bubbles — non-blocking so the UI stays
+      // responsive immediately after Update. Use refresh=1 so the server rebuilds
+      // synchronously AND pulls a fresh overview snapshot; otherwise the
+      // Total/Assigned/Unassigned cards keep showing the pre-save counts (the
+      // cached overview that drives the unassigned list is stale until recomputed).
+      fetch(`/api/training-matrix/manage-sop-view?year=all&refresh=1`, { cache: 'no-store' })
+        .then(r => r.ok ? r.json() : null)
+        .then(fresh => { if (fresh) setViewData(fresh); })
+        .catch(() => {});
     } catch (err) {
       setApplyMsg({
         kind: 'err',
@@ -776,10 +820,18 @@ export default function ManageSOPDashboard() {
   };
 
   useEffect(() => {
+    // Seed from localStorage on first client paint — avoids loading flash while
+    // keeping the initial SSR render (null/true) matching the client's first pass.
+    const cached = readManageSopLocalCache();
+    if (cached) {
+      setViewData(cached);
+      setLoading(false);
+    }
+
     const controller = new AbortController();
     const fetchData = async (refresh = false) => {
       try {
-        if (!viewData) setLoading(true);
+        if (!viewData && !cached) setLoading(true);
         else setRefreshing(true);
         const url = `/api/training-matrix/manage-sop-view?year=all${refresh ? '&refresh=1' : ''}`;
         const res = await fetch(url, { cache: 'no-store', signal: controller.signal });
@@ -1541,6 +1593,7 @@ export default function ManageSOPDashboard() {
                 setDeptInductionChecked={setDeptInductionChecked}
                 toggleMonthCell={toggleMonthCell}
                 openCountPopup={stableOpenCountPopup}
+                searchQuery={deferredSearch}
               />
               </CountsContext.Provider>
             </table>
@@ -2126,6 +2179,7 @@ interface VirtualizedSopRowsProps {
   setDeptInductionChecked: (sopCode: string, dept: string, value: boolean) => void;
   toggleMonthCell: (sopCode: string, dept: string, month: number, value: boolean) => void;
   openCountPopup: (e: React.MouseEvent, scope: CountScope) => void;
+  searchQuery: string;
 }
 
 const VirtualizedSopRows = memo(function VirtualizedSopRows({
@@ -2154,11 +2208,26 @@ const VirtualizedSopRows = memo(function VirtualizedSopRows({
   setDeptInductionChecked,
   toggleMonthCell,
   openCountPopup,
+  searchQuery,
 }: VirtualizedSopRowsProps) {
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportHeight, setViewportHeight] = useState(720);
   const scrollRafRef = useRef<number | null>(null);
   const pendingScrollTopRef = useRef(0);
+  // Measured row heights keyed by index. The fixed ESTIMATED_ROW_HEIGHT is only a
+  // seed — actual rows (7 department sub-rows) are much taller, and a wrong estimate
+  // makes the spacer padding drift out of sync with the browser's real layout,
+  // pushing the rendered window off-screen (the "blank rows" bug). Measuring after
+  // render keeps the offsets exact regardless of how tall a row turns out to be.
+  const rowHeightsRef = useRef<number[]>([]);
+  const [measureTick, setMeasureTick] = useState(0);
+
+  // Reset measurements when the row set or layout mode changes — index→row mapping
+  // (and therefore height) is no longer valid.
+  useLayoutEffect(() => {
+    rowHeightsRef.current = [];
+    setMeasureTick((t) => t + 1);
+  }, [filteredSops, viewMode]);
 
   useLayoutEffect(() => {
     const el = scrollRef.current;
@@ -2191,26 +2260,73 @@ const VirtualizedSopRows = memo(function VirtualizedSopRows({
     };
   }, [scrollRef, filteredSops.length, viewMode]);
 
+  // Cumulative pixel offsets built from measured heights (estimate for unmeasured
+  // rows). offsets[i] = top of row i; offsets[n] = total content height.
+  const { offsets, totalHeight } = useMemo(() => {
+    const est = viewMode === 'employee' ? ESTIMATED_ROW_HEIGHT_EMPLOYEE : ESTIMATED_ROW_HEIGHT;
+    const n = filteredSops.length;
+    const offs = new Array<number>(n + 1);
+    offs[0] = 0;
+    for (let i = 0; i < n; i++) offs[i + 1] = offs[i] + (rowHeightsRef.current[i] || est);
+    return { offsets: offs, totalHeight: offs[n] };
+    // measureTick changes whenever a measured height updates.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filteredSops.length, viewMode, measureTick]);
+
   const windowedRange = useMemo(() => {
     const total = filteredSops.length;
     if (total === 0) return { start: 0, end: 0, topPad: 0, bottomPad: 0 };
-    const rowHeight = viewMode === 'employee' ? ESTIMATED_ROW_HEIGHT_EMPLOYEE : ESTIMATED_ROW_HEIGHT;
     const overscan = viewMode === 'employee' ? ROW_OVERSCAN_EMPLOYEE : ROW_OVERSCAN;
-    const start = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
-    const visibleCount = Math.ceil(viewportHeight / rowHeight) + overscan * 2;
-    const end = Math.min(total, start + visibleCount);
+    // Largest index whose top offset is <= scrollTop (first row touching the viewport).
+    let lo = 0;
+    let hi = total;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (offsets[mid] <= scrollTop) lo = mid + 1;
+      else hi = mid;
+    }
+    const start = Math.max(0, lo - 1 - overscan);
+    // Smallest index whose top offset is >= the viewport bottom.
+    const bottom = scrollTop + viewportHeight;
+    lo = start;
+    hi = total;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (offsets[mid] < bottom) lo = mid + 1;
+      else hi = mid;
+    }
+    const end = Math.min(total, lo + overscan);
     return {
       start,
       end,
-      topPad: start * rowHeight,
-      bottomPad: Math.max(0, (total - end) * rowHeight),
+      topPad: offsets[start],
+      bottomPad: Math.max(0, totalHeight - offsets[end]),
     };
-  }, [filteredSops.length, scrollTop, viewportHeight, viewMode]);
+  }, [filteredSops.length, scrollTop, viewportHeight, viewMode, offsets, totalHeight]);
 
   const windowedSops = useMemo(
     () => filteredSops.slice(windowedRange.start, windowedRange.end),
     [filteredSops, windowedRange.start, windowedRange.end],
   );
+
+  // Measure the rows actually in the DOM after each paint and store real heights.
+  // Only triggers a re-render when a height genuinely changed, so it converges.
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const rows = el.querySelectorAll<HTMLTableRowElement>('tr[data-row-index]');
+    let changed = false;
+    rows.forEach((r) => {
+      const i = Number(r.dataset.rowIndex);
+      if (!Number.isInteger(i)) return;
+      const h = r.offsetHeight;
+      if (h > 0 && Math.abs((rowHeightsRef.current[i] ?? 0) - h) > 1) {
+        rowHeightsRef.current[i] = h;
+        changed = true;
+      }
+    });
+    if (changed) setMeasureTick((t) => t + 1);
+  });
 
   if (filteredSops.length === 0) {
     return (
@@ -2259,6 +2375,7 @@ const VirtualizedSopRows = memo(function VirtualizedSopRows({
             setDeptInductionChecked={setDeptInductionChecked}
             toggleMonthCell={toggleMonthCell}
             openCountPopup={openCountPopup}
+            searchQuery={searchQuery}
           />
         );
       })}
@@ -2332,6 +2449,7 @@ interface SopRowProps {
   setDeptInductionChecked: (sopCode: string, dept: string, value: boolean) => void;
   toggleMonthCell: (sopCode: string, dept: string, month: number, value: boolean) => void;
   openCountPopup: (e: React.MouseEvent, scope: CountScope) => void;
+  searchQuery: string;
 }
 
 const SopRow = memo(function SopRow({
@@ -2357,6 +2475,7 @@ const SopRow = memo(function SopRow({
   setDeptInductionChecked,
   toggleMonthCell,
   openCountPopup,
+  searchQuery,
 }: SopRowProps) {
   // Always color rows from the same source used by the Unassigned card count/filter.
   const rowBg = isUnassigned ? 'bg-red-50' : 'bg-green-50';
@@ -2390,12 +2509,8 @@ const SopRow = memo(function SopRow({
 
   return (
     <tr
+      data-row-index={idx}
       className={`border-b border-gray-200 ${rowHover} align-top`}
-      style={{
-        contentVisibility: 'auto',
-        contain: 'layout style paint',
-        containIntrinsicSize: `auto ${viewMode === 'employee' ? ESTIMATED_ROW_HEIGHT_EMPLOYEE : ESTIMATED_ROW_HEIGHT}px`,
-      }}
     >
       {/* SR NO */}
       <td className={`w-10 px-2 py-3 text-center font-medium text-gray-900 ${rowBg} align-top`}>
@@ -2603,7 +2718,7 @@ const SopRow = memo(function SopRow({
                                         className="font-medium text-[11px] text-blue-700 hover:underline cursor-pointer truncate"
                                         title={`${emp.name} (${emp.designation})`}
                                       >
-                                        {emp.name}
+                                        {highlightText(emp.name, searchQuery)}
                                       </button>
                                       <input
                                         type="checkbox"

@@ -551,10 +551,13 @@ async function computeOverviewPayload(forceFresh: boolean) {
         .map((c) => ({ sopCode: c, month: excel?.sopMonthMap?.[c] || '', department: deptName }));
 
       // Repetition buckets (how many departments share each SOP in Excel).
+      // Use allExcelUnion (not just this dept's own Excel) so that per-dept bucket
+      // sums reflect global coverage — matching the total card's excelSopCount.
+      const foundInAnyExcel = codes.filter((c) => allExcelUnion.has(c));
       const repeat3PlusList: Array<{ sopCode: string; title: string; department: string; count: number }> = [];
       const repeat2List: typeof repeat3PlusList = [];
       const repeat1List: typeof repeat3PlusList = [];
-      for (const c of foundInDb) {
+      for (const c of foundInAnyExcel) {
         const count = sopCodeToDeptCount.get(c) || 1;
         const item = { sopCode: c, title: dbBaseMeta.get(c)!.title, department: deptName, count };
         if (count >= 3) repeat3PlusList.push(item);
@@ -683,7 +686,10 @@ async function computeOverviewPayload(forceFresh: boolean) {
         const mc: Record<string, number> = {};
         for (const base of baseForMonths) {
           const mo = smm[base];
-          if (mo) mc[mo] = (mc[mo] || 0) + 1;
+          if (!mo) continue;
+          for (const m of mo.split(',').map((s: string) => s.trim()).filter(Boolean)) {
+            mc[m] = (mc[m] || 0) + 1;
+          }
         }
         return mc;
       })();

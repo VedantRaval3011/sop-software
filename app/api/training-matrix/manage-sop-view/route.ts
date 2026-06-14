@@ -196,6 +196,7 @@ async function revalidateManageSopViewInBackground(
     yearAll: boolean;
     year: number;
     reqStartMs: number;
+    forceFresh: boolean;
   },
 ): Promise<void> {
   try {
@@ -222,7 +223,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     const year = yearAll ? 0 : parseInt(yearParam) || new Date().getFullYear();
     const search = searchParams.get("search")?.toLowerCase() || "";
     const cacheYear: number | "all" = yearAll ? "all" : year;
-    const ctx = { cacheYear, search, yearAll, year, reqStartMs };
+    const ctx = { cacheYear, search, yearAll, year, reqStartMs, forceFresh };
 
     // Explicit refresh: recompute synchronously (single-flight dedups concurrent).
     if (forceFresh) {
@@ -284,9 +285,10 @@ async function buildManageSopViewResponse(
     yearAll: boolean;
     year: number;
     reqStartMs: number;
+    forceFresh: boolean;
   },
 ): Promise<ManageSOPViewResponse> {
-    const { cacheYear, search, yearAll, year, reqStartMs } = ctx;
+    const { cacheYear, search, yearAll, year, reqStartMs, forceFresh } = ctx;
     const dbConnectStartMs = nowMs();
     await connectDB();
     const dbConnectMs = elapsedMs(dbConnectStartMs);
@@ -417,11 +419,17 @@ async function buildManageSopViewResponse(
     }
 
     // Hydrate overview once up-front (needed for dbSop universe + unassigned counts).
-    let overviewData: any = overviewCached;
+    // On a forced refresh (e.g. right after a Manage SOP save) the cached overview
+    // is stale — its missingFromExcel/assigned lists still reflect the pre-save
+    // snapshot. getTrainingMatrixOverviewCached() returns that stale payload as-is,
+    // so the unassigned/assigned counts would never move. Recompute the overview
+    // synchronously via ?refresh=1 so this view AND the training-matrix page (which
+    // reads the same overview snapshot) both reflect the new assignment.
+    let overviewData: any = forceFresh ? null : overviewCached;
     if (!overviewData?.totalCard?.dbSopsByDept) {
       try {
         const overviewRes = await fetch(
-          `${request.nextUrl.origin}/api/training-matrix/overview`,
+          `${request.nextUrl.origin}/api/training-matrix/overview${forceFresh ? "?refresh=1" : ""}`,
           { cache: "no-store" },
         );
         if (overviewRes.ok) overviewData = await overviewRes.json();
@@ -1192,116 +1200,114 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     }
 
     const fallbackYear = new Date().getFullYear();
-    let totalInserted = 0;
-    let totalMatched = 0;
-    let totalUnchanged = 0;
-    let totalRemoved = 0;
     const warnings: string[] = [];
 
-    for (const removal of removalEntries) {
-      const sopCode = (removal.sopCode || "").trim();
-      const department = (removal.department || "").trim();
-      const months = (removal.months || []).filter(
-        (m) => Number.isInteger(m) && m >= 1 && m <= 12,
-      );
-      const designations = (removal.designations || [])
-        .map((d) => (d || "").trim())
-        .filter(Boolean);
-      const removeAllDesignations = removal.removeAllDesignations === true;
-      const year =
-        removal.year && Number.isInteger(removal.year)
-          ? removal.year
-          : fallbackYear;
+    // ── Normalise & validate entries/removals up front ──────────────────────
+    type NormEntry = {
+      sopCode: string; sopName: string; department: string;
+      designations: string[]; months: number[]; year: number;
+    };
+    type NormRemoval = {
+      sopCode: string; department: string; months: number[];
+      designations: string[]; removeAllDesignations: boolean; year: number;
+    };
 
-      if (!sopCode || !department || months.length === 0) continue;
-      if (!removeAllDesignations && designations.length === 0) continue;
-
-      const filter: Record<string, any> = {
-        sopCode,
-        department,
-        year,
-        month: { $in: months },
-        sourceFile: "manage-sop-manual",
-      };
-      if (!removeAllDesignations) {
-        filter.designation = { $in: designations };
-      }
-
-      const del = await TrainingMatrixRecord.deleteMany(filter);
-      totalRemoved += del.deletedCount || 0;
-    }
-
-    for (const entry of upsertEntries) {
+    const normEntries: NormEntry[] = upsertEntries.flatMap((entry) => {
       const sopCode = (entry.sopCode || "").trim();
       const department = (entry.department || "").trim();
-      const designations = (entry.designations || [])
-        .map((d) => (d || "").trim())
-        .filter(Boolean);
-      const months = (entry.months || []).filter(
-        (m) => Number.isInteger(m) && m >= 1 && m <= 12,
-      );
-      const year =
-        entry.year && Number.isInteger(entry.year) ? entry.year : fallbackYear;
+      const designations = (entry.designations || []).map((d) => (d || "").trim()).filter(Boolean);
+      const months = (entry.months || []).filter((m) => Number.isInteger(m) && m >= 1 && m <= 12);
+      const year = entry.year && Number.isInteger(entry.year) ? entry.year : fallbackYear;
+      if (!sopCode || !department || designations.length === 0 || months.length === 0) return [];
+      return [{ sopCode, sopName: entry.sopName || sopCode, department, designations, months, year }];
+    });
 
-      if (
-        !sopCode ||
-        !department ||
-        designations.length === 0 ||
-        months.length === 0
-      ) {
-        continue;
-      }
+    const normRemovals: NormRemoval[] = removalEntries.flatMap((removal) => {
+      const sopCode = (removal.sopCode || "").trim();
+      const department = (removal.department || "").trim();
+      const months = (removal.months || []).filter((m) => Number.isInteger(m) && m >= 1 && m <= 12);
+      const designations = (removal.designations || []).map((d) => (d || "").trim()).filter(Boolean);
+      const removeAllDesignations = removal.removeAllDesignations === true;
+      const year = removal.year && Number.isInteger(removal.year) ? removal.year : fallbackYear;
+      if (!sopCode || !department || months.length === 0) return [];
+      if (!removeAllDesignations && designations.length === 0) return [];
+      return [{ sopCode, department, months, designations, removeAllDesignations, year }];
+    });
 
-      // All employees in (dept, designation ∈ list) — one record per employee per month
-      const employees = await Employee.find({
-        isActive: true,
-        department,
-        designation: { $in: designations },
-      })
-        .select("name designation")
-        .lean();
+    // ── Phase 1 (parallel): deletions + employee lookups + main-upload fetches ──
+    // Collect all unique (dept, year, month) keys we'll need uploadIds for.
+    const uploadIdKeys = new Set<string>();
+    for (const e of normEntries) {
+      for (const m of e.months) uploadIdKeys.add(`${e.department}|${e.year}|${m}`);
+    }
+    const uniqueDepts = [...new Set(normEntries.map((e) => e.department))];
 
-      if (employees.length === 0) {
-        warnings.push(
-          `No active employees found in ${department} for designations: ${designations.join(", ")}`,
-        );
-        continue;
-      }
+    const [removalResults, employeeResults, mainUploads, uploadIdResults] = await Promise.all([
+      // All deletions in parallel
+      Promise.all(normRemovals.map((r) => {
+        const filter: Record<string, any> = {
+          sopCode: r.sopCode, department: r.department, year: r.year,
+          month: { $in: r.months }, sourceFile: "manage-sop-manual",
+        };
+        if (!r.removeAllDesignations) filter.designation = { $in: r.designations };
+        return TrainingMatrixRecord.deleteMany(filter);
+      })),
+      // All employee lookups in parallel (one per entry)
+      Promise.all(normEntries.map((e) =>
+        Employee.find({ isActive: true, department: e.department, designation: { $in: e.designations } })
+          .select("name designation").lean()
+      )),
+      // All main-upload fetches in parallel (one per unique dept)
+      Promise.all(uniqueDepts.map((dept) =>
+        TrainingMatrixUpload.findOne({
+          department: dept, fileType: "main",
+          snapshot: { $exists: true, $ne: null },
+        }).sort({ uploadedAt: -1 }).lean()
+      )),
+      // All uploadId lookups in parallel (one per dept|year|month combo)
+      Promise.all([...uploadIdKeys].map(async (key) => {
+        const [dept, yearStr, monthStr] = key.split("|");
+        const id = await getOrCreateManualUploadId(dept, Number(yearStr), Number(monthStr));
+        return [key, id] as const;
+      })),
+    ]);
 
-      // Cache uploadId per (dept, year, month) — one per month
-      const uploadIdCache = new Map<number, any>();
+    const totalRemoved = removalResults.reduce((s, r) => s + (r.deletedCount || 0), 0);
+    const mainUploadByDept = new Map<string, any>(
+      uniqueDepts.map((dept, i) => [dept, mainUploads[i]])
+    );
+    const uploadIdMap = new Map<string, any>(uploadIdResults);
+
+    // Filter out entries with no employees and warn
+    const validEntries = normEntries.filter((e, i) => {
+      if ((employeeResults[i] as any[]).length > 0) return true;
+      warnings.push(`No active employees found in ${e.department} for designations: ${e.designations.join(", ")}`);
+      return false;
+    });
+
+    // ── Phase 2 (parallel): all bulkWrites + all snapshot updates ───────────
+    type SnapshotPatch = { sopCode: string; sopName: string; months: number[]; designations: string[] };
+    const snapshotPatches = new Map<string, SnapshotPatch[]>(); // dept → patches
+
+    const bulkWriteOps = validEntries.map((e, idx) => {
+      const emps = employeeResults[normEntries.indexOf(e)] as any[];
       const ops: any[] = [];
-      for (const month of months) {
-        let uploadId = uploadIdCache.get(month);
-        if (!uploadId) {
-          uploadId = await getOrCreateManualUploadId(department, year, month);
-          uploadIdCache.set(month, uploadId);
-        }
+      for (const month of e.months) {
+        const uploadId = uploadIdMap.get(`${e.department}|${e.year}|${month}`);
         const monthName = MONTH_NAMES[month] || `Month ${month}`;
-        for (const emp of employees as any[]) {
+        for (const emp of emps) {
           const employeeName = String(emp.name || "").trim();
-          const designation = String(emp.designation || "").trim();
           if (!employeeName) continue;
           ops.push({
             updateOne: {
-              filter: { employeeName, sopCode, month, year, department },
+              filter: { employeeName, sopCode: e.sopCode, month, year: e.year, department: e.department },
               update: {
                 $setOnInsert: {
-                  uploadId,
-                  department,
-                  employeeName,
-                  designation,
-                  sopCode,
-                  sopName: entry.sopName || sopCode,
-                  month,
-                  year,
-                  monthName,
-                  rawSymbol: "✓",
-                  sourceFile: "manage-sop-manual",
-                  isAddendum: true,
+                  uploadId, department: e.department, employeeName,
+                  designation: String(emp.designation || "").trim(),
+                  sopCode: e.sopCode, sopName: e.sopName, month, year: e.year,
+                  monthName, rawSymbol: "✓", sourceFile: "manage-sop-manual", isAddendum: true,
                 },
-                // Always normalize status to 'completed' on apply — the user is asserting
-                // these trainings happened.
                 $set: { status: "completed" },
               },
               upsert: true,
@@ -1309,91 +1315,85 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
           });
         }
       }
-
-      if (ops.length === 0) continue;
-      const result = await TrainingMatrixRecord.bulkWrite(ops, {
-        ordered: false,
+      // Accumulate snapshot patches per dept
+      if (!snapshotPatches.has(e.department)) snapshotPatches.set(e.department, []);
+      snapshotPatches.get(e.department)!.push({
+        sopCode: e.sopCode, sopName: e.sopName, months: e.months, designations: e.designations,
       });
-      const inserted = (result as any).upsertedCount || 0;
+      return ops;
+    });
+
+    const [bulkResults, ...snapshotResults] = await Promise.all([
+      // All bulkWrites in parallel
+      Promise.all(bulkWriteOps.map((ops) =>
+        ops.length > 0
+          ? TrainingMatrixRecord.bulkWrite(ops, { ordered: false })
+          : Promise.resolve(null)
+      )),
+      // All snapshot updates in parallel (one per unique dept)
+      ...[...snapshotPatches.entries()].map(async ([dept, patches]) => {
+        try {
+          const mainUpload: any = mainUploadByDept.get(dept);
+          if (!mainUpload?._id) {
+            warnings.push(`No main Training Matrix upload found for ${dept} — count cards will not refresh until an Excel is uploaded for this dept.`);
+            return;
+          }
+          const snapshotCodes: string[] = Array.isArray(mainUpload?.snapshot?.sopCodes)
+            ? mainUpload.snapshot.sopCodes : [];
+          const snapshotEmployees: Array<{ name?: string; designation?: string; training?: Record<string, boolean> }> =
+            Array.isArray(mainUpload?.snapshot?.employees) ? mainUpload.snapshot.employees : [];
+
+          const newSopCodes: string[] = [];
+          const update: any = { $set: {} };
+          for (const patch of patches) {
+            const base = stripVersion(patch.sopCode);
+            if (!snapshotCodes.some((c) => stripVersion(String(c)) === base)) {
+              newSopCodes.push(patch.sopCode);
+            }
+            const snapshotMonthMap: Record<string, string> = mainUpload?.snapshot?.sopMonthMap || {};
+            const patchBase = stripVersion(patch.sopCode);
+            const existingMonths: string[] = [];
+            for (const [k, v] of Object.entries(snapshotMonthMap)) {
+              if (stripVersion(String(k)) === patchBase && v) {
+                for (const m of String(v).split(',').map((s: string) => s.trim()).filter(Boolean)) {
+                  existingMonths.push(m);
+                }
+              }
+            }
+            const newMonths = patch.months.map((m: number) => MONTH_NAMES[m] || `Month ${m}`);
+            const allMonths = [...new Set([...existingMonths, ...newMonths])];
+            update.$set[`snapshot.sopMonthMap.${patch.sopCode}`] = allMonths.join(',');
+            const desigSet = new Set(patch.designations.map((d) => d.toLowerCase()));
+            snapshotEmployees.forEach((emp, idx) => {
+              if (desigSet.has(String(emp?.designation || "").toLowerCase())) {
+                update.$set[`snapshot.employees.${idx}.training.${patch.sopCode}`] = true;
+              }
+            });
+          }
+          if (newSopCodes.length > 0) update.$addToSet = { "snapshot.sopCodes": { $each: newSopCodes } };
+          await TrainingMatrixUpload.updateOne({ _id: mainUpload._id }, update);
+        } catch (e) {
+          warnings.push(`Failed to sync ${dept} snapshot: ${(e as Error).message}`);
+        }
+      }),
+    ]);
+
+    let totalInserted = 0, totalMatched = 0, totalUnchanged = 0;
+    for (const result of bulkResults) {
+      if (!result) continue;
+      totalInserted += (result as any).upsertedCount || 0;
       const matched = (result as any).matchedCount || 0;
       const modified = (result as any).modifiedCount || 0;
-      totalInserted += inserted;
       totalMatched += matched;
       totalUnchanged += matched - modified;
-
-      // Sync the assigned/unassigned counts shown on the main Training Matrix page.
-      // The overview endpoint computes those from the dept's latest `fileType: 'main'`
-      // upload (`snapshot.sopCodes` for "in Excel" and `snapshot.sopMonthMap` for the
-      // scheduled month). Without this update, the SOP would still appear in the
-      // "missing from Excel" red bucket after the user clicked Update, so the cards
-      // wouldn't move from 43 → 42 / 702 → 703.
-      try {
-        const mainUpload: any = await TrainingMatrixUpload.findOne({
-          department,
-          fileType: "main",
-          snapshot: { $exists: true, $ne: null },
-        })
-          .sort({ uploadedAt: -1 })
-          .lean();
-        if (mainUpload?._id) {
-          const snapshotCodes: string[] = Array.isArray(
-            mainUpload?.snapshot?.sopCodes,
-          )
-            ? mainUpload.snapshot.sopCodes
-            : [];
-          const base = stripVersion(sopCode);
-          const alreadyInCodes = snapshotCodes.some(
-            (c) => stripVersion(String(c)) === base,
-          );
-          const firstMonth = months[0];
-          const monthName = MONTH_NAMES[firstMonth] || `Month ${firstMonth}`;
-          const update: any = {
-            $set: { [`snapshot.sopMonthMap.${sopCode}`]: monthName },
-          };
-          if (!alreadyInCodes) {
-            update.$addToSet = { "snapshot.sopCodes": sopCode };
-          }
-
-          // Mark the SOP as completed in the per-employee training map so the
-          // Training Matrix employee × SOP detail grid (rendered from
-          // snapshot.employees[].training) also reflects the new assignment.
-          const snapshotEmployees: Array<{
-            name?: string;
-            designation?: string;
-            training?: Record<string, boolean>;
-          }> = Array.isArray(mainUpload?.snapshot?.employees)
-            ? mainUpload.snapshot.employees
-            : [];
-          const desigSet = new Set(designations.map((d) => d.toLowerCase()));
-          snapshotEmployees.forEach((emp, idx) => {
-            const desig = String(emp?.designation || "").toLowerCase();
-            if (!desigSet.has(desig)) return;
-            update.$set[`snapshot.employees.${idx}.training.${sopCode}`] = true;
-          });
-
-          await TrainingMatrixUpload.updateOne({ _id: mainUpload._id }, update);
-        } else {
-          warnings.push(
-            `No main Training Matrix upload found for ${department} — count cards will not refresh until an Excel is uploaded for this dept.`,
-          );
-        }
-      } catch (e) {
-        warnings.push(
-          `Failed to sync ${department} snapshot for ${sopCode}: ${(e as Error).message}`,
-        );
-      }
     }
 
-    // Drop all related caches so the next GET after "Update" reflects DB writes immediately.
-    try {
-      await Promise.all([
-        invalidateTrainingMatrixCache(),
-        invalidateInductionTrainingMatrixCache(),
-        invalidateManageSopViewCache(),
-      ]);
-    } catch {
-      // Cache invalidation is best-effort; not fatal.
-    }
+    // Drop caches after all writes — best-effort, non-blocking on the response.
+    void Promise.all([
+      invalidateTrainingMatrixCache(),
+      invalidateInductionTrainingMatrixCache(),
+      invalidateManageSopViewCache(),
+    ]).catch(() => {});
 
     console.info(
       `${MANAGE_SOP_API_LOG} POST /api/training-matrix/manage-sop-view source=manage-sop dbConnectMs=${dbConnectMs} upsertEntries=${upsertEntries.length} removalEntries=${removalEntries.length} inserted=${totalInserted} removed=${totalRemoved} updated=${totalMatched} unchanged=${totalUnchanged} warnings=${warnings.length} totalMs=${elapsedMs(reqStartMs)}`,

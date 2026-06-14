@@ -13,6 +13,19 @@ function monthForCode(monthMap: Record<string, string>, sopCode: string): string
   return monthMap[base] || monthMap[sopCode] || '';
 }
 
+// Returns all scheduled months for a SOP (supports comma-separated values stored
+// when the same SOP is manually assigned to multiple months via Manage SOPs).
+function monthsForCode(monthMap: Record<string, string>, sopCode: string): string[] {
+  const raw = monthForCode(monthMap, sopCode);
+  if (!raw) return [];
+  return raw.split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+function monthMatchesActive(month: string, activeMonth: string): boolean {
+  if (activeMonth === 'All') return true;
+  return month.split(',').map((s) => s.trim()).includes(activeMonth);
+}
+
 function sopCodesMatch(a: string, b: string): boolean {
   const au = String(a || '').toUpperCase();
   const bu = String(b || '').toUpperCase();
@@ -50,13 +63,16 @@ function buildSopAssignedMonths(
   const seen = new Set<string>();
   for (const dept of deptList) {
     const monthMap = sopMonthMapByDept[dept] || {};
-    const month = monthForCode(monthMap, sopCode);
+    const months = monthsForCode(monthMap, sopCode);
     const inDept = (sopCodesByDept[dept] || []).some((c) => sopCodesMatch(c, sopCode));
-    if (!month && !inDept) continue;
-    const key = `${dept}|${month || '—'}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push({ dept, month: month || '—' });
+    if (months.length === 0 && !inDept) continue;
+    const displayMonths = months.length > 0 ? months : ['—'];
+    for (const month of displayMonths) {
+      const key = `${dept}|${month}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ dept, month });
+    }
   }
   return out.sort((a, b) => a.dept.localeCompare(b.dept) || a.month.localeCompare(b.month));
 }
@@ -3248,7 +3264,7 @@ export default function TrainingMatrixPage() {
       const dMonthMap = data.sopMonthMapByDept?.[d] || {};
       for (const c of dSopCodes) {
         const sopMonth = monthForCode(dMonthMap, c);
-        if (activeMonth === 'All' || sopMonth === activeMonth) {
+        if (monthMatchesActive(sopMonth, activeMonth)) {
           codes.add(c);
           monthOf[c] = sopMonth;
         }
@@ -3701,18 +3717,28 @@ export default function TrainingMatrixPage() {
             // *this card's* Excel SOPs whose DB owner is dbDept. foundInDbList only
             // contains SOPs whose DB owner == this card's dept, so it would always
             // intersect to 0 for any other dbDept. Start from full sopCodes instead.
-            let list: string[] =
-              opts.dbDept && opts.dbDept !== 'All'
-                ? (deptData.sopCodes || [])
-                : (deptData.foundInDbList || deptData.sopCodes || []);
-
+            let list: string[];
             if (opts.dbDept && opts.dbDept !== 'All') {
+              list = deptData.sopCodes || [];
               const targetDbCodes = new Set(
                 ((data.totalCard as any)?.dbSopsByDept?.[opts.dbDept] || []).map((x: any) =>
                   stripVersion(x.sopCode),
                 ),
               );
               list = list.filter((c: string) => targetDbCodes.has(stripVersion(c)));
+            } else {
+              // "In Excel" = SOPs owned by this dept found in ANY uploaded Excel (not just
+              // this dept's own Excel). Derive by subtracting globally-missing codes from
+              // all owned codes so the shown rows match the displayed count.
+              const ownedCodes = ((data.totalCard as any)?.dbSopsByDept?.[d] || []).map((x: any) =>
+                x?.sopCode || x,
+              ) as string[];
+              const missingFromAnyExcel = new Set(
+                ((deptData.excelDeptSplit?.missingListByDept?.[d] || []) as any[]).map((x: any) =>
+                  stripVersion(x?.sopCode || x),
+                ),
+              );
+              list = ownedCodes.filter((c) => !missingFromAnyExcel.has(stripVersion(c)));
             }
             codes.push(...list);
           }
@@ -3733,8 +3759,8 @@ export default function TrainingMatrixPage() {
             // Legacy path — kept for compatibility; prefer global missing.
             codes = departments.flatMap((d) => perDeptMissing(d));
           } else if (opts.dept !== 'All') {
-            // Per-dept card "In Excel" row — that dept's DB SOPs not in its own Excel.
-            codes = perDeptMissing(opts.dept);
+            // Per-dept card "In Excel" row — SOPs owned by this dept absent from ANY Excel.
+            codes = globalMissingForOwner(opts.dept);
           } else {
             // Global: DB SOPs not present in ANY Excel — matches Excel SOP / Repetitive red totals.
             codes = ((data.totalCard as any)?.missingFromExcelList || []).map((c: any) => c?.sopCode || c);
@@ -4083,7 +4109,7 @@ export default function TrainingMatrixPage() {
           };
         })
         .filter((r) => {
-          if (activeMonth !== 'All' && r.month !== activeMonth) return false;
+          if (!monthMatchesActive(r.month, activeMonth)) return false;
           if (!term) return true;
           return (
             r.sopCode.toLowerCase().includes(term) ||
@@ -4143,7 +4169,7 @@ export default function TrainingMatrixPage() {
           };
         })
         .filter((r) => {
-          if (activeMonth !== 'All' && r.month !== activeMonth) return false;
+          if (!monthMatchesActive(r.month, activeMonth)) return false;
           if (!term) return true;
           return r.sopCode.toLowerCase().includes(term) || r.pendingEmployees.length > 0 || r.completedEmployees.length > 0;
         })
@@ -4210,7 +4236,7 @@ export default function TrainingMatrixPage() {
           };
         })
         .filter((r) => {
-          if (activeMonth !== 'All' && r.month !== activeMonth) return false;
+          if (!monthMatchesActive(r.month, activeMonth)) return false;
           if (!term) return true;
           return r.sopCode.toLowerCase().includes(term) || (r.month || '').toLowerCase().includes(term) || r.pendingEmployees.length > 0 || r.completedEmployees.length > 0;
         });
@@ -4317,7 +4343,7 @@ export default function TrainingMatrixPage() {
           };
         })
         .filter((r) => {
-          if (activeMonth !== 'All' && r.month !== activeMonth) return false;
+          if (!monthMatchesActive(r.month, activeMonth)) return false;
           if (!term) return true;
           // keep if sop matches month/code search too
           return r.sopCode.toLowerCase().includes(term) || (r.month || '').toLowerCase().includes(term) || r.pendingEmployees.length > 0 || r.completedEmployees.length > 0;
@@ -4408,27 +4434,28 @@ export default function TrainingMatrixPage() {
         .map(([key, v]) => ({ key, label: key, ...v }));
     })();
 
-    // Aggregate repetitive SOP counts across all uploaded depts
-    // De-duplicate by sopCode since same SOP appears in multiple dept lists
-    const allRepeat3Plus = new Map<string, { sopCode: string; title: string; department: string; count: number }>();
-    const allRepeat2 = new Map<string, { sopCode: string; title: string; department: string; count: number }>();
-    const allRepeatOnce = new Map<string, { sopCode: string; title: string; department: string; count: number }>();
-    for (const dept of departments) {
-      const deptData = data?.perDept?.[dept] as any;
-      if (!deptData?.uploaded) continue;
-      for (const item of (deptData.repeat3PlusList || []) as Array<{ sopCode: string; title: string; department: string; count: number }>) {
-        if (!allRepeat3Plus.has(item.sopCode)) allRepeat3Plus.set(item.sopCode, item);
+    // Aggregate bucket lists from ALL dept cards (no upload guard) so the total is always
+    // the sum of dept cards — never an independently-computed total that can drift.
+    // The API now builds per-dept bucket lists from allExcelUnion, so even non-uploaded
+    // depts contribute SOPs that appear in other depts' Excels.
+    const _allRepeat3Plus = new Map<string, { sopCode: string; title: string; department: string; count: number }>();
+    const _allRepeat2 = new Map<string, { sopCode: string; title: string; department: string; count: number }>();
+    const _allRepeatOnce = new Map<string, { sopCode: string; title: string; department: string; count: number }>();
+    for (const _dept of departments) {
+      const _dd = data?.perDept?.[_dept] as any;
+      for (const item of (_dd?.repeat3PlusList || []) as Array<{ sopCode: string; title: string; department: string; count: number }>) {
+        if (!_allRepeat3Plus.has(item.sopCode)) _allRepeat3Plus.set(item.sopCode, item);
       }
-      for (const item of (deptData.repeat2List || []) as Array<{ sopCode: string; title: string; department: string; count: number }>) {
-        if (!allRepeat2.has(item.sopCode)) allRepeat2.set(item.sopCode, item);
+      for (const item of (_dd?.repeat2List || []) as Array<{ sopCode: string; title: string; department: string; count: number }>) {
+        if (!_allRepeat2.has(item.sopCode)) _allRepeat2.set(item.sopCode, item);
       }
-      for (const item of (deptData.repeat1List || []) as Array<{ sopCode: string; title: string; department: string; count: number }>) {
-        if (!allRepeatOnce.has(item.sopCode)) allRepeatOnce.set(item.sopCode, item);
+      for (const item of (_dd?.repeat1List || []) as Array<{ sopCode: string; title: string; department: string; count: number }>) {
+        if (!_allRepeatOnce.has(item.sopCode)) _allRepeatOnce.set(item.sopCode, item);
       }
     }
-    const totalRepeat3PlusList = Array.from(allRepeat3Plus.values());
-    const totalRepeat2List = Array.from(allRepeat2.values());
-    const totalRepeatOnceList = Array.from(allRepeatOnce.values());
+    const totalRepeat3PlusList = Array.from(_allRepeat3Plus.values());
+    const totalRepeat2List = Array.from(_allRepeat2.values());
+    const totalRepeatOnceList = Array.from(_allRepeatOnce.values());
 
     // Aggregate Excel SOP Dept Split across all uploaded depts (found only — missing is global).
     const totalExcelDeptFoundByDept: Record<string, number> = {};
@@ -4448,6 +4475,12 @@ export default function TrainingMatrixPage() {
     const totalExcelDeptUnknownMissing = (t as any).excelDeptSplit?.unknownMissing ?? 0;
     const totalExcelDeptMissingSum = t.missingSopCount ?? 0;
     const hasTotalExcelDeptSplit = totalExcelDeptTotal > 0;
+    // "In Excel" totals derived from dept cards (same dataset) so total always equals sum of depts.
+    const totalInExcelFromDepts = departments.reduce((sum, dep) => {
+      const ownedTotal = (data?.totalCard?.dbSopCountsByDept as any)?.[dep] ?? 0;
+      const missingAny = (data?.perDept?.[dep] as any)?.excelDeptSplit?.missingByDept?.[dep] ?? 0;
+      return sum + ownedTotal - missingAny;
+    }, 0);
 
     const totalExpiryExpired = t.expiredCount ?? 0;
     const totalExpiryNear = t.nearExpiryCount ?? t.dueSoon30Count ?? 0;
@@ -4488,11 +4521,11 @@ export default function TrainingMatrixPage() {
               className="min-w-[1.35rem] cursor-pointer rounded px-1 py-0.5 text-center text-[10px] font-bold leading-none text-emerald-700 transition-colors hover:bg-emerald-50 focus:z-10 focus:outline-none focus:ring-1 focus:ring-emerald-500/70"
               title="Found"
             >
-              {t.excelSopCount}
+              {totalInExcelFromDepts}
             </button>
             <span className="select-none text-[8px] font-light text-black/35" aria-hidden>|</span>
             <RedCountBtn
-              value={t.missingSopCount ?? 0}
+              value={t.dbSopCount - totalInExcelFromDepts}
               title="Missing"
               onClick={() =>
                 applySummaryCapsuleFilter({
@@ -4639,7 +4672,7 @@ export default function TrainingMatrixPage() {
                   </button>
                   <span className="select-none text-[8px] font-light text-black/35" aria-hidden>|</span>
                   <RedCountBtn
-                    value={totalExcelDeptMissingSum}
+                    value={t.dbSopCount - bucketSopSum}
                     title="Missing SOPs (DB but not in any Excel)"
                     onClick={() => applySummaryCapsuleFilter({ dept: 'All', type: 'missing', title: 'Total · Missing (DB but not in any Excel)' })}
                   />
@@ -4927,17 +4960,17 @@ export default function TrainingMatrixPage() {
               className="min-w-[1.35rem] cursor-pointer rounded px-1 py-0.5 text-center text-[10px] font-bold leading-none text-emerald-700 transition-colors hover:bg-emerald-50 focus:z-10 focus:outline-none focus:ring-1 focus:ring-emerald-500/70"
               title="Found"
             >
-              {d.foundInDb}
+              {dbDeptCount - ((d.excelDeptSplit?.missingByDept as any)?.[dept] ?? 0)}
             </button>
             <span className="select-none text-[8px] font-light text-black/35" aria-hidden>|</span>
                 <RedCountBtn
-                  value={d.missingFromExcel ?? 0}
-                  title="Missing (this dept's DB SOPs not in its own Excel)"
+                  value={(d.excelDeptSplit?.missingByDept as any)?.[dept] ?? 0}
+                  title="Missing (this dept's DB SOPs not in any Excel)"
                   onClick={() =>
                     applySummaryCapsuleFilter({
                       dept,
                       type: 'missing',
-                      title: `${dept} · Missing (DB but not in this dept's Excel)`,
+                      title: `${dept} · Missing (DB but not in any Excel)`,
                     })
                   }
                 />
@@ -5078,6 +5111,8 @@ export default function TrainingMatrixPage() {
           const dr2 = (d.repeat2List ?? []).reduce((s, i) => s + (i.count || 0), 0);
           const dr1 = (d.repeat1List ?? []).reduce((s, i) => s + (i.count || 0), 0);
           const bucketSopSum = r3Count + r2Count + r1Count;
+          const deptOwnedTotal = data?.totalCard?.dbSopCountsByDept?.[dept] ?? 0;
+          const deptMissingAnyExcel = deptOwnedTotal - bucketSopSum;
           return (
             <>
               <div className="flex w-full min-h-[24px] items-center justify-between gap-1 px-1 py-0.5 text-[11px]">
@@ -5093,9 +5128,9 @@ export default function TrainingMatrixPage() {
                   </button>
                   <span className="select-none text-[8px] font-light text-black/35" aria-hidden>|</span>
                   <RedCountBtn
-                    value={globalMissingCount}
+                    value={deptMissingAnyExcel}
                     title="Missing SOPs (DB but not in any Excel)"
-                    onClick={() => applySummaryCapsuleFilter({ dept: 'All', type: 'missing', title: `${dept} · Missing (DB but not in any Excel)` })}
+                    onClick={() => applySummaryCapsuleFilter({ dept, type: 'missing', title: `${dept} · Missing (DB but not in any Excel)` })}
                   />
                 </div>
               </div>
@@ -5593,7 +5628,7 @@ export default function TrainingMatrixPage() {
   }) {
     const tint = deptToBgTint(dept, sop.expired);
 
-    const isActiveMonth = activeMonth !== 'All' && sop.month && sop.month === activeMonth;
+    const isActiveMonth = activeMonth !== 'All' && sop.month && monthMatchesActive(sop.month, activeMonth);
 
 
     const openEmployee = (n: string) => {
