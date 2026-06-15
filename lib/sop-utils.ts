@@ -1177,9 +1177,25 @@ export function baseIdentifierFromIdentifier(identifier: string): string {
   return code;
 }
 
-/** Match all identifier variants for the same SOP family (e.g. PEGE11, PEGE11-09, PEGE11-11). */
+/**
+ * Match all identifier variants for the same SOP family (e.g. PEGE11, PEGE11-09,
+ * PEGE11-11). The document number is matched leading-zero-insensitively so the
+ * family resolves to the SAME record set the registry groups for display
+ * ({@link sopFamilyGroupKey} treats QAGE01-11 ≡ QAGE1-11). If this regex were
+ * stricter than the grouping, an obsolete/revive/edit action would touch only
+ * some of a family's rows and the registry — which marks a family obsolete only
+ * when `group.every(r => r.isObsolete)` — would snap it back to active on reload.
+ */
 export function sopFamilyIdentifierRegex(identifier: string): RegExp {
   const base = baseIdentifierFromIdentifier(identifier);
+  // Split a trailing document number off the base so QAGE01 and QAGE1 collapse:
+  // emit `LETTERS0*N` so any zero-padding of the doc number matches.
+  const docMatch = base.match(/^(.*?)(\d+)$/);
+  if (docMatch) {
+    const prefix = docMatch[1].replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
+    const docNum = String(parseInt(docMatch[2], 10));
+    return new RegExp(`^${prefix}0*${docNum}(-\\d+)?$`, "i");
+  }
   const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
   return new RegExp(`^${escaped}(-\\d+)?$`, "i");
 }
