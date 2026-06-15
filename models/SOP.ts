@@ -51,6 +51,9 @@ export interface ISOP extends Document {
   isObsolete?: boolean;
   obsoleteAt?: Date;
   obsoleteReason?: string;
+  /** True for records auto-created by the Bunny relink scan (not explicit uploads).
+   *  Such records must NOT count toward version completeness. */
+  linkedFromBunny?: boolean;
   deptManualOverride?: boolean;
   sopDocuments?: {
     fileName?: string;
@@ -136,6 +139,7 @@ const SOPSchema = new Schema<ISOP>(
     isObsolete: { type: Boolean, default: false },
     obsoleteAt: { type: Date },
     obsoleteReason: { type: String },
+    linkedFromBunny: { type: Boolean, default: false },
     deptManualOverride: { type: Boolean, default: false },
     sopDocuments: [
       {

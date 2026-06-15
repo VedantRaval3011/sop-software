@@ -32,6 +32,13 @@ export async function POST(request: NextRequest) {
       nextForm.append("files", file);
       nextForm.append("paths", path);
     }
+    // Every bulk batch defers the heavy version reconcile; the client runs it once
+    // after the final batch (see uploadSopBatch in BulkUploadModals).
+    nextForm.set("deferReconcile", "true");
+
+    console.log(
+      `[bulk-folder-upload] batch received: ${files.length} file(s), ${filtered.length} after skip-filter`,
+    );
 
     return processSopUpload(nextForm);
   } catch (error) {

@@ -5,13 +5,21 @@ import type { EditSOPPayload } from "@/lib/types";
 import {
   applyRegistryUpdate,
   buildEditFormData,
+  deleteRegistryGroup,
   markRegistryObsolete,
+  reviveRegistryGroup,
   sopFamilyIdentifierRegex,
 } from "@/lib/sop-utils";
 import { invalidateDashboardSopsCache } from "@/lib/cache";
 import { requireAuth } from "@/lib/withAuth";
 
 type RouteContext = { params: Promise<{ identifier: string }> };
+
+/**
+ * Password that gates the irreversible permanent-delete action. Falls back to a
+ * shared default when no environment override is configured.
+ */
+const PERMANENT_DELETE_PASSWORD = process.env.SOP_DELETE_PASSWORD ?? "indiana132";
 
 async function loadGroup(identifier: string) {
   await connectDB();
@@ -68,7 +76,8 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
   }
 }
 
-export async function DELETE(_request: NextRequest, context: RouteContext) {
+// Revive an obsolete SOP family — move it back to the active registry.
+export async function POST(_request: NextRequest, context: RouteContext) {
   const auth = await requireAuth(["admin", "trainer"]);
   if (auth.error) return auth.error;
 
@@ -77,6 +86,46 @@ export async function DELETE(_request: NextRequest, context: RouteContext) {
     const group = await loadGroup(decodeURIComponent(identifier));
     if (!group.length) {
       return NextResponse.json({ error: "SOP not found" }, { status: 404 });
+    }
+
+    await reviveRegistryGroup(group);
+    invalidateDashboardSopsCache();
+    return NextResponse.json({ success: true, revived: true, identifier: group[0].identifier });
+  } catch (error) {
+    return NextResponse.json(
+      { error: error instanceof Error ? error.message : "Failed to revive SOP" },
+      { status: 500 },
+    );
+  }
+}
+
+export async function DELETE(request: NextRequest, context: RouteContext) {
+  const auth = await requireAuth(["admin", "trainer"]);
+  if (auth.error) return auth.error;
+
+  // `?permanent=1` removes the family outright; otherwise it is merely marked
+  // obsolete. The permanent path is gated by a password sent in the request
+  // header so an accidental click can't destroy records.
+  const permanent = request.nextUrl.searchParams.get("permanent") === "1";
+
+  try {
+    const { identifier } = await context.params;
+    const group = await loadGroup(decodeURIComponent(identifier));
+    if (!group.length) {
+      return NextResponse.json({ error: "SOP not found" }, { status: 404 });
+    }
+
+    if (permanent) {
+      const password = request.headers.get("x-confirm-password") ?? "";
+      if (password !== PERMANENT_DELETE_PASSWORD) {
+        return NextResponse.json(
+          { error: "Incorrect password. SOP was not deleted." },
+          { status: 403 },
+        );
+      }
+      await deleteRegistryGroup(group);
+      invalidateDashboardSopsCache();
+      return NextResponse.json({ success: true, deleted: true, identifier: group[0].identifier });
     }
 
     await markRegistryObsolete(group);

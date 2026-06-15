@@ -11,7 +11,13 @@ import {
   writeClientCache,
 } from "@/lib/cache";
 import { useDashboardStore } from "@/lib/store/dashboard-store";
-import { applyFilters, paginate } from "@/lib/sop-utils";
+import {
+  applyFilters,
+  baseIdentifierFromIdentifier,
+  buildDashboardStats,
+  paginate,
+} from "@/lib/sop-utils";
+import { exportSopsToExcel } from "@/lib/export-missing";
 import { canMutate, isAdmin } from "@/lib/roles";
 import type { AppRole } from "@/lib/auth";
 import { DashboardHeader } from "./DashboardHeader";
@@ -80,9 +86,10 @@ export function DashboardClient() {
   // Derived view: filter + sort + paginate the cached registry locally. This runs
   // in a few ms even for the whole collection, so every capsule/pill/department
   // click is instant.
-  const { items, total } = useMemo(() => {
+  const { filtered, items, total } = useMemo(() => {
     const filtered = applyFilters(allItems, filters);
-    return paginate(filtered, filters.page, filters.limit);
+    const { items, total } = paginate(filtered, filters.page, filters.limit);
+    return { filtered, items, total };
   }, [allItems, filters]);
 
   const fetchStats = useCallback(async () => {
@@ -132,6 +139,121 @@ export function DashboardClient() {
     bustDashboardCache();
     await Promise.allSettled([fetchStats(), fetchSops()]);
   }, [fetchStats, fetchSops]);
+
+  // Mark an SOP family obsolete with an instant, optimistic update: flip the
+  // family's `isObsolete` flag locally so it leaves the active list and joins the
+  // Obsolete view immediately, then recompute the dashboard stats from the same
+  // registry array — no full re-scan / re-group round-trip. The DELETE call only
+  // persists the change; on failure we roll the local state back so an SOP is
+  // never shown in both places.
+  const handleObsolete = useCallback(
+    async (sop: RegistrySOP) => {
+      const base = baseIdentifierFromIdentifier(sop.identifier);
+      const prevItems = allItems;
+      const prevStats = stats;
+
+      const nextItems = allItems.map((item) =>
+        baseIdentifierFromIdentifier(item.identifier) === base
+          ? { ...item, isObsolete: true }
+          : item,
+      );
+      const nextStats = buildDashboardStats(nextItems, departmentList);
+
+      setAllItems(nextItems);
+      setStats(nextStats);
+      writeClientCache(DASHBOARD_CACHE_KEY, "all", nextItems);
+      writeClientCache(DASHBOARD_STATS_CACHE_KEY, "stats", { ...nextStats, departmentList });
+
+      try {
+        const res = await fetch(
+          `/api/sops/registry/${encodeURIComponent(sop.identifier)}`,
+          { method: "DELETE" },
+        );
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.error ?? "Failed to mark SOP obsolete");
+        }
+      } catch (e) {
+        setAllItems(prevItems);
+        setStats(prevStats);
+        writeClientCache(DASHBOARD_CACHE_KEY, "all", prevItems);
+        writeClientCache(DASHBOARD_STATS_CACHE_KEY, "stats", prevStats);
+        throw e;
+      }
+    },
+    [allItems, stats, departmentList],
+  );
+
+  // Revive an obsolete SOP family: optimistically flip `isObsolete` back to false
+  // so it leaves the Obsolete view and rejoins the active registry immediately,
+  // then recompute stats. The POST call persists the change; on failure we roll
+  // the local state back so the SOP is never shown in both places.
+  const handleRevive = useCallback(
+    async (sop: RegistrySOP) => {
+      const base = baseIdentifierFromIdentifier(sop.identifier);
+      const prevItems = allItems;
+      const prevStats = stats;
+
+      const nextItems = allItems.map((item) =>
+        baseIdentifierFromIdentifier(item.identifier) === base
+          ? { ...item, isObsolete: false }
+          : item,
+      );
+      const nextStats = buildDashboardStats(nextItems, departmentList);
+
+      setAllItems(nextItems);
+      setStats(nextStats);
+      writeClientCache(DASHBOARD_CACHE_KEY, "all", nextItems);
+      writeClientCache(DASHBOARD_STATS_CACHE_KEY, "stats", { ...nextStats, departmentList });
+
+      try {
+        const res = await fetch(
+          `/api/sops/registry/${encodeURIComponent(sop.identifier)}`,
+          { method: "POST" },
+        );
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.error ?? "Failed to revive SOP");
+        }
+      } catch (e) {
+        setAllItems(prevItems);
+        setStats(prevStats);
+        writeClientCache(DASHBOARD_CACHE_KEY, "all", prevItems);
+        writeClientCache(DASHBOARD_STATS_CACHE_KEY, "stats", prevStats);
+        throw e;
+      }
+    },
+    [allItems, stats, departmentList],
+  );
+
+  // Permanently delete an SOP family. Unlike obsolete, this is irreversible, so
+  // we call the API first (password-gated) and only drop the family from the
+  // local registry once the server confirms — no optimistic flicker, and a wrong
+  // password leaves the table untouched.
+  const handlePermanentDelete = useCallback(
+    async (sop: RegistrySOP, password: string) => {
+      const res = await fetch(
+        `/api/sops/registry/${encodeURIComponent(sop.identifier)}?permanent=1`,
+        { method: "DELETE", headers: { "x-confirm-password": password } },
+      );
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error ?? "Failed to delete SOP");
+      }
+
+      const base = baseIdentifierFromIdentifier(sop.identifier);
+      const nextItems = allItems.filter(
+        (item) => baseIdentifierFromIdentifier(item.identifier) !== base,
+      );
+      const nextStats = buildDashboardStats(nextItems, departmentList);
+
+      setAllItems(nextItems);
+      setStats(nextStats);
+      writeClientCache(DASHBOARD_CACHE_KEY, "all", nextItems);
+      writeClientCache(DASHBOARD_STATS_CACHE_KEY, "stats", { ...nextStats, departmentList });
+    },
+    [allItems, departmentList],
+  );
 
   useEffect(() => {
     const cachedStats = readClientCache<DashboardStats & { departmentList?: string[] }>(
@@ -190,6 +312,13 @@ export function DashboardClient() {
     URL.revokeObjectURL(url);
   };
 
+  // Excel export of the full filtered/searched set (every matching record, not
+  // just the current page). Respects the active missing-data category so users
+  // can export exactly what the registry is showing.
+  const handleExportExcel = useCallback(() => {
+    exportSopsToExcel(filtered, filters);
+  }, [filtered, filters]);
+
   return (
     <div className="flex min-h-screen flex-col overflow-x-hidden bg-[#f8f9fa] text-gray-800">
       <DashboardHeader
@@ -233,6 +362,10 @@ export function DashboardClient() {
           departments={departmentList}
           onSort={handleSort}
           onRefresh={refresh}
+          onObsolete={handleObsolete}
+          onRevive={handleRevive}
+          onPermanentDelete={handlePermanentDelete}
+          onExportExcel={handleExportExcel}
           canMutate={userCanMutate}
         />
       </div>

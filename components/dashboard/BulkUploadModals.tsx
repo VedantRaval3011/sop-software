@@ -146,12 +146,16 @@ async function uploadSopBatch(
 ): Promise<UploadResult[]> {
   const allResults: UploadResult[] = [];
   const total = files.length;
+  const batchCount = Math.ceil(total / SOP_UPLOAD_BATCH_SIZE);
 
   for (let start = 0; start < total; start += SOP_UPLOAD_BATCH_SIZE) {
     const batch = files.slice(start, start + SOP_UPLOAD_BATCH_SIZE);
+    const batchIndex = Math.floor(start / SOP_UPLOAD_BATCH_SIZE) + 1;
     const batchResults = await uploadSopBatchWithFallback(batch, language, department, generateMcq);
     allResults.push(...batchResults);
-    onProgress?.(Math.min(start + batch.length, total), total);
+    const done = Math.min(start + batch.length, total);
+    onProgress?.(done, total);
+    console.info(`[upload] batch ${batchIndex}/${batchCount} done — ${done}/${total} files`);
   }
 
   return allResults;
@@ -209,28 +213,11 @@ export function SopFolderUploadModal({
       setResults(uploadResults);
       const count = uploadResults.filter((r) => r.success).length;
       if (count > 0) {
-        showToast(`Uploaded ${count} file(s) — linking version files…`);
         clearFiles();
-        try {
-          const relinkRes = await fetch("/api/admin/relink-bunny-versions", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ department: department.trim() || undefined }),
-          });
-          const relinkData = await relinkRes.json();
-          if (relinkRes.ok) {
-            const parts = [
-              `${count} uploaded`,
-              relinkData.linked ? `${relinkData.linked} linked` : null,
-              relinkData.created ? `${relinkData.created} new records` : null,
-            ].filter(Boolean);
-            showToast(parts.join(", ") + " — refresh dashboard to see updated counts");
-          } else {
-            showToast(`Uploaded ${count} file(s); link step: ${relinkData.error ?? "failed"}`);
-          }
-        } catch {
-          showToast(`Uploaded ${count} file(s) successfully`);
-        }
+        // No post-upload reprocessing needed: each file was saved with its correct version
+        // fields and the server invalidated the dashboard cache during the upload, so the
+        // refetch triggered by onSuccess regroups fresh and shows accurate counts immediately.
+        showToast(`Uploaded ${count} file(s) — dashboard updated`);
         onSuccess();
         if (uploadResults.every((r) => r.success)) handleClose();
       } else {

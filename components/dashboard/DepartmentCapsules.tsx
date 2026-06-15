@@ -729,6 +729,14 @@ const DepartmentCard = memo(function DepartmentCard({
           onAvailableClick={() => f({ media: "Slides" })}
           onMissingClick={() => f({ media: "No Slides" })}
         />
+        <LangPairPills
+          l1="ENG" f1={cap.slides.en?.available ?? 0} m1={cap.slides.en?.missing ?? 0}
+          l2="GUJ" f2={cap.slides.gu?.available ?? 0} m2={cap.slides.gu?.missing ?? 0}
+          onF1={() => f({ media: "Slides", language: "ENG" })}
+          onM1={() => f({ media: "No Slides", language: "ENG" })}
+          onF2={() => f({ media: "Slides", language: "GUJ" })}
+          onM2={() => f({ media: "No Slides", language: "GUJ" })}
+        />
       </div>
     </div>
   );

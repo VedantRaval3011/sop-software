@@ -23,11 +23,19 @@ export function groupRecordsByBase(records: ISOP[]) {
 /** Backfill version fields and strip contaminated file links from prior-version records. */
 export async function reconcileSopVersions() {
   await connectDB();
-  const records = await SOP.find({});
+  const startedAt = Date.now();
+  // Exclude the heavy `content` field (full extracted SOP text — ~56MB across the collection).
+  // Reconcile only needs identifier/version/sopDocuments; transferring `content` throttles a
+  // free-tier (M0) cluster to minutes. `.lean()` returns plain objects, so writes go through a
+  // single bulkWrite instead of one round-trip per record.
+  const records = (await SOP.find({})
+    .select("identifier version sopBaseId versionNum sopDocuments")
+    .lean()) as unknown as ISOP[];
   const grouped = groupRecordsByBase(records);
+  console.log(`[reconcile-versions] scanning ${records.length} record(s) in ${grouped.size} families…`);
 
-  let updated = 0;
   let cleaned = 0;
+  const ops: Parameters<typeof SOP.bulkWrite>[0] = [];
 
   for (const [, family] of grouped) {
     const currentVersion = maxVersionInGroup(family);
@@ -38,16 +46,16 @@ export async function reconcileSopVersions() {
     for (const record of family) {
       const fields = sopVersionFields(record.identifier, record.version);
       const isCurrent = currentIds.has(record._id.toString());
-      const patch: Record<string, unknown> = {};
+      const set: Record<string, unknown> = {};
 
       if (
         record.sopBaseId !== fields.sopBaseId ||
         record.versionNum !== fields.versionNum ||
         record.version !== fields.version
       ) {
-        patch.sopBaseId = fields.sopBaseId;
-        patch.versionNum = fields.versionNum;
-        patch.version = fields.version;
+        set.sopBaseId = fields.sopBaseId;
+        set.versionNum = fields.versionNum;
+        set.version = fields.version;
       }
 
       if (!isCurrent) {
@@ -56,18 +64,23 @@ export async function reconcileSopVersions() {
           return type !== "docx" && type !== "pdf";
         });
         if (docs.length !== (record.sopDocuments ?? []).length) {
-          patch.sopDocuments = docs;
+          set.sopDocuments = docs;
           cleaned++;
         }
       }
 
-      if (Object.keys(patch).length > 0) {
-        await record.updateOne(patch);
-        updated++;
+      if (Object.keys(set).length > 0) {
+        ops.push({ updateOne: { filter: { _id: record._id }, update: { $set: set } } });
       }
     }
   }
 
-  if (updated > 0) invalidateDashboardSopsCache();
-  return { updated, cleaned, total: records.length };
+  if (ops.length > 0) {
+    await SOP.bulkWrite(ops, { ordered: false });
+    invalidateDashboardSopsCache();
+  }
+  console.log(
+    `[reconcile-versions] done: ${ops.length} updated, ${cleaned} cleaned in ${((Date.now() - startedAt) / 1000).toFixed(1)}s`,
+  );
+  return { updated: ops.length, cleaned, total: records.length };
 }

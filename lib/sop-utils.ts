@@ -52,7 +52,7 @@ export function sortByDeptOrder(departments: string[]): string[] {
   });
 }
 
-const NEAR_EXPIRY_DAYS = 90;
+const NEAR_EXPIRY_DAYS = 30;
 const MEDIUM_EXPIRY_DAYS = 180;
 
 export function getExpiryTier(expiryDate?: Date | string | null): ExpiryTier {
@@ -458,6 +458,31 @@ export async function markRegistryObsolete(group: ISOP[], reason = "Moved to Obs
   );
 }
 
+/**
+ * Reverse {@link markRegistryObsolete}: return an SOP family to active status so
+ * it reappears in the main registry. Clears the obsolete bookkeeping fields.
+ */
+export async function reviveRegistryGroup(group: ISOP[]) {
+  await Promise.all(
+    group.map((record) =>
+      record.updateOne({
+        isObsolete: false,
+        $unset: { obsoleteAt: "", obsoleteReason: "" },
+      }),
+    ),
+  );
+}
+
+/**
+ * Permanently remove every record in an SOP family from the database. Unlike
+ * {@link markRegistryObsolete}, this is irreversible — the records (all versions
+ * and languages) are deleted outright. Stored files on the CDN are left intact;
+ * this only purges the registry rows.
+ */
+export async function deleteRegistryGroup(group: ISOP[]) {
+  await Promise.all(group.map((record) => record.deleteOne()));
+}
+
 export function groupSOPRecords(records: ISOP[]): RegistrySOP[] {
   const grouped = new Map<string, ISOP[]>();
 
@@ -515,7 +540,7 @@ export function groupSOPRecords(records: ISOP[]): RegistrySOP[] {
       const langNeedsGu = language === "GUJ" || language === "ENG-GUJ";
       return (langNeedsEn ? hasVersionDateEn : true) && (langNeedsGu ? hasVersionDateGu : true);
     })();
-    const priorVersions = buildPriorVersions(group, currentVersion, language === "ENG-GUJ");
+    const priorVersions = buildPriorVersions(group, currentVersion, language);
 
     const displayIdentifier =
       currentRecords.find((r) => {
@@ -569,7 +594,24 @@ export function groupSOPRecords(records: ISOP[]): RegistrySOP[] {
   return result;
 }
 
-function buildPriorVersions(group: ISOP[], currentVersion: string, isDual = false) {
+/**
+ * The prior-revision numbers an SOP at `currentNum` is REQUIRED to keep on file:
+ * the two revisions immediately preceding the current one, down to the original v0.
+ *   • a v5 SOP must hold V4 and V3
+ *   • a v2 SOP must hold V1 and V0
+ *   • a v1 SOP must hold V0
+ *   • a v0 SOP has no required prior
+ *
+ * This is the SINGLE source of truth used by both the Found/Not-Found status
+ * (priorVersionsComplete) and the per-version "missing" markers (buildPriorVersions),
+ * so the two can never disagree as SOPs are added, edited, or deleted.
+ */
+function requiredPriorVersionNumbers(currentNum: number): number[] {
+  return [currentNum - 1, currentNum - 2].filter((n) => n >= 0);
+}
+
+function buildPriorVersions(group: ISOP[], currentVersion: string, language = "ENG") {
+  const isDual = language === "ENG-GUJ";
   const currentNum = versionNumber(currentVersion);
 
   // Collect every uploaded prior-version file, keyed by "<versionNum>-<lang>".
@@ -597,20 +639,56 @@ function buildPriorVersions(group: ISOP[], currentVersion: string, isDual = fals
     result.push({ version, language: lang, docx, pdf });
   }
 
-  // For dual-language SOPs, add "missing" markers for any version number that exists for
-  // one language but not the other. This keeps ENG and GUJ rows visually symmetric and
-  // ensures the version-completeness check catches asymmetric prior-version history.
-  if (isDual) {
-    const engVers = new Set(result.filter((pv) => pv.language === "ENG").map((pv) => pv.version));
-    const gujVers = new Set(result.filter((pv) => pv.language === "GUJ").map((pv) => pv.version));
-    for (const v of new Set([...engVers, ...gujVers])) {
-      if (!engVers.has(v)) result.push({ version: v, language: "ENG", missing: true });
-      if (!gujVers.has(v)) result.push({ version: v, language: "GUJ", missing: true });
+  // The registry must hold the two revisions immediately preceding the current one, and
+  // EACH required language must hold them independently. For a dual-language SOP both the
+  // English and Gujarati copies of each required revision must exist (complete docx + pdf);
+  // a missing Gujarati translation is flagged on its own row, not masked by the English
+  // copy. Any required (language, revision) that has no complete file on file is marked
+  // "missing" so the SOP is Not Found and the specific version number is shown as missing.
+  const requiredLangs = isDual ? ["ENG", "GUJ"] : [language === "GUJ" ? "GUJ" : "ENG"];
+  const requiredVersions = requiredPriorVersionNumbers(currentNum);
+  for (const lang of requiredLangs) {
+    const completeForLang = new Set(
+      result
+        .filter((pv) => pv.language === lang && pv.docx && pv.pdf)
+        .map((pv) => versionNumber(pv.version)),
+    );
+    for (const n of requiredVersions) {
+      if (completeForLang.has(n)) continue;
+      const existsForLang = result.some(
+        (pv) => pv.language === lang && versionNumber(pv.version) === n,
+      );
+      if (!existsForLang) result.push({ version: String(n), language: lang, missing: true });
     }
   }
 
   // Newest first — guarantees correct descending order for every language independently.
   return result.sort((a, b) => versionNumber(b.version) - versionNumber(a.version));
+}
+
+/**
+ * Whether an SOP's prior-version history is complete for the Found / Not Found status.
+ *
+ * Only the TWO revisions immediately preceding the current one are required — older
+ * revisions (3rd-newest and beyond) never affect the status, even if they are incomplete.
+ * EACH required language must independently hold every required revision as a complete
+ * docx + pdf: for a dual-language (ENG-GUJ) SOP, both the English AND Gujarati copies of
+ * each required revision must exist, so a missing translation makes the SOP Not Found.
+ */
+function priorVersionsComplete(sop: RegistrySOP): boolean {
+  const requiredVersions = requiredPriorVersionNumbers(versionNumber(sop.version));
+  if (requiredVersions.length === 0) return true;
+  const requiredLangs =
+    sop.language === "ENG-GUJ" ? ["ENG", "GUJ"] : [sop.language === "GUJ" ? "GUJ" : "ENG"];
+  for (const lang of requiredLangs) {
+    const completeNums = new Set(
+      sop.priorVersions
+        .filter((pv) => pv.language === lang && Boolean(pv.docx) && Boolean(pv.pdf))
+        .map((pv) => versionNumber(pv.version)),
+    );
+    if (!requiredVersions.every((n) => completeNums.has(n))) return false;
+  }
+  return true;
 }
 
 export function applyFilters(items: RegistrySOP[], filters: SOPFilters): RegistrySOP[] {
@@ -669,7 +747,7 @@ export function applyFilters(items: RegistrySOP[], filters: SOPFilters): Registr
       const needsEn = s.language === "ENG" || s.language === "ENG-GUJ";
       const needsGu = s.language === "GUJ" || s.language === "ENG-GUJ";
       return (
-        s.priorVersions.every((pv) => Boolean(pv.docx) && Boolean(pv.pdf)) &&
+        priorVersionsComplete(s) &&
         (needsEn ? hasFile(s.files.docx, "en") && hasFile(s.files.pdf, "en") : true) &&
         (needsGu ? hasFile(s.files.docx, "gu") && hasFile(s.files.pdf, "gu") : true)
       );
@@ -681,10 +759,16 @@ export function applyFilters(items: RegistrySOP[], filters: SOPFilters): Registr
     }
   }
 
-  if (filters.versionDate === "found") {
-    result = result.filter((s) => s.hasVersionDate);
-  } else if (filters.versionDate === "missing") {
-    result = result.filter((s) => !s.hasVersionDate);
+  if (filters.versionDate === "found" || filters.versionDate === "missing") {
+    // Mirror the capsule's per-language counts: when a single language is selected, judge that
+    // language's dates; otherwise require every language the SOP needs (combined flag).
+    const dateOk = (s: RegistrySOP): boolean =>
+      filters.language === "ENG"
+        ? s.hasVersionDateEn
+        : filters.language === "GUJ"
+          ? s.hasVersionDateGu
+          : s.hasVersionDate;
+    result = result.filter((s) => (filters.versionDate === "found" ? dateOk(s) : !dateOk(s)));
   }
 
   if (filters.absoluteSop) {
@@ -912,11 +996,8 @@ function buildCapsule(department: string, sops: RegistrySOP[]): DepartmentCapsul
       else bucket.missing++;
     }
 
-    const priorVersionsComplete = sop.priorVersions.every(
-      (pv) => Boolean(pv.docx) && Boolean(pv.pdf),
-    );
     const hasCompleteFiles =
-      priorVersionsComplete &&
+      priorVersionsComplete(sop) &&
       (needsEn(sop) ? hasFile(sop.files.docx, "en") && hasFile(sop.files.pdf, "en") : true) &&
       (needsGu(sop) ? hasFile(sop.files.docx, "gu") && hasFile(sop.files.pdf, "gu") : true);
 
@@ -933,33 +1014,44 @@ function buildCapsule(department: string, sops: RegistrySOP[]): DepartmentCapsul
       if (needsGu(sop)) { capsule.version.docx.gu.missing++; capsule.version.pdf.gu.missing++; }
     }
 
+    // SOP-level: date-complete only when EVERY required language has real version dates.
     if (sop.hasVersionDate) capsule.versionDate.found++;
     else capsule.versionDate.missing++;
+    // Per-language: each language is judged on ITS OWN dates, not the combined flag, so a
+    // dual SOP with English dates but missing Gujarati dates is counted accurately on each side.
     if (needsEn(sop)) {
-      if (sop.hasVersionDate) capsule.versionDate.en.found++;
+      if (sop.hasVersionDateEn) capsule.versionDate.en.found++;
       else capsule.versionDate.en.missing++;
     }
     if (needsGu(sop)) {
-      if (sop.hasVersionDate) capsule.versionDate.gu.found++;
+      if (sop.hasVersionDateGu) capsule.versionDate.gu.found++;
       else capsule.versionDate.gu.missing++;
     }
 
-    const totalVideos = sop.media.videos.en + sop.media.videos.gu;
-    const totalSlides = sop.media.slides.en + sop.media.slides.gu;
+    // Found / Not Found are SOP counts (not raw file counts) so each pair sums to
+    // the dataset size — the master count for the overall row, and the number of
+    // SOPs that require a language for the ENG/GUJ rows. This keeps the panel
+    // aligned with the dashboard's active SOP total instead of mixing units.
+    const hasEnVideo = sop.media.videos.en > 0;
+    const hasGuVideo = sop.media.videos.gu > 0;
+    const hasAnyVideo = hasEnVideo || hasGuVideo;
+    const hasEnSlide = sop.media.slides.en > 0;
+    const hasGuSlide = sop.media.slides.gu > 0;
+    const hasAnySlide = hasEnSlide || hasGuSlide;
 
-    capsule.videos.available += totalVideos;
-    capsule.videos.missing += Math.max(0, 1 - totalVideos);
-    capsule.videos.en.available += sop.media.videos.en;
-    capsule.videos.en.missing += needsEn(sop) && sop.media.videos.en === 0 ? 1 : 0;
-    capsule.videos.gu.available += sop.media.videos.gu;
-    capsule.videos.gu.missing += needsGu(sop) && sop.media.videos.gu === 0 ? 1 : 0;
+    capsule.videos.available += hasAnyVideo ? 1 : 0;
+    capsule.videos.missing += hasAnyVideo ? 0 : 1;
+    capsule.videos.en.available += needsEn(sop) && hasEnVideo ? 1 : 0;
+    capsule.videos.en.missing += needsEn(sop) && !hasEnVideo ? 1 : 0;
+    capsule.videos.gu.available += needsGu(sop) && hasGuVideo ? 1 : 0;
+    capsule.videos.gu.missing += needsGu(sop) && !hasGuVideo ? 1 : 0;
 
-    capsule.slides.available += totalSlides;
-    capsule.slides.missing += Math.max(0, 1 - totalSlides);
-    capsule.slides.en.available += sop.media.slides.en;
-    capsule.slides.en.missing += needsEn(sop) && sop.media.slides.en === 0 ? 1 : 0;
-    capsule.slides.gu.available += sop.media.slides.gu;
-    capsule.slides.gu.missing += needsGu(sop) && sop.media.slides.gu === 0 ? 1 : 0;
+    capsule.slides.available += hasAnySlide ? 1 : 0;
+    capsule.slides.missing += hasAnySlide ? 0 : 1;
+    capsule.slides.en.available += needsEn(sop) && hasEnSlide ? 1 : 0;
+    capsule.slides.en.missing += needsEn(sop) && !hasEnSlide ? 1 : 0;
+    capsule.slides.gu.available += needsGu(sop) && hasGuSlide ? 1 : 0;
+    capsule.slides.gu.missing += needsGu(sop) && !hasGuSlide ? 1 : 0;
 
     const allVideoStrings = [
       ...(sop.mediaUrls?.videos?.en ?? []).map((u) => u.toLowerCase()),

@@ -1460,7 +1460,7 @@ function ExpiryInlineRow({
         })()}
       </span>
       <span className="flex shrink-0 items-center gap-x-0.5">
-        <span className={label} title="Near expiry (≤ 90 days, same as Dashboard)">
+        <span className={label} title="Near expiry (≤ 30 days, same as Dashboard)">
           Near
         </span>
         {onNear ? (
@@ -4583,7 +4583,7 @@ export default function TrainingMatrixPage() {
             applySummaryCapsuleFilter({
               dept: 'All',
               type: 'found',
-              title: 'Total · Near Expiry (≤ 90 days)',
+              title: 'Total · Near Expiry (≤ 30 days)',
               status: 'due_soon_30',
             })
           }
@@ -5026,7 +5026,7 @@ export default function TrainingMatrixPage() {
             applySummaryCapsuleFilter({
               dept,
               type: 'found',
-              title: `${dept} · Near Expiry (≤ 90 days)`,
+              title: `${dept} · Near Expiry (≤ 30 days)`,
               status: 'due_soon_30',
             })
           }

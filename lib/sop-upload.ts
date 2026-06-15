@@ -42,12 +42,22 @@ export async function processSopUpload(formData: FormData) {
   const versionInput = (formData.get("version") as string)?.trim();
   const location = (formData.get("location") as string)?.trim();
   const generateMcq = formData.get("generateMcq") === "true";
+  // Bulk uploads defer the (expensive, whole-collection) version reconcile to a single
+  // pass after the LAST batch — running it per 4-file batch made large uploads crawl.
+  const deferReconcile = formData.get("deferReconcile") === "true";
   const files = formData.getAll("files") as File[];
   const paths = formData.getAll("paths").map((value) => String(value));
 
   if (!files.length) {
     return NextResponse.json({ error: "No files provided" }, { status: 400 });
   }
+
+  const startedAt = Date.now();
+  console.log(
+    `[sop-upload] received ${files.length} file(s) — lang=${language}` +
+      `${batchDepartment ? `, dept=${batchDepartment}` : ""}${generateMcq ? ", mcq=on" : ""}` +
+      `${deferReconcile ? ", reconcile=deferred" : ""}`,
+  );
 
   const results: Array<{ file: string; success: boolean; error?: string; id?: string; identifier?: string }> = [];
   const mcqIdentifiers = new Set<string>();
@@ -206,6 +216,9 @@ export async function processSopUpload(formData: FormData) {
       }
 
       if (generateMcq) mcqIdentifiers.add(identifier);
+      console.log(
+        `[sop-upload] ✓ (${index + 1}/${files.length}) ${identifier} v${resolvedVersion} ${lang} ${fileType} → ${department}`,
+      );
       results.push({
         file: file.name,
         success: true,
@@ -213,10 +226,12 @@ export async function processSopUpload(formData: FormData) {
         identifier,
       });
     } catch (err) {
+      const message = err instanceof Error ? err.message : "Upload failed";
+      console.error(`[sop-upload] ✗ (${index + 1}/${files.length}) ${file.name}: ${message}`);
       results.push({
         file: file.name,
         success: false,
-        error: err instanceof Error ? err.message : "Upload failed",
+        error: message,
       });
     }
   }
@@ -229,12 +244,19 @@ export async function processSopUpload(formData: FormData) {
 
   // Re-group version fields so newly uploaded prior-version files attach to the
   // correct SOP family immediately (fixes QAGE01-05 vs QAGE1-05 split families).
+  // Bulk uploads skip this here and run a single reconcile after the final batch.
   const successCount = results.filter((r) => r.success).length;
-  if (successCount > 0) {
+  const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
+  console.log(
+    `[sop-upload] batch done: ${successCount} ok, ${results.length - successCount} failed in ${elapsed}s` +
+      `${deferReconcile && successCount > 0 ? " (reconcile deferred to caller)" : ""}`,
+  );
+
+  if (successCount > 0 && !deferReconcile) {
     try {
       await reconcileSopVersions();
     } catch (e) {
-      console.error("post-upload reconcile error:", e);
+      console.error("[sop-upload] post-upload reconcile error:", e);
     }
   }
 

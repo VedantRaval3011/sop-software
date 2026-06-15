@@ -623,7 +623,7 @@ async function computeOverviewPayload(forceFresh: boolean) {
         nearExpiryList,
         noDateCount: noDateList.length,
         noDateList,
-        // Legacy aliases — same 90-day "Near" tier as the Dashboard.
+        // Legacy aliases — same 30-day "Near" tier as the Dashboard.
         dueSoon30Count: nearExpiryList.length,
         dueSoon30List: nearExpiryList,
         trainersAssigned,

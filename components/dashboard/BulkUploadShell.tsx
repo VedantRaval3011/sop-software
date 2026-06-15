@@ -291,6 +291,7 @@ export function BulkUploadShell({
   uploading,
   uploadProgress,
   progressIndeterminate,
+  progressLabel,
   fileCount,
   uploadLabel,
   disableUpload,
@@ -308,6 +309,7 @@ export function BulkUploadShell({
   uploading: boolean;
   uploadProgress?: UploadProgress | null;
   progressIndeterminate?: boolean;
+  progressLabel?: string;
   fileCount: number;
   uploadLabel: string;
   disableUpload?: boolean;
@@ -355,6 +357,7 @@ export function BulkUploadShell({
               accent={accent}
               progress={uploadProgress}
               indeterminate={progressIndeterminate}
+              label={progressLabel}
             />
           </div>
         ) : null}

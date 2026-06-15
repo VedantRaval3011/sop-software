@@ -94,6 +94,10 @@ async function upsertBunnyFile(bf: {
     expiryDate: new Date(Date.now() + 24 * 30 * 86400000),
     status: "uploaded",
     pipelineStatus: "idle",
+    // Mark as a relink-created stub (not an explicit upload). The version-completeness
+    // logic excludes these. This flag survives the dashboard's `-content` projection,
+    // unlike the LINKED_CONTENT content marker.
+    linkedFromBunny: true,
   });
   return "created";
 }
@@ -126,13 +130,18 @@ export async function relinkBunnyVersionFiles(opts?: { department?: string; refr
 
   await connectDB();
   const department = opts?.department?.trim();
+  const startedAt = Date.now();
 
   if (opts?.refreshIndex) invalidateBunnyVersionIndexCache();
 
+  console.log(`[relink-bunny] building Bunny file index${department ? ` for dept=${department}` : ""}…`);
   const [missingSlots, bunnyIndex] = await Promise.all([
     collectMissingSlots(department),
     buildBunnyVersionFileIndex(opts?.refreshIndex),
   ]);
+  console.log(
+    `[relink-bunny] index ready (${bunnyIndex.size} files), checking ${missingSlots.length} missing slot(s)…`,
+  );
 
   let linked = 0;
   let created = 0;
@@ -173,6 +182,10 @@ export async function relinkBunnyVersionFiles(opts?: { department?: string; refr
   const reconcile =
     linked + created > 0 ? await reconcileSopVersions() : { updated: 0, cleaned: 0, total: 0 };
   invalidateDashboardSopsCache();
+
+  console.log(
+    `[relink-bunny] done: ${linked} linked, ${created} created, ${skipped} skipped, ${notFound} not-found in ${((Date.now() - startedAt) / 1000).toFixed(1)}s`,
+  );
 
   return {
     missingSlotsChecked: missingSlots.length,

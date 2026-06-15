@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  Archive,
   ArrowDown,
   ArrowUp,
   ArrowUpDown,
@@ -12,6 +13,7 @@ import {
   FileText,
   Loader2,
   Presentation,
+  RotateCcw,
   SlidersHorizontal,
   Sparkles,
   Trash2,
@@ -20,6 +22,7 @@ import {
   X,
 } from "lucide-react";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { PasswordConfirmDialog } from "./PasswordConfirmDialog";
 import { EditSOPModal } from "./EditSOPModal";
 import { Fragment, memo, useCallback, useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
@@ -30,6 +33,7 @@ import {
   isOfficePreviewAvailable,
 } from "@/lib/file-urls";
 import { formatUploaded } from "@/lib/sop-utils";
+import { describeFilters } from "@/lib/filter-breadcrumb";
 import { useDashboardStore } from "@/lib/store/dashboard-store";
 import { Btn } from "./ui";
 import { DocPreviewModal } from "@/components/shared/DocPreviewModal";
@@ -262,6 +266,10 @@ interface SOPRegistryTableProps {
   departments: string[];
   onSort: (field: string) => void;
   onRefresh: () => void;
+  onObsolete: (sop: RegistrySOP) => Promise<void>;
+  onRevive: (sop: RegistrySOP) => Promise<void>;
+  onPermanentDelete: (sop: RegistrySOP, password: string) => Promise<void>;
+  onExportExcel: () => void;
   canMutate: boolean;
 }
 
@@ -272,13 +280,22 @@ export function SOPRegistryTable({
   departments,
   onSort,
   onRefresh,
+  onObsolete,
+  onRevive,
+  onPermanentDelete,
+  onExportExcel,
   canMutate,
 }: SOPRegistryTableProps) {
   const { filters, setFilter, resetFilters, expandedRows, toggleRow, toggleFilterSidebar, showToast } =
     useDashboardStore();
   const [editIdentifier, setEditIdentifier] = useState<string | null>(null);
+  const [obsoleteTarget, setObsoleteTarget] = useState<RegistrySOP | null>(null);
+  const [obsoleting, setObsoleting] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<RegistrySOP | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  const breadcrumb = useMemo(() => describeFilters(filters), [filters]);
 
   const handleEditClose = useCallback(() => setEditIdentifier(null), []);
 
@@ -300,23 +317,52 @@ export function SOPRegistryTable({
     return Array.from(langs).sort();
   }, [items]);
 
-  const handleDeleteConfirm = async () => {
-    if (!deleteTarget) return;
-    setDeleting(true);
-    try {
-      const res = await fetch(
-        `/api/sops/registry/${encodeURIComponent(deleteTarget.identifier)}`,
-        { method: "DELETE" },
-      );
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.error ?? "Failed to delete SOP");
+  // True when the table is showing the Obsolete SOPs view; there we offer Revive
+  // (move back to active) instead of the Obsolete action.
+  const isObsoleteView = Boolean(filters.obsoleteOnly);
+
+  const handleRevive = useCallback(
+    async (sop: RegistrySOP) => {
+      try {
+        await onRevive(sop);
+        showToast(`${sop.identifier} restored to the SOP Registry`);
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : "Failed to revive SOP");
       }
-      showToast(`${deleteTarget.identifier} moved to Obsolete SOPs`);
-      setDeleteTarget(null);
-      onRefresh();
+    },
+    [onRevive, showToast],
+  );
+
+  const handleObsoleteConfirm = async () => {
+    if (!obsoleteTarget) return;
+    const target = obsoleteTarget;
+    // The move is applied optimistically by the parent, so close the dialog at
+    // once — the SOP leaves the active list and the counts update on this click.
+    setObsoleteTarget(null);
+    setObsoleting(true);
+    try {
+      await onObsolete(target);
+      showToast(`${target.identifier} moved to Obsolete SOPs`);
     } catch (err) {
-      showToast(err instanceof Error ? err.message : "Failed to delete SOP");
+      showToast(err instanceof Error ? err.message : "Failed to move SOP to Obsolete");
+    } finally {
+      setObsoleting(false);
+    }
+  };
+
+  const handleDeleteConfirm = async (password: string) => {
+    if (!deleteTarget) return;
+    const target = deleteTarget;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await onPermanentDelete(target, password);
+      // Only close on success; a wrong password keeps the dialog open so the
+      // user can retry without losing their place.
+      setDeleteTarget(null);
+      showToast(`${target.identifier} permanently deleted`);
+    } catch (err) {
+      setDeleteError(err instanceof Error ? err.message : "Failed to delete SOP");
     } finally {
       setDeleting(false);
     }
@@ -332,17 +378,34 @@ export function SOPRegistryTable({
         onSuccess={onRefresh}
       />
       <ConfirmDialog
-        open={deleteTarget !== null}
-        title="Delete SOP"
+        open={obsoleteTarget !== null}
+        title="Move SOP to Obsolete"
         message={
-          deleteTarget
-            ? `Move SOP ${deleteTarget.identifier} to Obsolete SOPs? All files, versions, history, and metadata will be preserved. The SOP will be removed from active listings.`
+          obsoleteTarget
+            ? `Move SOP ${obsoleteTarget.identifier} to Obsolete SOPs? All files, versions, history, and metadata will be preserved. The SOP will be removed from active listings.`
             : ""
         }
         confirmLabel="Move to Obsolete"
+        loading={obsoleting}
+        onConfirm={handleObsoleteConfirm}
+        onCancel={() => setObsoleteTarget(null)}
+      />
+      <PasswordConfirmDialog
+        open={deleteTarget !== null}
+        title="Permanently delete SOP"
+        message={
+          deleteTarget
+            ? `Permanently delete SOP ${deleteTarget.identifier}? This removes all versions, languages, history, and metadata from the registry and cannot be undone.`
+            : ""
+        }
+        confirmLabel="Delete permanently"
         loading={deleting}
+        error={deleteError}
         onConfirm={handleDeleteConfirm}
-        onCancel={() => setDeleteTarget(null)}
+        onCancel={() => {
+          setDeleteTarget(null);
+          setDeleteError(null);
+        }}
       />
       <div className="flex flex-col w-full bg-gray-50">
 
@@ -351,8 +414,14 @@ export function SOPRegistryTable({
           <h2 className="text-xs font-bold uppercase tracking-widest text-gray-700">SOP Registry</h2>
           <div className="flex flex-wrap items-center gap-1.5">
             <Btn size="xs" onClick={resetFilters}>Reset</Btn>
-            <Btn size="xs">
-              <Download className="h-3 w-3" /> Export Missing DOCX
+            <Btn
+              size="xs"
+              onClick={onExportExcel}
+              disabled={total === 0}
+              title={`Export the ${total} displayed record${total === 1 ? "" : "s"} (${breadcrumb.label}) to Excel`}
+            >
+              <Download className="h-3 w-3" />
+              Export to Excel{total > 0 ? ` (${total})` : ""}
             </Btn>
             <select
               className="rounded border border-gray-300 bg-white px-1.5 py-0.5 text-[10px] focus:outline-none focus:border-purple-500"
@@ -381,6 +450,26 @@ export function SOPRegistryTable({
           </span>
         </div>
 
+        {/* Breadcrumb — shows which capsule/card was clicked and the dataset on view */}
+        <div
+          className="flex flex-wrap items-center gap-1.5 border-b border-gray-200 bg-white px-3 py-1.5 text-[11px]"
+          aria-label="Current results context"
+        >
+          <span className="font-semibold text-purple-700">{breadcrumb.department}</span>
+          <ChevronRight className="h-3 w-3 shrink-0 text-gray-400" aria-hidden />
+          {breadcrumb.segments.length > 0 ? (
+            breadcrumb.segments.map((seg, i) => (
+              <Fragment key={seg}>
+                {i > 0 && <span className="text-gray-300" aria-hidden>·</span>}
+                <span className="rounded bg-gray-100 px-1.5 py-0.5 font-medium text-gray-700">{seg}</span>
+              </Fragment>
+            ))
+          ) : (
+            <span className="font-medium text-gray-600">All SOPs</span>
+          )}
+          <span className="text-gray-500">Results</span>
+        </div>
+
         {/* Table — vertical scroll only; columns share viewport width */}
         <div
           className="w-full max-w-full overflow-x-hidden overflow-y-auto overscroll-y-contain max-h-[calc(100vh-180px)]"
@@ -394,14 +483,14 @@ export function SOPRegistryTable({
               <col style={{ width: canMutate ? "15%" : "17%" }} />
               <col style={{ width: "3.5%" }} />
               <col style={{ width: "5%" }} />
-              <col style={{ width: canMutate ? "12%" : "13%" }} />
-              <col style={{ width: "7.5%" }} />
+              <col style={{ width: canMutate ? "15.5%" : "16.5%" }} />
+              <col style={{ width: "8%" }} />
               <col style={{ width: "3.5%" }} />
               <col style={{ width: "8.5%" }} />
               <col style={{ width: "7%" }} />
               <col style={{ width: "6%" }} />
+              <col style={{ width: "6.5%" }} />
               <col style={{ width: "7%" }} />
-              <col style={{ width: "10.5%" }} />
               {canMutate && <col style={{ width: "3.5%" }} />}
             </colgroup>
             <thead className="bg-gray-100 border-b border-gray-300">
@@ -575,8 +664,14 @@ export function SOPRegistryTable({
                     expanded={expandedRows.has(sop.id)}
                     onToggle={() => toggleRow(sop.id)}
                     canMutate={canMutate}
+                    isObsoleteView={isObsoleteView}
                     onEdit={() => setEditIdentifier(sop.identifier)}
-                    onDelete={() => setDeleteTarget(sop)}
+                    onObsolete={() => setObsoleteTarget(sop)}
+                    onRevive={() => handleRevive(sop)}
+                    onDelete={() => {
+                      setDeleteError(null);
+                      setDeleteTarget(sop);
+                    }}
                   />
                 ))
               )}
@@ -596,7 +691,10 @@ const SOPRow = memo(function SOPRow({
   expanded,
   onToggle,
   canMutate,
+  isObsoleteView,
   onEdit,
+  onObsolete,
+  onRevive,
   onDelete,
 }: {
   sop: RegistrySOP;
@@ -605,7 +703,10 @@ const SOPRow = memo(function SOPRow({
   expanded: boolean;
   onToggle: () => void;
   canMutate: boolean;
+  isObsoleteView: boolean;
   onEdit: () => void;
+  onObsolete: () => void;
+  onRevive: () => void;
   onDelete: () => void;
 }) {
   const isDual = sop.language === "ENG-GUJ";
@@ -796,10 +897,35 @@ const SOPRow = memo(function SOPRow({
               >
                 <Edit2 className="h-3 w-3 text-slate-500" />
               </button>
+              {isObsoleteView ? (
+                <button
+                  type="button"
+                  className="rounded p-0.5 hover:bg-emerald-50"
+                  title="Revive — move back to SOP Registry"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onRevive();
+                  }}
+                >
+                  <RotateCcw className="h-3 w-3 text-emerald-600" />
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="rounded p-0.5 hover:bg-amber-50"
+                  title="Move to Obsolete"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onObsolete();
+                  }}
+                >
+                  <Archive className="h-3 w-3 text-amber-600" />
+                </button>
+              )}
               <button
                 type="button"
                 className="rounded p-0.5 hover:bg-red-50"
-                title="Delete SOP"
+                title="Delete permanently"
                 onClick={(e) => {
                   e.stopPropagation();
                   onDelete();
@@ -820,7 +946,10 @@ const SOPRow = memo(function SOPRow({
               sop={sop}
               expiryNode={expiryNode}
               canMutate={canMutate}
+              isObsoleteView={isObsoleteView}
               onEdit={onEdit}
+              onObsolete={onObsolete}
+              onRevive={onRevive}
               onDelete={onDelete}
             />
           </td>
@@ -852,13 +981,19 @@ function SOPDetailPanel({
   sop,
   expiryNode,
   canMutate,
+  isObsoleteView,
   onEdit,
+  onObsolete,
+  onRevive,
   onDelete,
 }: {
   sop: RegistrySOP;
   expiryNode: React.ReactNode;
   canMutate: boolean;
+  isObsoleteView: boolean;
   onEdit: () => void;
+  onObsolete: () => void;
+  onRevive: () => void;
   onDelete: () => void;
 }) {
   const languageLabel =
@@ -1022,12 +1157,29 @@ function SOPDetailPanel({
               >
                 <Edit2 className="h-3 w-3" /> Edit SOP
               </button>
+              {isObsoleteView ? (
+                <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); onRevive(); }}
+                  className="flex items-center justify-center gap-1 rounded border border-emerald-200 bg-white px-2 py-1 text-[10px] font-semibold text-emerald-700 hover:bg-emerald-50"
+                >
+                  <RotateCcw className="h-3 w-3" /> Revive SOP
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); onObsolete(); }}
+                  className="flex items-center justify-center gap-1 rounded border border-amber-200 bg-white px-2 py-1 text-[10px] font-semibold text-amber-700 hover:bg-amber-50"
+                >
+                  <Archive className="h-3 w-3" /> Mark Obsolete
+                </button>
+              )}
               <button
                 type="button"
                 onClick={(e) => { e.stopPropagation(); onDelete(); }}
                 className="flex items-center justify-center gap-1 rounded border border-red-200 bg-white px-2 py-1 text-[10px] font-semibold text-red-600 hover:bg-red-50"
               >
-                <Trash2 className="h-3 w-3" /> Mark Obsolete
+                <Trash2 className="h-3 w-3" /> Delete Permanently
               </button>
             </div>
           )}
@@ -1157,7 +1309,7 @@ function PriorVersionEntry({ pv }: { pv: PriorVersion }) {
 }
 
 /* Version slot width: wide enough for "V12 DOCX / PDF" at 8-9px font */
-const PRIOR_SLOT_W = "5.5rem";
+const PRIOR_SLOT_W = "6rem";
 const PRIOR_LABEL_W = "2rem";
 
 function PriorLangRow({ pvs, label }: { pvs: PriorVersion[]; label: string }) {
