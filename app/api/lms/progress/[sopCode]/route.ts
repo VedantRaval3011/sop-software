@@ -2,6 +2,13 @@ import { NextRequest, NextResponse } from 'next/server';
 import { cookies } from 'next/headers';
 import { connectDB } from '@/lib/mongodb';
 import { verifyLmsToken, LMS_COOKIE } from '@/lib/lms-session';
+import {
+  getOrBuildLmsCache,
+  invalidateLmsLearnerCache,
+  lmsCacheControl,
+  lmsServerKeys,
+  lmsServerTtl,
+} from '@/lib/lmsCache';
 import LearningProgress from '@/models/lms/LearningProgress';
 
 export const dynamic = 'force-dynamic';
@@ -45,13 +52,20 @@ export async function GET(_req: NextRequest, { params }: Params) {
   const { sopCode } = await params;
 
   try {
-    await connectDB();
-    const progress = await LearningProgress.findOne({
-      employeeId: payload.sub,
-      sopCode,
-    }).lean();
+    const body = await getOrBuildLmsCache(
+      lmsServerKeys.progressSop(payload.sub, sopCode),
+      lmsServerTtl.userProgress,
+      async () => {
+        await connectDB();
+        const progress = await LearningProgress.findOne({
+          employeeId: payload.sub,
+          sopCode,
+        }).lean();
+        return { progress: progress || null };
+      },
+    );
 
-    return NextResponse.json({ progress: progress || null });
+    return NextResponse.json(body, { headers: lmsCacheControl(30) });
   } catch (err: unknown) {
     return NextResponse.json({ error: err instanceof Error ? err.message : String(err) }, { status: 500 });
   }
@@ -133,6 +147,7 @@ export async function PATCH(req: NextRequest, { params }: Params) {
     }
 
     await progress.save();
+    invalidateLmsLearnerCache(payload.sub, sopCode);
     return NextResponse.json({ progress: progress.toObject() });
   } catch (err: unknown) {
     return NextResponse.json({ error: err instanceof Error ? err.message : String(err) }, { status: 500 });

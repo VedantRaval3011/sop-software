@@ -8,6 +8,12 @@ import {
   ArrowLeft, Loader2, Settings, RefreshCw, Trophy,
   UserX, UserCheck, ChevronDown, Search, CheckCircle2, Clock, Circle, X,
 } from 'lucide-react';
+import {
+  lmsClientFields,
+  LMS_CLIENT_FRESH_MS,
+  readLmsClientCache,
+  writeLmsClientCache,
+} from '@/lib/lmsCache';
 
 const DEPARTMENTS = ['All', 'QA', 'QC', 'Microbiology', 'Production', 'Store', 'Engineering', 'Personnel'];
 
@@ -39,14 +45,24 @@ export default function LmsAdminPage() {
     if (status === 'unauthenticated') router.push('/login');
   }, [status, router]);
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const load = useCallback(async (force = false) => {
+    const field = lmsClientFields.adminTrainingStatus(dept);
+    const cached = !force ? readLmsClientCache<{ records: EmployeeRecord[] }>(field) : null;
+    if (cached?.value) {
+      setRecords(cached.value.records || []);
+      setLoading(false);
+      if (Date.now() - cached.cachedAt <= LMS_CLIENT_FRESH_MS) return;
+    } else {
+      setLoading(true);
+    }
     try {
       const params = new URLSearchParams();
       if (dept !== 'All') params.set('department', dept);
       const res  = await fetch(`/api/lms/admin/training-status?${params}`);
       const json = await res.json();
-      setRecords(json.records || []);
+      const records = json.records || [];
+      setRecords(records);
+      writeLmsClientCache(field, { records });
     } finally {
       setLoading(false);
     }
@@ -99,7 +115,7 @@ export default function LmsAdminPage() {
             >
               <Settings className="h-3.5 w-3.5" /> Exam Settings
             </Link>
-            <button onClick={load} disabled={loading} className="rounded-lg border border-gray-200 p-1.5 text-gray-400 hover:bg-gray-50">
+            <button onClick={() => load(true)} disabled={loading} className="rounded-lg border border-gray-200 p-1.5 text-gray-400 hover:bg-gray-50">
               <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
             </button>
           </div>

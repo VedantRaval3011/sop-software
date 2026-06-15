@@ -3,6 +3,12 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { ArrowLeft, Download, Award, Check, Loader2, AlertCircle } from 'lucide-react';
+import {
+  lmsClientFields,
+  LMS_CLIENT_FRESH_MS,
+  readLmsClientCache,
+  writeLmsClientCache,
+} from '@/lib/lmsCache';
 
 interface Certificate {
   _id: string;
@@ -29,20 +35,27 @@ export default function CertificatePage() {
   const [loading, setLoading] = useState(true);
   const [error,   setError]   = useState('');
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const load = useCallback(async (force = false) => {
+    const field = lmsClientFields.certificate(sopCode);
+    const cached = !force ? readLmsClientCache<{ certificate: Certificate | null }>(field) : null;
+    if (cached?.value?.certificate) {
+      setCert(cached.value.certificate);
+      setLoading(false);
+      if (Date.now() - cached.cachedAt <= LMS_CLIENT_FRESH_MS) return;
+    } else if (!cached) {
+      setLoading(true);
+    }
     try {
-      // Try to get existing certificate
       const getRes = await fetch(`/api/lms/certificate/${sopCode}`);
       if (getRes.status === 401) { router.push('/lms'); return; }
       const getData = await getRes.json();
 
       if (getData.certificate) {
         setCert(getData.certificate);
+        writeLmsClientCache(field, getData);
         return;
       }
 
-      // Try to generate one
       const postRes = await fetch(`/api/lms/certificate/${sopCode}`, { method: 'POST' });
       const postData = await postRes.json();
       if (!postRes.ok) {
@@ -50,6 +63,7 @@ export default function CertificatePage() {
         return;
       }
       setCert(postData.certificate);
+      writeLmsClientCache(field, postData);
     } catch {
       setError('Failed to load certificate.');
     } finally {

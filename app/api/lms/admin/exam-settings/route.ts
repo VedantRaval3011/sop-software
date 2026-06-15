@@ -2,6 +2,13 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth';
 import { connectDB } from '@/lib/mongodb';
+import {
+  getOrBuildLmsCache,
+  invalidateLmsServerKeys,
+  lmsCacheControl,
+  lmsServerKeys,
+  lmsServerTtl,
+} from '@/lib/lmsCache';
 import ExamSettings from '@/models/lms/ExamSettings';
 
 export const dynamic = 'force-dynamic';
@@ -12,13 +19,20 @@ export async function GET() {
   if (!session) return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
 
   try {
-    await connectDB();
-    const settings = await ExamSettings.findOneAndUpdate(
-      { settingsKey: 'global' },
-      { $setOnInsert: { settingsKey: 'global' } },
-      { upsert: true, new: true, setDefaultsOnInsert: true },
-    ).lean();
-    return NextResponse.json({ settings });
+    const body = await getOrBuildLmsCache(
+      lmsServerKeys.adminExamSettings(),
+      lmsServerTtl.adminExamSettings,
+      async () => {
+        await connectDB();
+        const settings = await ExamSettings.findOneAndUpdate(
+          { settingsKey: 'global' },
+          { $setOnInsert: { settingsKey: 'global' } },
+          { upsert: true, new: true, setDefaultsOnInsert: true },
+        ).lean();
+        return { settings };
+      },
+    );
+    return NextResponse.json(body, { headers: lmsCacheControl(120) });
   } catch (err: unknown) {
     return NextResponse.json({ error: err instanceof Error ? err.message : String(err) }, { status: 500 });
   }
@@ -50,6 +64,7 @@ export async function PATCH(req: NextRequest) {
       { upsert: true, new: true, setDefaultsOnInsert: true },
     ).lean();
 
+    invalidateLmsServerKeys(lmsServerKeys.adminExamSettings());
     return NextResponse.json({ settings });
   } catch (err: unknown) {
     return NextResponse.json({ error: err instanceof Error ? err.message : String(err) }, { status: 500 });

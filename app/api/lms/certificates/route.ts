@@ -2,6 +2,12 @@ import { NextResponse } from 'next/server';
 import { cookies } from 'next/headers';
 import { connectDB } from '@/lib/mongodb';
 import { verifyLmsToken, LMS_COOKIE } from '@/lib/lms-session';
+import {
+  getOrBuildLmsCache,
+  lmsCacheControl,
+  lmsServerKeys,
+  lmsServerTtl,
+} from '@/lib/lmsCache';
 import Certificate from '@/models/lms/Certificate';
 
 export const dynamic = 'force-dynamic';
@@ -13,13 +19,20 @@ export async function GET() {
   if (!payload) return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
 
   try {
-    await connectDB();
-    const certificates = await Certificate.find({ employeeId: payload.sub })
-      .sort({ issuedAt: -1 })
-      .select('certificateNumber sopCode sopName completedAt quizScore hasPractical practicalScore issuedAt')
-      .lean();
+    const body = await getOrBuildLmsCache(
+      lmsServerKeys.certificates(payload.sub),
+      lmsServerTtl.userDashboard,
+      async () => {
+        await connectDB();
+        const certificates = await Certificate.find({ employeeId: payload.sub })
+          .sort({ issuedAt: -1 })
+          .select('certificateNumber sopCode sopName completedAt quizScore hasPractical practicalScore issuedAt')
+          .lean();
+        return { certificates };
+      },
+    );
 
-    return NextResponse.json({ certificates });
+    return NextResponse.json(body, { headers: lmsCacheControl(60) });
   } catch (err: unknown) {
     return NextResponse.json({ error: err instanceof Error ? err.message : String(err) }, { status: 500 });
   }

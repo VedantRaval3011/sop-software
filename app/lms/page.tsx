@@ -7,6 +7,13 @@ import {
   CheckCircle2, AlertCircle, ChevronRight, Loader2, RefreshCw,
   FileText, ClipboardList, TrendingUp, Award,
 } from 'lucide-react';
+import {
+  clearLmsClientCache,
+  lmsClientFields,
+  LMS_CLIENT_FRESH_MS,
+  readLmsClientCache,
+  writeLmsClientCache,
+} from '@/lib/lmsCache';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -46,6 +53,12 @@ interface ProgressRecord {
 }
 
 type FilterTab = 'all' | 'in_progress' | 'completed' | 'overdue' | 'not_started';
+
+interface DashboardCache {
+  assignments: SopAssignment[];
+  progress: ProgressRecord[];
+  certificates: CertRecord[];
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -275,6 +288,7 @@ function LoginCard({ onLogin }: { onLogin: (emp: Employee) => void }) {
       });
       const json = await res.json();
       if (!res.ok) { setError(json.error || 'Login failed'); return; }
+      writeLmsClientCache(lmsClientFields.employee, { employee: json.employee });
       onLogin(json.employee);
     } finally {
       setLoading(false);
@@ -346,8 +360,19 @@ function Dashboard({ employee, onLogout }: { employee: Employee; onLogout: () =>
   const [search,   setSearch]   = useState('');
   const [filter,   setFilter]   = useState<FilterTab>('all');
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const load = useCallback(async (force = false) => {
+    const cached = !force ? readLmsClientCache<DashboardCache>(lmsClientFields.dashboard) : null;
+    if (cached?.value) {
+      setAssignments(cached.value.assignments || []);
+      const map = new Map<string, ProgressRecord>();
+      for (const p of cached.value.progress || []) map.set(p.sopCode, p);
+      setProgressMap(map);
+      setCertificates(cached.value.certificates || []);
+      setLoading(false);
+      if (Date.now() - cached.cachedAt <= LMS_CLIENT_FRESH_MS) return;
+    } else {
+      setLoading(true);
+    }
     try {
       const [meRes, progressRes, certRes] = await Promise.all([
         fetch('/api/lms/auth/me'),
@@ -358,13 +383,15 @@ function Dashboard({ employee, onLogout }: { employee: Employee; onLogout: () =>
       const meData    = await meRes.json();
       const progData  = await progressRes.json();
       const certData  = certRes.ok ? await certRes.json() : { certificates: [] };
-      setAssignments(meData.assignments || []);
+      const assignments = meData.assignments || [];
+      const progress = (progData.progress || []) as ProgressRecord[];
+      const certificates = certData.certificates || [];
+      setAssignments(assignments);
       const map = new Map<string, ProgressRecord>();
-      for (const p of (progData.progress || []) as ProgressRecord[]) {
-        map.set(p.sopCode, p);
-      }
+      for (const p of progress) map.set(p.sopCode, p);
       setProgressMap(map);
-      setCertificates(certData.certificates || []);
+      setCertificates(certificates);
+      writeLmsClientCache(lmsClientFields.dashboard, { assignments, progress, certificates });
     } finally {
       setLoading(false);
     }
@@ -374,6 +401,7 @@ function Dashboard({ employee, onLogout }: { employee: Employee; onLogout: () =>
 
   const handleSignOut = async () => {
     await fetch('/api/lms/auth/logout', { method: 'POST' });
+    clearLmsClientCache();
     onLogout();
   };
 
@@ -423,7 +451,7 @@ function Dashboard({ employee, onLogout }: { employee: Employee; onLogout: () =>
           </div>
           <div className="flex items-center gap-2">
             <button
-              onClick={load}
+              onClick={() => load(true)}
               disabled={loading}
               className="rounded-lg border border-gray-200 p-1.5 text-gray-400 hover:bg-gray-50 disabled:opacity-50"
             >
@@ -579,9 +607,20 @@ export default function LmsPage() {
   const [checking, setChecking] = useState(true);
 
   useEffect(() => {
+    const cached = readLmsClientCache<{ employee: Employee }>(lmsClientFields.employee);
+    if (cached?.value?.employee) {
+      setEmployee(cached.value.employee);
+      setChecking(false);
+      if (Date.now() - cached.cachedAt <= LMS_CLIENT_FRESH_MS) return;
+    }
     fetch('/api/lms/auth/me')
       .then((r) => r.json())
-      .then((d) => { if (d.employee) setEmployee(d.employee); })
+      .then((d) => {
+        if (d.employee) {
+          setEmployee(d.employee);
+          writeLmsClientCache(lmsClientFields.employee, { employee: d.employee });
+        }
+      })
       .catch(() => { /* not logged in */ })
       .finally(() => setChecking(false));
   }, []);
