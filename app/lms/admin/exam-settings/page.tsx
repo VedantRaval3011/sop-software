@@ -8,6 +8,12 @@ import {
   ArrowLeft, Save, Loader2, AlertCircle, Check,
   ClipboardList, Timer, Hash, RotateCcw, Eye, Shuffle, Plus, Trash2, Award,
 } from 'lucide-react';
+import {
+  lmsClientFields,
+  LMS_CLIENT_FRESH_MS,
+  readLmsClientCache,
+  writeLmsClientCache,
+} from '@/lib/lmsCache';
 
 interface PassingScoreRule {
   employeeId?: string;
@@ -131,12 +137,25 @@ function PassingScoreRulesSection({
   const [addErr, setAddErr] = useState('');
 
   useEffect(() => {
+    const cached = readLmsClientCache<{
+      departments: string[];
+      designations: string[];
+      employees: EmployeeMeta[];
+    }>(lmsClientFields.adminMeta);
+    if (cached?.value) {
+      setDepartments(cached.value.departments ?? []);
+      setDesignations(cached.value.designations ?? []);
+      setEmployees(cached.value.employees ?? []);
+      setMetaLoading(false);
+      if (Date.now() - cached.cachedAt <= LMS_CLIENT_FRESH_MS) return;
+    }
     fetch('/api/lms/admin/meta')
       .then((r) => r.json())
       .then((d) => {
         setDepartments(d.departments  ?? []);
         setDesignations(d.designations ?? []);
         setEmployees(d.employees      ?? []);
+        writeLmsClientCache(lmsClientFields.adminMeta, d);
       })
       .finally(() => setMetaLoading(false));
   }, []);
@@ -328,9 +347,20 @@ export default function ExamSettingsPage() {
   }, [status, router]);
 
   useEffect(() => {
+    const cached = readLmsClientCache<{ settings: ExamSettings }>(lmsClientFields.adminExamSettings);
+    if (cached?.value?.settings) {
+      setSettings({ ...DEFAULT, ...cached.value.settings });
+      setLoading(false);
+      if (Date.now() - cached.cachedAt <= LMS_CLIENT_FRESH_MS) return;
+    }
     fetch('/api/lms/admin/exam-settings')
       .then((r) => r.json())
-      .then((d) => { if (d.settings) setSettings({ ...DEFAULT, ...d.settings }); })
+      .then((d) => {
+        if (d.settings) {
+          setSettings({ ...DEFAULT, ...d.settings });
+          writeLmsClientCache(lmsClientFields.adminExamSettings, d);
+        }
+      })
       .catch(() => setError('Failed to load settings'))
       .finally(() => setLoading(false));
   }, []);
@@ -352,7 +382,9 @@ export default function ExamSettingsPage() {
       });
       const json = await res.json();
       if (!res.ok) { setError(json.error || 'Failed to save'); return; }
-      setSettings({ ...DEFAULT, ...json.settings });
+      const merged = { ...DEFAULT, ...json.settings };
+      setSettings(merged);
+      writeLmsClientCache(lmsClientFields.adminExamSettings, { settings: merged });
       setSaved(true);
       setTimeout(() => setSaved(false), 2500);
     } finally {

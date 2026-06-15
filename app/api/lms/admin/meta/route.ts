@@ -2,6 +2,12 @@ import { NextResponse } from 'next/server';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth';
 import { connectDB } from '@/lib/mongodb';
+import {
+  getOrBuildLmsCache,
+  lmsCacheControl,
+  lmsServerKeys,
+  lmsServerTtl,
+} from '@/lib/lmsCache';
 import Employee from '@/models/Employee';
 
 export const dynamic = 'force-dynamic';
@@ -13,26 +19,34 @@ export async function GET() {
   if (!session) return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
 
   try {
-    await connectDB();
+    const body = await getOrBuildLmsCache(
+      lmsServerKeys.adminMeta(),
+      lmsServerTtl.adminMeta,
+      async () => {
+        await connectDB();
 
-    const employees = await Employee.find({ isActive: true })
-      .select('_id name department designation')
-      .sort({ name: 1 })
-      .lean<{ _id: unknown; name: string; department: string; designation: string }[]>();
+        const employees = await Employee.find({ isActive: true })
+          .select('_id name department designation')
+          .sort({ name: 1 })
+          .lean<{ _id: unknown; name: string; department: string; designation: string }[]>();
 
-    const departments  = [...new Set(employees.map((e) => e.department).filter(Boolean))].sort();
-    const designations = [...new Set(employees.map((e) => e.designation).filter(Boolean))].sort();
+        const departments  = [...new Set(employees.map((e) => e.department).filter(Boolean))].sort();
+        const designations = [...new Set(employees.map((e) => e.designation).filter(Boolean))].sort();
 
-    return NextResponse.json({
-      departments,
-      designations,
-      employees: employees.map((e) => ({
-        id:          String(e._id),
-        name:        e.name,
-        department:  e.department,
-        designation: e.designation,
-      })),
-    });
+        return {
+          departments,
+          designations,
+          employees: employees.map((e) => ({
+            id:          String(e._id),
+            name:        e.name,
+            department:  e.department,
+            designation: e.designation,
+          })),
+        };
+      },
+    );
+
+    return NextResponse.json(body, { headers: lmsCacheControl(300) });
   } catch (err: unknown) {
     return NextResponse.json({ error: err instanceof Error ? err.message : String(err) }, { status: 500 });
   }

@@ -5,10 +5,17 @@ import { useParams, useRouter } from 'next/navigation';
 import {
   ArrowLeft, Check, ChevronLeft, ChevronRight, PlayCircle,
   FileText, BookOpen, ClipboardList, Lock, Loader2, AlertCircle,
-  Volume2, Trophy, X, Award,
+  Volume2, Trophy, X, Award, RefreshCw, Clock,
 } from 'lucide-react';
 import type { JourneyStep } from '@/app/api/lms/journey/[sopCode]/route';
 import { buildOfficeOnlineEmbedUrl, buildPreviewHref } from '@/lib/file-urls';
+import {
+  invalidateLmsClientFields,
+  lmsClientFields,
+  LMS_CLIENT_FRESH_MS,
+  readLmsClientCache,
+  writeLmsClientCache,
+} from '@/lib/lmsCache';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -903,31 +910,53 @@ export default function JourneyPage() {
   const [showAssessmentIntro, setShowAssessmentIntro] = useState(false);
   const [pendingQuizIdx, setPendingQuizIdx] = useState<number | null>(null);
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const applyJourneyData = useCallback((json: JourneyData) => {
+    setData(json);
+    setLocalSteps(json.steps);
+    const pct = json.progress?.overallPercentage ?? 0;
+    setOverallPct(pct);
+    const firstIncomplete = json.steps.findIndex((s) => !s.completed);
+    setCurrentStep(firstIncomplete >= 0 ? firstIncomplete : 0);
+  }, []);
+
+  const load = useCallback(async (force = false) => {
+    const field = lmsClientFields.journey(sopCode);
+    const cached = !force ? readLmsClientCache<JourneyData>(field) : null;
+    if (cached?.value) {
+      applyJourneyData(cached.value);
+      setLoading(false);
+      if (Date.now() - cached.cachedAt <= LMS_CLIENT_FRESH_MS) {
+        const pct = cached.value.progress?.overallPercentage ?? 0;
+        if (pct >= 100) {
+          const certCached = readLmsClientCache<{ certificate: unknown }>(lmsClientFields.certificate(sopCode));
+          if (certCached?.value?.certificate) setHasCert(true);
+        }
+        return;
+      }
+    } else {
+      setLoading(true);
+    }
     try {
       const res = await fetch(`/api/lms/journey/${sopCode}`);
       if (res.status === 401) { router.push('/lms'); return; }
       const json = await res.json() as JourneyData;
-      setData(json);
-      setLocalSteps(json.steps);
+      applyJourneyData(json);
+      writeLmsClientCache(field, json);
       const pct = json.progress?.overallPercentage ?? 0;
-      setOverallPct(pct);
-      // Resume at first incomplete step
-      const firstIncomplete = json.steps.findIndex((s) => !s.completed);
-      setCurrentStep(firstIncomplete >= 0 ? firstIncomplete : 0);
-      // If already complete, load cert status
       if (pct >= 100) {
         const certRes = await fetch(`/api/lms/certificate/${sopCode}`);
         const certData = await certRes.json();
-        if (certData.certificate) setHasCert(true);
+        if (certData.certificate) {
+          setHasCert(true);
+          writeLmsClientCache(lmsClientFields.certificate(sopCode), certData);
+        }
       }
     } catch {
       setError('Failed to load training.');
     } finally {
       setLoading(false);
     }
-  }, [sopCode, router]);
+  }, [sopCode, router, applyJourneyData]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -942,7 +971,11 @@ export default function JourneyPage() {
       if (json.progress) {
         const newPct = json.progress.overallPercentage ?? 0;
         setOverallPct(newPct);
-        // Reached 100% — load cert status
+        invalidateLmsClientFields(
+          lmsClientFields.journey(sopCode),
+          lmsClientFields.dashboard,
+          lmsClientFields.certificate(sopCode),
+        );
         if (newPct >= 100 && !hasCert) {
           const certRes = await fetch(`/api/lms/certificate/${sopCode}`);
           const certData = await certRes.json();

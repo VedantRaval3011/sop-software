@@ -2,6 +2,13 @@ import { NextRequest, NextResponse } from 'next/server';
 import { cookies } from 'next/headers';
 import { connectDB } from '@/lib/mongodb';
 import { verifyLmsToken, LMS_COOKIE } from '@/lib/lms-session';
+import {
+  getOrBuildLmsCache,
+  invalidateLmsLearnerCache,
+  lmsCacheControl,
+  lmsServerKeys,
+  lmsServerTtl,
+} from '@/lib/lmsCache';
 import Certificate from '@/models/lms/Certificate';
 import LearningProgress from '@/models/lms/LearningProgress';
 import Employee from '@/models/Employee';
@@ -27,9 +34,17 @@ export async function GET(_req: NextRequest, { params }: Params) {
   const { sopCode } = await params;
 
   try {
-    await connectDB();
-    const cert = await Certificate.findOne({ employeeId: payload.sub, sopCode }).lean();
-    return NextResponse.json({ certificate: cert || null });
+    const body = await getOrBuildLmsCache(
+      lmsServerKeys.certificate(payload.sub, sopCode),
+      lmsServerTtl.certificate,
+      async () => {
+        await connectDB();
+        const cert = await Certificate.findOne({ employeeId: payload.sub, sopCode }).lean();
+        return { certificate: cert || null };
+      },
+    );
+
+    return NextResponse.json(body, { headers: lmsCacheControl(120) });
   } catch (err: unknown) {
     return NextResponse.json({ error: err instanceof Error ? err.message : String(err) }, { status: 500 });
   }
@@ -93,6 +108,7 @@ export async function POST(_req: NextRequest, { params }: Params) {
       issuedAt: new Date(),
     });
 
+    invalidateLmsLearnerCache(payload.sub, sopCode);
     return NextResponse.json({ certificate: cert.toObject() }, { status: 201 });
   } catch (err: unknown) {
     return NextResponse.json({ error: err instanceof Error ? err.message : String(err) }, { status: 500 });
