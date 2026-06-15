@@ -95,6 +95,7 @@ export function describeFilters(filters: SOPFilters): FilterBreadcrumb {
   if (filters.dualLanguage) push("Dual Language");
   if (filters.absoluteSop) push("Absolute SOP");
   if (filters.obsoleteOnly) push("Obsolete");
+  if (filters.archiveView) push("Prior Version Archive");
 
   if (filters.locations && filters.locations.length > 0) {
     push(filters.locations.length === 1 ? filters.locations[0] : `${filters.locations.length} Locations`);

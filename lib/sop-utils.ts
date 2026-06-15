@@ -540,7 +540,11 @@ export function groupSOPRecords(records: ISOP[]): RegistrySOP[] {
       const langNeedsGu = language === "GUJ" || language === "ENG-GUJ";
       return (langNeedsEn ? hasVersionDateEn : true) && (langNeedsGu ? hasVersionDateGu : true);
     })();
-    const priorVersions = buildPriorVersions(group, currentVersion, language);
+    const { prior: priorVersions, archived: archivedVersions } = buildPriorVersions(
+      group,
+      currentVersion,
+      language,
+    );
 
     const displayIdentifier =
       currentRecords.find((r) => {
@@ -582,6 +586,7 @@ export function groupSOPRecords(records: ISOP[]): RegistrySOP[] {
           .map((d) => d.fileName!.toLowerCase()),
       ),
       priorVersions,
+      archivedVersions,
       hasVersion,
       hasVersionDate,
       hasVersionDateEn,
@@ -610,9 +615,31 @@ function requiredPriorVersionNumbers(currentNum: number): number[] {
   return [currentNum - 1, currentNum - 2].filter((n) => n >= 0);
 }
 
+type PriorVersionEntry = {
+  version: string;
+  language: string;
+  docx?: string;
+  pdf?: string;
+  missing?: boolean;
+};
+
+/**
+ * Split an SOP family's superseded revisions into two buckets:
+ *   • `prior`    — the two revisions immediately preceding the current one. These stay in
+ *                  the active SOP Registry's "Prior Versions" column (e.g. V12 keeps V11, V10).
+ *   • `archived` — every revision older than that window (e.g. V9 and below). These are NOT
+ *                  deleted; they are surfaced in the Prior Version Archive as historical
+ *                  records, with all their files and metadata intact.
+ *
+ * A revision automatically moves from `prior` to `archived` the moment a newer version is
+ * uploaded and pushes it outside the two-revision window — no deletion, no migration.
+ */
 function buildPriorVersions(group: ISOP[], currentVersion: string, language = "ENG") {
   const isDual = language === "ENG-GUJ";
   const currentNum = versionNumber(currentVersion);
+  // Revisions with versionNum >= keptThreshold (and below current) stay in the registry;
+  // anything older is archived. keptThreshold = currentNum - 2 keeps exactly V-1 and V-2.
+  const keptThreshold = currentNum - 2;
 
   // Collect every uploaded prior-version file, keyed by "<versionNum>-<lang>".
   const uploaded = new Map<string, { versionNum: number; version: string; lang: string; docx?: string; pdf?: string }>();
@@ -626,17 +653,14 @@ function buildPriorVersions(group: ISOP[], currentVersion: string, language = "E
     uploaded.set(key, entry);
   }
 
-  const result: Array<{
-    version: string;
-    language: string;
-    docx?: string;
-    pdf?: string;
-    missing?: boolean;
-  }> = [];
+  const prior: PriorVersionEntry[] = [];
+  const archived: PriorVersionEntry[] = [];
 
-  for (const { version, lang, docx, pdf } of uploaded.values()) {
+  for (const { versionNum, version, lang, docx, pdf } of uploaded.values()) {
     if (!docx && !pdf) continue;
-    result.push({ version, language: lang, docx, pdf });
+    const entry: PriorVersionEntry = { version, language: lang, docx, pdf };
+    if (versionNum >= keptThreshold) prior.push(entry);
+    else archived.push(entry);
   }
 
   // The registry must hold the two revisions immediately preceding the current one, and
@@ -645,25 +669,28 @@ function buildPriorVersions(group: ISOP[], currentVersion: string, language = "E
   // a missing Gujarati translation is flagged on its own row, not masked by the English
   // copy. Any required (language, revision) that has no complete file on file is marked
   // "missing" so the SOP is Not Found and the specific version number is shown as missing.
+  // Required revisions are always inside the kept window, so missing markers live in `prior`.
   const requiredLangs = isDual ? ["ENG", "GUJ"] : [language === "GUJ" ? "GUJ" : "ENG"];
   const requiredVersions = requiredPriorVersionNumbers(currentNum);
   for (const lang of requiredLangs) {
     const completeForLang = new Set(
-      result
+      prior
         .filter((pv) => pv.language === lang && pv.docx && pv.pdf)
         .map((pv) => versionNumber(pv.version)),
     );
     for (const n of requiredVersions) {
       if (completeForLang.has(n)) continue;
-      const existsForLang = result.some(
+      const existsForLang = prior.some(
         (pv) => pv.language === lang && versionNumber(pv.version) === n,
       );
-      if (!existsForLang) result.push({ version: String(n), language: lang, missing: true });
+      if (!existsForLang) prior.push({ version: String(n), language: lang, missing: true });
     }
   }
 
   // Newest first — guarantees correct descending order for every language independently.
-  return result.sort((a, b) => versionNumber(b.version) - versionNumber(a.version));
+  const byVersionDesc = (a: PriorVersionEntry, b: PriorVersionEntry) =>
+    versionNumber(b.version) - versionNumber(a.version);
+  return { prior: prior.sort(byVersionDesc), archived: archived.sort(byVersionDesc) };
 }
 
 /**
@@ -694,7 +721,10 @@ function priorVersionsComplete(sop: RegistrySOP): boolean {
 export function applyFilters(items: RegistrySOP[], filters: SOPFilters): RegistrySOP[] {
   let result = [...items];
 
-  if (filters.obsoleteOnly) {
+  if (filters.archiveView) {
+    // Prior Version Archive: active families that have superseded revisions on file.
+    result = result.filter((s) => !s.isObsolete && s.archivedVersions.length > 0);
+  } else if (filters.obsoleteOnly) {
     result = result.filter((s) => s.isObsolete);
   } else {
     result = result.filter((s) => !s.isObsolete);
@@ -1093,6 +1123,7 @@ export function buildDashboardStats(registry: RegistrySOP[], extraDepartments: s
       (s, r) => s + r.priorVersions.filter((pv) => !pv.missing).length,
       0,
     ),
+    archivedVersionCount: active.reduce((s, r) => s + r.archivedVersions.length, 0),
   };
 }
 
@@ -1115,6 +1146,7 @@ export function parseFiltersFromSearchParams(params: URLSearchParams): SOPFilter
     dualLanguage: params.get("dualLanguage") === "true",
     absoluteSop: params.get("absoluteSop") === "true",
     obsoleteOnly: params.get("obsoleteOnly") === "true",
+    archiveView: params.get("archiveView") === "true",
     dateFrom: params.get("dateFrom") ?? undefined,
     dateTo: params.get("dateTo") ?? undefined,
     locations: params.getAll("location"),

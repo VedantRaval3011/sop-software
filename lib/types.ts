@@ -44,7 +44,11 @@ export interface RegistrySOP {
     slides: MediaFileLinks;
   };
   videoFileNames: string[];
+  /** The two revisions immediately preceding the current one — kept in the active registry. */
   priorVersions: PriorVersion[];
+  /** Superseded revisions older than the kept window — surfaced in the Prior Version Archive,
+   *  never deleted. Files and metadata are preserved on these records. */
+  archivedVersions: PriorVersion[];
   hasVersion: boolean;
   hasVersionDate: boolean;
   hasVersionDateEn: boolean;
@@ -165,6 +169,8 @@ export interface DashboardStats {
   guidelinesAnalyzed: number;
   departments: DepartmentCapsule[];
   priorVersionCount: number;
+  /** Number of superseded revisions held in the Prior Version Archive. */
+  archivedVersionCount: number;
 }
 
 export interface SOPFilters {
@@ -181,6 +187,8 @@ export interface SOPFilters {
   dualLanguage?: boolean;
   absoluteSop?: boolean;
   obsoleteOnly?: boolean;
+  /** Show the Prior Version Archive view: families with superseded (older than the kept window) revisions. */
+  archiveView?: boolean;
   dateFrom?: string;
   dateTo?: string;
   locations?: string[];

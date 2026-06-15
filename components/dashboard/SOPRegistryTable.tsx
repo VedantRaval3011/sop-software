@@ -320,6 +320,9 @@ export function SOPRegistryTable({
   // True when the table is showing the Obsolete SOPs view; there we offer Revive
   // (move back to active) instead of the Obsolete action.
   const isObsoleteView = Boolean(filters.obsoleteOnly);
+  // True when showing the Prior Version Archive: a read-only historical listing of
+  // superseded revisions. Rows show their archived versions and hide mutate actions.
+  const isArchiveView = Boolean(filters.archiveView);
 
   const handleRevive = useCallback(
     async (sop: RegistrySOP) => {
@@ -411,7 +414,9 @@ export function SOPRegistryTable({
 
         {/* Toolbar row */}
         <div className="flex flex-wrap items-center gap-2 border-b border-gray-300 bg-gray-100 px-3 py-2">
-          <h2 className="text-xs font-bold uppercase tracking-widest text-gray-700">SOP Registry</h2>
+          <h2 className="text-xs font-bold uppercase tracking-widest text-gray-700">
+            {isArchiveView ? "Prior Version Archive" : isObsoleteView ? "Obsolete SOPs" : "SOP Registry"}
+          </h2>
           <div className="flex flex-wrap items-center gap-1.5">
             <Btn size="xs" onClick={resetFilters}>Reset</Btn>
             <Btn
@@ -526,9 +531,9 @@ export function SOPRegistryTable({
                     Location <SortIcon field="location" />
                   </button>
                 </th>
-                <th className={thBase} title="Prior revisions (DOCX/PDF) per language">
+                <th className={thBase} title={isArchiveView ? "Archived (superseded) revisions per language" : "Prior revisions (DOCX/PDF) per language"}>
                   <button type="button" className={sortBtn} onClick={() => onSort("priorVersions")}>
-                    Prior Versions <SortIcon field="priorVersions" />
+                    {isArchiveView ? "Archived Versions" : "Prior Versions"} <SortIcon field="priorVersions" />
                   </button>
                 </th>
                 <th className={thBase}>
@@ -650,7 +655,11 @@ export function SOPRegistryTable({
                   <td colSpan={canMutate ? 16 : 15} className="py-12 text-center text-gray-500">
                     <div className="flex flex-col items-center gap-1">
                       <FileText className="h-5 w-5 text-gray-300" />
-                      <p className="text-xs">No SOPs found</p>
+                      <p className="text-xs">
+                        {isArchiveView
+                          ? "No archived versions — SOPs need more than two prior revisions before older ones are archived."
+                          : "No SOPs found"}
+                      </p>
                     </div>
                   </td>
                 </tr>
@@ -665,6 +674,7 @@ export function SOPRegistryTable({
                     onToggle={() => toggleRow(sop.id)}
                     canMutate={canMutate}
                     isObsoleteView={isObsoleteView}
+                    isArchiveView={isArchiveView}
                     onEdit={() => setEditIdentifier(sop.identifier)}
                     onObsolete={() => setObsoleteTarget(sop)}
                     onRevive={() => handleRevive(sop)}
@@ -692,6 +702,7 @@ const SOPRow = memo(function SOPRow({
   onToggle,
   canMutate,
   isObsoleteView,
+  isArchiveView,
   onEdit,
   onObsolete,
   onRevive,
@@ -704,6 +715,7 @@ const SOPRow = memo(function SOPRow({
   onToggle: () => void;
   canMutate: boolean;
   isObsoleteView: boolean;
+  isArchiveView: boolean;
   onEdit: () => void;
   onObsolete: () => void;
   onRevive: () => void;
@@ -819,9 +831,9 @@ const SOPRow = memo(function SOPRow({
           </span>
         </td>
 
-        {/* Prior Versions */}
+        {/* Prior Versions (or archived revisions in the archive view) */}
         <td className={`${registryTdBase} px-0.5`}>
-          <PriorVersionsCell sop={sop} />
+          <PriorVersionsCell sop={sop} archiveView={isArchiveView} />
         </td>
 
         {/* Department */}
@@ -897,42 +909,47 @@ const SOPRow = memo(function SOPRow({
               >
                 <Edit2 className="h-3 w-3 text-slate-500" />
               </button>
-              {isObsoleteView ? (
-                <button
-                  type="button"
-                  className="rounded p-0.5 hover:bg-emerald-50"
-                  title="Revive — move back to SOP Registry"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onRevive();
-                  }}
-                >
-                  <RotateCcw className="h-3 w-3 text-emerald-600" />
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  className="rounded p-0.5 hover:bg-amber-50"
-                  title="Move to Obsolete"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onObsolete();
-                  }}
-                >
-                  <Archive className="h-3 w-3 text-amber-600" />
-                </button>
+              {/* Archive view is read-only history — only Edit is offered there. */}
+              {!isArchiveView && (
+                <>
+                  {isObsoleteView ? (
+                    <button
+                      type="button"
+                      className="rounded p-0.5 hover:bg-emerald-50"
+                      title="Revive — move back to SOP Registry"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onRevive();
+                      }}
+                    >
+                      <RotateCcw className="h-3 w-3 text-emerald-600" />
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      className="rounded p-0.5 hover:bg-amber-50"
+                      title="Move to Obsolete"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onObsolete();
+                      }}
+                    >
+                      <Archive className="h-3 w-3 text-amber-600" />
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className="rounded p-0.5 hover:bg-red-50"
+                    title="Delete permanently"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onDelete();
+                    }}
+                  >
+                    <Trash2 className="h-3 w-3 text-red-500" />
+                  </button>
+                </>
               )}
-              <button
-                type="button"
-                className="rounded p-0.5 hover:bg-red-50"
-                title="Delete permanently"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onDelete();
-                }}
-              >
-                <Trash2 className="h-3 w-3 text-red-500" />
-              </button>
             </div>
           </td>
         )}
@@ -947,6 +964,7 @@ const SOPRow = memo(function SOPRow({
               expiryNode={expiryNode}
               canMutate={canMutate}
               isObsoleteView={isObsoleteView}
+              isArchiveView={isArchiveView}
               onEdit={onEdit}
               onObsolete={onObsolete}
               onRevive={onRevive}
@@ -982,6 +1000,7 @@ function SOPDetailPanel({
   expiryNode,
   canMutate,
   isObsoleteView,
+  isArchiveView,
   onEdit,
   onObsolete,
   onRevive,
@@ -991,6 +1010,7 @@ function SOPDetailPanel({
   expiryNode: React.ReactNode;
   canMutate: boolean;
   isObsoleteView: boolean;
+  isArchiveView: boolean;
   onEdit: () => void;
   onObsolete: () => void;
   onRevive: () => void;
@@ -1009,8 +1029,11 @@ function SOPDetailPanel({
     { lang: "GUJ", docx: sop.files.docx.gu, pdf: sop.files.pdf.gu },
   ].filter((g) => g.docx || g.pdf);
 
-  const engPrior = sop.priorVersions.filter((pv) => pv.language === "ENG");
-  const gujPrior = sop.priorVersions.filter((pv) => pv.language === "GUJ");
+  // In the archive view the panel shows the superseded (archived) revisions instead of
+  // the two kept prior versions.
+  const revisionList = isArchiveView ? sop.archivedVersions : sop.priorVersions;
+  const engPrior = revisionList.filter((pv) => pv.language === "ENG");
+  const gujPrior = revisionList.filter((pv) => pv.language === "GUJ");
 
   const renderPriorGroup = (label: string, pvs: typeof sop.priorVersions) =>
     pvs.length === 0 ? null : (
@@ -1075,9 +1098,11 @@ function SOPDetailPanel({
               )}
             </div>
           </div>
-          {sop.priorVersions.length > 0 && (
+          {revisionList.length > 0 && (
             <div className="flex flex-col gap-1 border-t border-gray-200 pt-1.5">
-              <span className="font-semibold text-gray-600">Prior Revisions:</span>
+              <span className="font-semibold text-gray-600">
+                {isArchiveView ? "Archived Revisions:" : "Prior Revisions:"}
+              </span>
               {renderPriorGroup("English", engPrior)}
               {renderPriorGroup("Gujarati", gujPrior)}
             </div>
@@ -1157,30 +1182,35 @@ function SOPDetailPanel({
               >
                 <Edit2 className="h-3 w-3" /> Edit SOP
               </button>
-              {isObsoleteView ? (
-                <button
-                  type="button"
-                  onClick={(e) => { e.stopPropagation(); onRevive(); }}
-                  className="flex items-center justify-center gap-1 rounded border border-emerald-200 bg-white px-2 py-1 text-[10px] font-semibold text-emerald-700 hover:bg-emerald-50"
-                >
-                  <RotateCcw className="h-3 w-3" /> Revive SOP
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={(e) => { e.stopPropagation(); onObsolete(); }}
-                  className="flex items-center justify-center gap-1 rounded border border-amber-200 bg-white px-2 py-1 text-[10px] font-semibold text-amber-700 hover:bg-amber-50"
-                >
-                  <Archive className="h-3 w-3" /> Mark Obsolete
-                </button>
+              {/* Archive view is read-only history — only Edit is offered there. */}
+              {!isArchiveView && (
+                <>
+                  {isObsoleteView ? (
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); onRevive(); }}
+                      className="flex items-center justify-center gap-1 rounded border border-emerald-200 bg-white px-2 py-1 text-[10px] font-semibold text-emerald-700 hover:bg-emerald-50"
+                    >
+                      <RotateCcw className="h-3 w-3" /> Revive SOP
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); onObsolete(); }}
+                      className="flex items-center justify-center gap-1 rounded border border-amber-200 bg-white px-2 py-1 text-[10px] font-semibold text-amber-700 hover:bg-amber-50"
+                    >
+                      <Archive className="h-3 w-3" /> Mark Obsolete
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={(e) => { e.stopPropagation(); onDelete(); }}
+                    className="flex items-center justify-center gap-1 rounded border border-red-200 bg-white px-2 py-1 text-[10px] font-semibold text-red-600 hover:bg-red-50"
+                  >
+                    <Trash2 className="h-3 w-3" /> Delete Permanently
+                  </button>
+                </>
               )}
-              <button
-                type="button"
-                onClick={(e) => { e.stopPropagation(); onDelete(); }}
-                className="flex items-center justify-center gap-1 rounded border border-red-200 bg-white px-2 py-1 text-[10px] font-semibold text-red-600 hover:bg-red-50"
-              >
-                <Trash2 className="h-3 w-3" /> Delete Permanently
-              </button>
             </div>
           )}
         </div>
@@ -1338,7 +1368,44 @@ function sortPriorDesc(pvs: PriorVersion[]): PriorVersion[] {
   return [...pvs].sort((a, b) => (parseFloat(b.version) || 0) - (parseFloat(a.version) || 0));
 }
 
-function PriorVersionsCell({ sop }: { sop: RegistrySOP }) {
+function ArchivedLangRow({ pvs, label }: { pvs: PriorVersion[]; label: string }) {
+  if (pvs.length === 0) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 leading-none">
+      <span className="text-[8px] font-bold uppercase text-gray-400 tabular-nums">{label}</span>
+      {pvs.map((pv) => (
+        <div key={`${pv.version}-${pv.language}`} className="overflow-hidden">
+          <PriorVersionEntry pv={pv} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function PriorVersionsCell({ sop, archiveView }: { sop: RegistrySOP; archiveView?: boolean }) {
+  // Archive view: show every superseded revision (no two-version cap), wrapped.
+  if (archiveView) {
+    const archived = sortPriorDesc(sop.archivedVersions);
+    if (archived.length === 0) {
+      return <span className="text-[8px] text-gray-400">—</span>;
+    }
+    if (sop.language === "ENG-GUJ") {
+      return (
+        <div className="flex flex-col gap-0.5">
+          <ArchivedLangRow pvs={archived.filter((pv) => pv.language === "ENG")} label="ENG" />
+          <ArchivedLangRow pvs={archived.filter((pv) => pv.language === "GUJ")} label="GUJ" />
+        </div>
+      );
+    }
+    const langCode = sop.language === "GUJ" ? "GUJ" : "ENG";
+    return (
+      <ArchivedLangRow
+        pvs={archived.filter((pv) => pv.language === langCode || !pv.language)}
+        label={langCode}
+      />
+    );
+  }
+
   if (sop.priorVersions.length === 0) {
     return <span className="text-[8px] text-gray-400">—</span>;
   }

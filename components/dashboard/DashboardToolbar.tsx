@@ -22,7 +22,6 @@ import {
 } from "lucide-react";
 import type { DashboardStats } from "@/lib/types";
 import { useDashboardStore } from "@/lib/store/dashboard-store";
-import { ConfirmDialog } from "./ConfirmDialog";
 import { Btn } from "./ui";
 
 interface DashboardToolbarProps {
@@ -54,24 +53,15 @@ export function DashboardToolbar({
     filters,
     showToast,
   } = useDashboardStore();
-  const [clearPriorOpen, setClearPriorOpen] = useState(false);
-  const [clearingPrior, setClearingPrior] = useState(false);
 
-  const handleClearPriorVersions = async () => {
-    setClearingPrior(true);
-    try {
-      const res = await fetch("/api/admin/clear-prior-versions", { method: "POST" });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? "Clear failed");
-      showToast(
-        `Removed ${data.deleted} prior version record(s). ${data.kept} current file(s) kept across ${data.familiesCleared} SOP(s).`,
-      );
-      setClearPriorOpen(false);
-      onRefresh();
-    } catch (err) {
-      showToast(err instanceof Error ? err.message : "Clear failed");
-    } finally {
-      setClearingPrior(false);
+  const archiveActive = Boolean(filters.archiveView);
+
+  // Open the Prior Version Archive view: a read-only historical listing of superseded
+  // SOP revisions. This is purely a view toggle — it never deletes or moves any files.
+  const toggleArchiveView = () => {
+    setFilter({ archiveView: !archiveActive, obsoleteOnly: false });
+    if (!archiveActive) {
+      document.getElementById("sop-registry")?.scrollIntoView({ behavior: "smooth" });
     }
   };
 
@@ -79,43 +69,32 @@ export function DashboardToolbar({
     <div className="border-b border-slate-200 bg-white shadow-sm">
       <div className="mx-auto flex max-w-[1920px] flex-wrap items-center gap-1.5 px-4 py-2">
 
-        {/* Guidelines */}
-        <Btn size="sm" className="border-indigo-200 bg-indigo-50 text-indigo-700 hover:bg-indigo-100" onClick={toggleGuidelines}>
-          <BookOpen className="h-3 w-3" /> Guidelines
-        </Btn>
-
         {/* Show charts */}
         <Btn size="sm">
           <BarChart3 className="h-3 w-3" /> Show charts
         </Btn>
 
-        {/* Prior Ver. Archive – amber outlined; admin can clear incorrect mappings */}
+        {/* Prior Ver. Archive – amber outlined; opens the historical archive view (read-only) */}
         <Btn
           size="sm"
-          className="border-amber-300 bg-amber-50 text-amber-700 hover:bg-amber-100"
-          onClick={isAdmin ? () => setClearPriorOpen(true) : undefined}
+          className={
+            archiveActive
+              ? "border-amber-500 bg-amber-100 text-amber-900 ring-1 ring-amber-400"
+              : "border-amber-300 bg-amber-50 text-amber-700 hover:bg-amber-100"
+          }
+          onClick={toggleArchiveView}
           title={
-            isAdmin
-              ? "Clear all prior version file records (keeps current Files column)"
-              : undefined
+            archiveActive
+              ? "Showing the Prior Version Archive — click to return to the SOP Registry"
+              : "View superseded SOP revisions (older than the two kept versions). No files are deleted."
           }
         >
           <Archive className="h-3 w-3" />
           Prior Ver. Archive
           <span className="ml-0.5 rounded border border-amber-200 bg-white px-1.5 py-px text-[10px] font-bold leading-none text-amber-800">
-            {stats?.priorVersionCount ?? 0}
+            {stats?.archivedVersionCount ?? 0}
           </span>
         </Btn>
-
-        <ConfirmDialog
-          open={clearPriorOpen}
-          title="Clear all prior version files?"
-          message="This removes every historical version file record from the database. Current SOP files in the Files column, names, departments, and other master data are kept. You can re-upload version folders afterward to rebuild correct Prior Versions mappings."
-          confirmLabel="Clear prior versions"
-          loading={clearingPrior}
-          onConfirm={handleClearPriorVersions}
-          onCancel={() => !clearingPrior && setClearPriorOpen(false)}
-        />
 
         {canMutate && (
           <>
@@ -179,16 +158,9 @@ export function DashboardToolbar({
         <Btn
           size="sm"
           className="border-teal-200 bg-teal-50 text-teal-700 hover:bg-teal-100"
+          onClick={() => router.push("/training-matrix")}
         >
           <BarChart3 className="h-3 w-3" /> Training Matrix
-        </Btn>
-
-        {/* SOP Scheduler – violet outlined */}
-        <Btn
-          size="sm"
-          className="border-violet-200 bg-violet-50 text-violet-700 hover:bg-violet-100"
-        >
-          <CalendarDays className="h-3 w-3" /> SOP Scheduler
         </Btn>
 
         {canMutate && (
@@ -202,18 +174,9 @@ export function DashboardToolbar({
             <Btn
               size="sm"
               className="border-rose-200 bg-rose-50 text-rose-700 hover:bg-rose-100"
-              onClick={() => setFilter({ obsoleteOnly: !filters.obsoleteOnly })}
+              onClick={() => setFilter({ obsoleteOnly: !filters.obsoleteOnly, archiveView: false })}
             >
               Obsolete SOPs
-            </Btn>
-
-            {/* SOP Upload – emerald outlined */}
-            <Btn
-              size="sm"
-              className="border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
-              onClick={() => setUploadModalOpen(true)}
-            >
-              <Plus className="h-3 w-3" /> SOP Upload
             </Btn>
           </>
         )}
@@ -236,28 +199,60 @@ export function DashboardToolbar({
           <BarChart3 className="h-3 w-3" /> MCQ Bank
         </Btn>
 
-        {/* Admin Tools – admin only (includes Fix SOP Names backfill) */}
-        {isAdmin && (
-          <>
-            <Btn
-              size="sm"
-              className="border-orange-200 bg-orange-50 text-orange-700 hover:bg-orange-100"
-              onClick={() => router.push("/bunny-files")}
-              title="Browse all files stored in Bunny CDN storage"
-            >
-              <Cloud className="h-3 w-3" /> Bunny Files
-            </Btn>
-            <Btn
-              size="sm"
-              className="border-sky-200 bg-sky-50 text-sky-700 hover:bg-sky-100"
-              onClick={() => setAdminOpen(true)}
-              title="Admin tools: fix SOP names, migrate files, delete versioned SOPs"
-            >
-              <Wrench className="h-3 w-3" /> Admin Tools
-            </Btn>
-            <RetagLanguageBtn onSuccess={onRefresh} showToast={showToast} />
-          </>
-        )}
+        {/* Developer Tools – consolidates developer-only buttons into one menu */}
+        <div className="group relative ml-auto">
+          <Btn
+            size="sm"
+            className="border-slate-300 bg-slate-50 text-slate-700 hover:bg-slate-100"
+            title="Developer-only tools"
+          >
+            <Wrench className="h-3 w-3" /> Developer Tools{" "}
+            <ChevronDown className="h-3 w-3" />
+          </Btn>
+
+          <div className="absolute right-0 top-full z-30 hidden w-56 rounded-lg border border-slate-200 bg-white py-1 shadow-xl group-hover:block">
+            {/* Guidelines */}
+            <DropdownItem
+              icon={<BookOpen className="h-3.5 w-3.5 text-indigo-600" />}
+              label="Guidelines"
+              onClick={toggleGuidelines}
+            />
+
+            {/* SOP Scheduler */}
+            <DropdownItem
+              icon={<CalendarDays className="h-3.5 w-3.5 text-violet-600" />}
+              label="SOP Scheduler"
+            />
+
+            {/* SOP Upload */}
+            {canMutate && (
+              <DropdownItem
+                icon={<Plus className="h-3.5 w-3.5 text-emerald-600" />}
+                label="SOP Upload"
+                onClick={() => setUploadModalOpen(true)}
+              />
+            )}
+
+            {/* Admin-only tools */}
+            {isAdmin && (
+              <>
+                <DropdownItem
+                  icon={<Cloud className="h-3.5 w-3.5 text-orange-500" />}
+                  label="Bunny Files"
+                  onClick={() => router.push("/bunny-files")}
+                />
+                <DropdownItem
+                  icon={<Wrench className="h-3.5 w-3.5 text-sky-600" />}
+                  label="Admin Tools"
+                  onClick={() => setAdminOpen(true)}
+                />
+                <div className="my-1 border-t border-slate-100" />
+                {/* Prefix box + Fix Language */}
+                <RetagLanguageBtn onSuccess={onRefresh} showToast={showToast} />
+              </>
+            )}
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -294,9 +289,9 @@ function RetagLanguageBtn({
   };
 
   return (
-    <div className="flex items-center gap-1">
+    <div className="flex flex-col gap-1.5 px-3 py-2">
       <input
-        className="w-20 rounded border border-slate-200 px-2 py-1 text-[10px] text-slate-600 placeholder:text-slate-400 focus:border-sky-400 focus:outline-none"
+        className="w-full rounded border border-slate-200 px-2 py-1 text-[10px] text-slate-600 placeholder:text-slate-400 focus:border-sky-400 focus:outline-none"
         placeholder="prefix e.g. MAGE"
         value={prefix}
         onChange={(e) => setPrefix(e.target.value.toUpperCase())}
@@ -305,7 +300,7 @@ function RetagLanguageBtn({
       />
       <Btn
         size="sm"
-        className="border-orange-200 bg-orange-50 text-orange-700 hover:bg-orange-100"
+        className="w-full justify-center border-orange-200 bg-orange-50 text-orange-700 hover:bg-orange-100"
         onClick={run}
         disabled={running}
         title="Re-detect language from file content and fix mislabelled records"
