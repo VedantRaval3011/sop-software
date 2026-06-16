@@ -21,6 +21,7 @@ import {
   X,
 } from "lucide-react";
 import { MCQViewerModal } from "./MCQViewerModal";
+import { DeptDetailModal } from "./DeptDetailModal";
 import { DeptGridSkeleton } from "./MCQSkeleton";
 import { displaySopCode, displaySopTitle } from "@/lib/sop-display";
 
@@ -127,6 +128,20 @@ function getDeptTheme(deptName: string) {
   if (name.includes("person") || name.includes("hr"))
     return { border: "border-rose-500", statBg: "bg-rose-50", iconBg: "bg-rose-100", iconText: "text-rose-600", accent: "text-rose-600", headerBorder: "border-b border-rose-100", capBg: "bg-rose-50 border-rose-200", pendingText: "text-rose-700", cardBg: "" };
   return { border: "border-slate-400", statBg: "bg-slate-50", iconBg: "bg-slate-100", iconText: "text-slate-600", accent: "text-slate-600", headerBorder: "border-b border-slate-100", capBg: "bg-slate-50 border-slate-200", pendingText: "text-slate-700", cardBg: "" };
+}
+
+// Map a department name → the { bg } class DeptDetailModal uses to pick its
+// header gradient. Keys must match DEPT_GRADIENT in DeptDetailModal.tsx.
+function getDeptModalColor(deptName: string): { bg: string; badge: string } {
+  const name = deptName.toLowerCase();
+  if (name.includes("qa")) return { bg: "bg-violet-600", badge: "bg-violet-100 text-violet-700" };
+  if (name.includes("qc")) return { bg: "bg-blue-600", badge: "bg-blue-100 text-blue-700" };
+  if (name.includes("micro")) return { bg: "bg-orange-600", badge: "bg-orange-100 text-orange-700" };
+  if (name.includes("prod")) return { bg: "bg-emerald-600", badge: "bg-emerald-100 text-emerald-700" };
+  if (name.includes("store")) return { bg: "bg-amber-600", badge: "bg-amber-100 text-amber-700" };
+  if (name.includes("engineer") || name.includes("maint")) return { bg: "bg-cyan-600", badge: "bg-cyan-100 text-cyan-700" };
+  if (name.includes("person") || name.includes("hr")) return { bg: "bg-rose-600", badge: "bg-rose-100 text-rose-700" };
+  return { bg: "bg-slate-600", badge: "bg-slate-100 text-slate-700" };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -611,6 +626,8 @@ export function MCQBankClient() {
 
   // Modal state
   const [viewerBankId, setViewerBankId] = useState<string | null>(null);
+  // Department folder modal (opened by clicking a department capsule/card)
+  const [modalDept, setModalDept] = useState<string | null>(null);
 
   // Data state
   const [stats, setStats] = useState<MCQBankGlobalStats | null>(null);
@@ -626,6 +643,8 @@ export function MCQBankClient() {
   const [search, setSearch] = useState("");
   const [difficulty, setDifficulty] = useState<"all" | "easy" | "medium" | "hard">("all");
   const [deptFilter, setDeptFilter] = useState("all");
+  // MCQ presence filter: "all" | "found" (has MCQs) | "notFound" (no MCQs yet)
+  const [mcqPresence, setMcqPresence] = useState<"all" | "found" | "notFound">("all");
   const [obsoleteOnly, setObsoleteOnly] = useState(false);
   const [sortCol, setSortCol] = useState("identifier");
   const [sortDir, setSortDir] = useState("asc");
@@ -681,6 +700,13 @@ export function MCQBankClient() {
     if (deptFilter !== "all") {
       rows = rows.filter((e) => e.department === deptFilter);
     }
+    // MCQ presence: "found" = SOPs that have at least one MCQ bank;
+    // "notFound" = SOPs with no MCQ bank yet (banks empty / no questions).
+    if (mcqPresence === "found") {
+      rows = rows.filter((e) => e.banks.length > 0);
+    } else if (mcqPresence === "notFound") {
+      rows = rows.filter((e) => e.banks.length === 0);
+    }
     if (regLangFilter === "English") {
       rows = rows.filter((e) => e.language === "ENG" || e.language === "ENG-GUJ");
     } else if (regLangFilter === "Gujarati") {
@@ -716,7 +742,7 @@ export function MCQBankClient() {
 
     return { filteredEntries: sorted, total: sorted.length };
   }, [
-    allActiveEntries, allObsoleteEntries, obsoleteOnly, deptFilter, regLangFilter,
+    allActiveEntries, allObsoleteEntries, obsoleteOnly, deptFilter, mcqPresence, regLangFilter,
     search, difficulty, sortCol, sortDir,
   ]);
 
@@ -740,13 +766,30 @@ export function MCQBankClient() {
   const applyDeptFilter = useCallback((department: string) => {
     setObsoleteOnly(false);
     setDeptFilter(department === "Total" ? "all" : department);
+    setMcqPresence("all");
     setSearch("");
     mcqRegistryRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, []);
+
+  // Filter the registry by MCQ presence (e.g. clicking "MCQ Found" / "Not Found").
+  const applyPresenceFilter = useCallback((department: string, presence: "found" | "notFound") => {
+    setObsoleteOnly(false);
+    setDeptFilter(department === "Total" ? "all" : department);
+    setMcqPresence(presence);
+    setSearch("");
+    mcqRegistryRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, []);
+
+  // Open the department folder modal (Digital Repository view) for a department.
+  const openDeptModal = useCallback((department: string) => {
+    if (department === "Total") return;
+    setModalDept(department);
   }, []);
 
   const toggleObsoleteView = useCallback(() => {
     setObsoleteOnly((v) => !v);
     setDeptFilter("all");
+    setMcqPresence("all");
     setSearch("");
     mcqRegistryRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   }, []);
@@ -761,6 +804,17 @@ export function MCQBankClient() {
 
   return (
     <>
+      {/* Department folder modal (Digital Repository) — opened from a dept capsule/card.
+          Rendered before the viewer so the MCQ viewer stacks on top when both are open. */}
+      {modalDept && (
+        <DeptDetailModal
+          dept={modalDept}
+          deptColor={getDeptModalColor(modalDept)}
+          onClose={() => setModalDept(null)}
+          onViewMcqs={(bankId) => setViewerBankId(bankId)}
+        />
+      )}
+
       {/* MCQ Viewer Modal */}
       {viewerBankId && (
         <MCQViewerModal
@@ -870,8 +924,8 @@ export function MCQBankClient() {
                     mcqFound={stats.mcqFound}
                     mcqNotFound={stats.notFound}
                     onOpen={() => applyDeptFilter("Total")}
-                    onMcqWithClick={() => applyDeptFilter("Total")}
-                    onMcqWithoutClick={() => applyDeptFilter("Total")}
+                    onMcqWithClick={() => applyPresenceFilter("Total", "found")}
+                    onMcqWithoutClick={() => applyPresenceFilter("Total", "notFound")}
                   />
                   {orderedDepts.map((dept) => (
                     <StatusCard
@@ -891,9 +945,9 @@ export function MCQBankClient() {
                       remainingGuj={dept.guRemaining}
                       mcqFound={dept.sopWithMcqs}
                       mcqNotFound={dept.sopWithoutMcqs}
-                      onOpen={() => applyDeptFilter(dept.department)}
-                      onMcqWithClick={() => applyDeptFilter(dept.department)}
-                      onMcqWithoutClick={() => applyDeptFilter(dept.department)}
+                      onOpen={() => openDeptModal(dept.department)}
+                      onMcqWithClick={() => applyPresenceFilter(dept.department, "found")}
+                      onMcqWithoutClick={() => applyPresenceFilter(dept.department, "notFound")}
                       onRowClick={() => applyDeptFilter(dept.department)}
                     />
                   ))}
@@ -934,9 +988,9 @@ export function MCQBankClient() {
                   <DeptColorCard
                     key={dept.department}
                     dept={dept}
-                    onClick={() => applyDeptFilter(dept.department)}
-                    onMcqWithClick={() => applyDeptFilter(dept.department)}
-                    onMcqWithoutClick={() => applyDeptFilter(dept.department)}
+                    onClick={() => openDeptModal(dept.department)}
+                    onMcqWithClick={() => applyPresenceFilter(dept.department, "found")}
+                    onMcqWithoutClick={() => applyPresenceFilter(dept.department, "notFound")}
                   />
                 ))}
               </div>
@@ -958,7 +1012,7 @@ export function MCQBankClient() {
                   <p className="text-[10px] text-gray-500 mt-0.5">
                     {regLoading ? "Loading…" : obsoleteOnly
                       ? `${total} obsolete MCQ ${total === 1 ? "family" : "families"}`
-                      : `${total} SOP${total === 1 ? "" : "s"}${deptFilter !== "all" ? ` · ${deptFilter}` : ""}`}
+                      : `${total} SOP${total === 1 ? "" : "s"}${deptFilter !== "all" ? ` · ${deptFilter}` : ""}${mcqPresence === "notFound" ? " · Not Found" : mcqPresence === "found" ? " · MCQ Found" : ""}`}
                   </p>
                 </div>
               </div>
@@ -978,7 +1032,7 @@ export function MCQBankClient() {
                 {!obsoleteOnly && (
                   <select
                     value={deptFilter}
-                    onChange={(e) => setDeptFilter(e.target.value)}
+                    onChange={(e) => { setDeptFilter(e.target.value); setMcqPresence("all"); }}
                     className="px-2.5 py-1.5 rounded-lg bg-white border border-gray-300 text-gray-800 text-[11px] focus:outline-none focus:border-purple-400 cursor-pointer"
                   >
                     <option value="all">All Depts</option>
@@ -994,6 +1048,19 @@ export function MCQBankClient() {
                     className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-purple-100 border border-purple-300 text-purple-700 text-[10px] font-bold hover:bg-purple-200 transition-colors"
                   >
                     {deptFilter} <X className="h-3 w-3 ml-0.5" />
+                  </button>
+                )}
+                {mcqPresence !== "all" && !obsoleteOnly && (
+                  <button
+                    type="button"
+                    onClick={() => setMcqPresence("all")}
+                    className={`flex items-center gap-1 px-2.5 py-1.5 rounded-lg border text-[10px] font-bold transition-colors ${
+                      mcqPresence === "notFound"
+                        ? "bg-red-100 border-red-300 text-red-700 hover:bg-red-200"
+                        : "bg-emerald-100 border-emerald-300 text-emerald-700 hover:bg-emerald-200"
+                    }`}
+                  >
+                    {mcqPresence === "notFound" ? "Not Found" : "MCQ Found"} <X className="h-3 w-3 ml-0.5" />
                   </button>
                 )}
                 <select
