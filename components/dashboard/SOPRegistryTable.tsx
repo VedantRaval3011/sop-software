@@ -33,25 +33,15 @@ import {
   isOfficePreviewAvailable,
 } from "@/lib/file-urls";
 import { formatUploaded } from "@/lib/sop-utils";
+import { displaySopCode, displaySopTitle } from "@/lib/sop-display";
 import { describeFilters } from "@/lib/filter-breadcrumb";
 import { useDashboardStore } from "@/lib/store/dashboard-store";
 import { Btn } from "./ui";
 import { DocPreviewModal } from "@/components/shared/DocPreviewModal";
 
-/* ─── SOP display helpers ────────────────────────────────────────────── */
-function displaySopCode(identifier: string): string {
-  const match = identifier.match(/^([A-Z]+\d+[-]\d+)/i);
-  if (match) return match[1].toUpperCase();
-  const seg = identifier.split("_")[0];
-  return /^[A-Z]{2,}\d/i.test(seg) ? seg.toUpperCase() : identifier;
-}
-
-function displaySopTitle(name: string, identifier: string): string {
-  const code = displaySopCode(identifier);
-  const codePattern = code.replace(/[-]/g, String.raw`[\s_-]`);
-  const stripped = name.replace(new RegExp(`^${codePattern}[\\s_-]*`, "i"), "").trim();
-  return stripped || name;
-}
+/* ─── SOP display helpers (shared with the MCQ Bank Registry) ─────────── */
+/* displaySopCode / displaySopTitle live in @/lib/sop-display so both the SOP
+   Registry and the MCQ Bank Registry render SOP No. / SOP Name identically. */
 
 const registryTdBase = "px-1 py-1 align-middle overflow-hidden max-w-0";
 

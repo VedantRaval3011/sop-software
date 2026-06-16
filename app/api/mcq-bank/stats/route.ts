@@ -4,7 +4,7 @@ import { connectDB } from "@/lib/mongodb";
 import SOP from "@/models/SOP";
 import User from "@/models/User";
 import { requireAuth } from "@/lib/withAuth";
-import { baseIdentifierFromIdentifier } from "@/lib/sop-utils";
+import { sopFamilyGroupKey } from "@/lib/sop-utils";
 
 // ── Subcategory prefix → canonical department (aligned with canonDept() in TM overview) ──
 const SUBCAT_TO_DEPT: Record<string, string> = {
@@ -16,13 +16,13 @@ const SUBCAT_TO_DEPT: Record<string, string> = {
   PRMA: "Production", PRPA: "Production",
   BSGE: "Store", STCL: "Store", STGE: "Store",
   STOP: "Store", STPA: "Store", STRM: "Store",
-  MAGE: "Engineering", PREG: "Engineering",
+  MAGE: "Engineering and Maintenance", PREG: "Engineering and Maintenance",
   PEGE: "Personnel",
 };
 
 const DEPARTMENT_ORDER = [
   "QA", "QC", "Microbiology", "Production",
-  "Store", "Engineering", "Personnel",
+  "Store", "Engineering and Maintenance", "Personnel",
 ];
 
 function deptFromIdentifier(id?: string | null): string {
@@ -44,7 +44,7 @@ function normalizeDeptName(raw?: string | null): string {
   if (/\bqa\b|quality.?assur/.test(lower)) return "QA";
   if (/\bqc\b|quality.?cont/.test(lower)) return "QC";
   if (/micro/.test(lower)) return "Microbiology";
-  if (/engineer|maint/.test(lower)) return "Engineering";
+  if (/engineer|maint/.test(lower)) return "Engineering and Maintenance";
   if (/person|\bhr\b/.test(lower)) return "Personnel";
   if (/store/.test(lower)) return "Store";
   if (/prod/.test(lower)) return "Production";
@@ -70,20 +70,22 @@ export async function GET() {
 
     // ── 1. All non-obsolete SOPs → per-dept SOP counts ────────────────────
     const sops = await SOP.find({ isObsolete: { $ne: true } })
-      .select("identifier name department language processArea")
+      .select("identifier name department language processArea sopBaseId")
       .lean();
 
-    // Unique SOP families per dept — collapse version suffixes so "QAGE001-1"
-    // and "QAGE001-2" count as one family, matching Training Matrix's approach.
+    // Unique SOP families per dept. Group with sopFamilyGroupKey — the SAME key the
+    // Main Dashboard uses (zero-padding-insensitive, version-collapsed). SOPs that
+    // resolve to "Other" (unmapped prefix + no known stored department) are dropped,
+    // matching the source project — the capsules only ever show named departments.
     const sopFamilyMap = new Map<string, { dept: string; languages: Set<string>; processAreas: Set<string>; name: string }>();
     for (const s of sops) {
-      const baseId = baseIdentifierFromIdentifier(s.identifier); // collapse versions
-      const dept = resolveDept(baseId, s.department);
+      const famKey = sopFamilyGroupKey(s);
+      const dept = resolveDept(s.identifier, s.department);
       if (dept === "Other") continue;
-      if (!sopFamilyMap.has(baseId)) {
-        sopFamilyMap.set(baseId, { dept, languages: new Set(), processAreas: new Set(), name: s.name });
+      if (!sopFamilyMap.has(famKey)) {
+        sopFamilyMap.set(famKey, { dept, languages: new Set(), processAreas: new Set(), name: s.name });
       }
-      const e = sopFamilyMap.get(baseId)!;
+      const e = sopFamilyMap.get(famKey)!;
       if (s.language) e.languages.add(s.language);
       if (s.processArea) e.processAreas.add(s.processArea);
     }
@@ -120,9 +122,8 @@ export async function GET() {
       totalQuestions: number; checkedCount: number; reviewedCount: number; similarCount: number; updatedAt?: Date;
     }[];
 
-    // Bank lookup: base identifier → aggregated stats
-    // Use baseIdentifierFromIdentifier() so "QAGE001-1" and "QAGE001-2" collapse
-    // to the same family "QAGE001", matching Training Matrix's counting method.
+    // Bank lookup: SOP family key → aggregated stats. Use sopFamilyGroupKey so banks
+    // collapse to the SAME families the SOP counts use (and the Main Dashboard uses).
     const bankByIdentifier = new Map<string, {
       dept: string;
       totalQ: number; checkedQ: number; reviewedQ: number; similarQ: number;
@@ -130,9 +131,10 @@ export async function GET() {
     }>();
 
     for (const b of bankAgg) {
-      const rawId = (b.sopIdentifier ?? "").trim().toUpperCase();
-      const id = baseIdentifierFromIdentifier(rawId); // collapse version suffix
-      const dept = resolveDept(id, b.department);
+      const rawId = (b.sopIdentifier ?? "").trim();
+      const id = sopFamilyGroupKey({ identifier: rawId });
+      const dept = resolveDept(rawId, b.department);
+      if (dept === "Other") continue; // drop unmapped/"Other" banks — never shown
       if (!bankByIdentifier.has(id)) {
         bankByIdentifier.set(id, { dept, totalQ: 0, checkedQ: 0, reviewedQ: 0, similarQ: 0, hasEn: false, hasGu: false });
       }
@@ -248,35 +250,8 @@ export async function GET() {
       };
     });
 
-    // Also include any "Other" departments from actual data
-    for (const [deptName, d] of deptMap) {
-      if (DEPARTMENT_ORDER.includes(deptName)) continue;
-      const sopCount = d.identifiers.size;
-      departments.push({
-        department: deptName,
-        sopCount,
-        subcategories: d.processAreas.size || 1,
-        totalQuestions: d.totalQ,
-        checkedQuestions: d.checkedQ,
-        reviewedQuestions: d.reviewedQ,
-        similarQuestions: d.similarQ,
-        remainingQuestions: Math.max(0, d.totalQ - d.checkedQ),
-        mcqCoverage: d.totalQ > 0 ? Math.round((d.checkedQ / d.totalQ) * 100) : 0,
-        withEnglish: d.sopEng,
-        withGujarati: d.sopGuj,
-        totalSopEng: d.totalSopEng,
-        totalSopGuj: d.totalSopGuj,
-        approvedSops: d.approvedSops,
-        partialSops: d.partialSops,
-        pendingSops: d.pendingSops,
-        similarSops: d.similarSops,
-        sopWithMcqs: d.sopWithMcqs,
-        sopWithoutMcqs: Math.max(0, sopCount - d.sopWithMcqs),
-        enRemaining: d.remainingEng,
-        guRemaining: d.remainingGuj,
-        trainer: trainerByDept.get(deptName) ?? null,
-      });
-    }
+    // No "Other" bucket: only the named departments above are reported, matching
+    // the source project (which drops every SOP/bank that resolves to "Other").
 
     // ── 6. Overall totals ─────────────────────────────────────────────────
     const overall = departments.reduce(

@@ -25,6 +25,7 @@ import {
 import { MCQViewerModal } from "./MCQViewerModal";
 import { DeptDetailModal } from "./DeptDetailModal";
 import { DeptGridSkeleton } from "./MCQSkeleton";
+import { displaySopCode, displaySopTitle } from "@/lib/sop-display";
 
 // ─────────────────────────────────────────────────────────────
 // Types
@@ -93,6 +94,7 @@ interface RegistryEntry {
   id: string;
   identifier: string;
   sopName: string;
+  sopNameGujarati: string | null;
   department: string;
   language: string;
   langCode: string;
@@ -102,6 +104,7 @@ interface RegistryEntry {
   partial: number;
   similar: number;
   lastUpdated: string | null;
+  banks: { id: string; langCode: "ENG" | "GUJ" }[];
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -538,32 +541,56 @@ function DeptColorCard({
 // Registry table row
 // ─────────────────────────────────────────────────────────────
 function RegistryRow({
-  entry, idx, onViewMcqs,
+  entry, isEven, onViewMcqs,
 }: {
-  entry: RegistryEntry; idx: number; onViewMcqs?: (id: string) => void;
+  entry: RegistryEntry; isEven: boolean; onViewMcqs?: (id: string) => void;
 }) {
   const remaining = Math.max(0, entry.totalMcqs - entry.approved);
-  const approvalStatus = entry.totalMcqs > 0 && entry.approved >= entry.totalMcqs
-    ? "Approved"
-    : entry.similar > 0 ? "Similar"
-    : entry.totalMcqs > 0 && entry.approved > 0 ? "Partial"
-    : "Pending";
+  const isDual = entry.language === "ENG-GUJ";
+  // SOP No. / SOP Name rendered with displaySopCode / displaySopTitle and the exact
+  // same Tailwind classes the SOP Registry uses, so both modules look identical.
+  const sopCode = displaySopCode(entry.identifier);
+  const sopTitle = displaySopTitle(entry.sopName, entry.identifier);
+  const gujTitle = entry.sopNameGujarati
+    ? displaySopTitle(entry.sopNameGujarati, entry.identifier)
+    : null;
 
   return (
-    <tr className="border-b border-gray-200 hover:bg-gray-200/60 transition-colors group/row">
-      <td className="px-3 py-2.5 whitespace-nowrap">
-        <span className="text-[11px] font-black text-indigo-600">{entry.identifier}</span>
+    <tr className={`hover:bg-purple-50/80 transition-colors group/row border-b border-gray-100/80 ${
+      isEven ? "bg-white" : "bg-gray-50/60"
+    }`}>
+      {/* SOP No. — matches SOP Registry (font-mono, 13px, purple-700) */}
+      <td className="px-3 py-2.5 font-mono text-[13px] font-bold tracking-wider text-purple-700 group-hover/row:underline">
+        <span className="block truncate" title={sopCode}>{sopCode}</span>
       </td>
+      {/* SOP Name — matches SOP Registry (12px bold, Gujarati subline) */}
       <td className="px-3 py-2.5 max-w-[220px]">
-        <span className="text-[11px] text-gray-700 line-clamp-2">{entry.sopName}</span>
+        <div className="flex min-w-0 flex-col gap-0 leading-tight">
+          <span className="line-clamp-2 text-[12px] font-bold leading-tight text-gray-900 wrap-break-word" title={sopTitle}>
+            {sopTitle}
+          </span>
+          {gujTitle && (
+            <span className="line-clamp-2 text-[10px] font-bold leading-tight text-indigo-700 wrap-break-word" title={gujTitle}>
+              {gujTitle}
+            </span>
+          )}
+        </div>
       </td>
       <td className="px-3 py-2.5 whitespace-nowrap text-[11px] text-gray-600">{entry.department}</td>
-      <td className="px-3 py-2.5 whitespace-nowrap">
-        <span className={`inline-flex items-center rounded px-1.5 py-0.5 text-[9px] font-black uppercase ${
-          entry.langCode === "ENG" ? "bg-blue-100 text-blue-800" : "bg-orange-100 text-orange-800"
-        }`}>
-          {entry.langCode}
-        </span>
+      {/* Lang — stacked ENG/GUJ for dual-language families, matching SOP Registry */}
+      <td className="px-3 py-2.5 text-center whitespace-nowrap">
+        {isDual ? (
+          <div className="inline-flex flex-col items-center gap-0 leading-none">
+            <span className="text-[9px] font-bold text-gray-800">ENG</span>
+            <span className="text-[9px] font-bold text-indigo-800">GUJ</span>
+          </div>
+        ) : (
+          <span className={`inline-flex items-center rounded px-1.5 py-0.5 text-[9px] font-black uppercase ${
+            entry.langCode === "ENG" ? "bg-blue-100 text-blue-800" : "bg-orange-100 text-orange-800"
+          }`}>
+            {entry.langCode}
+          </span>
+        )}
       </td>
       <td className="px-3 py-2.5 text-center whitespace-nowrap">
         <span className={`text-[11px] font-bold ${entry.totalMcqs > 0 ? "text-emerald-600" : "text-gray-300"}`}>
@@ -594,14 +621,19 @@ function RegistryRow({
         <span className="text-[11px] text-gray-500">{fmtDate(entry.lastUpdated)}</span>
       </td>
       <td className="px-3 py-2.5 whitespace-nowrap">
-        {entry.totalMcqs > 0 && entry.id ? (
-          <button
-            type="button"
-            onClick={() => onViewMcqs?.(entry.id)}
-            className="inline-flex items-center gap-1 rounded-full border border-violet-300 bg-violet-50 px-2.5 py-1 text-[9px] font-semibold text-violet-700 hover:bg-violet-100 transition-colors"
-          >
-            <Eye className="h-2.5 w-2.5" /> VIEW MCQs
-          </button>
+        {entry.banks.length > 0 ? (
+          <div className="flex items-center gap-1">
+            {entry.banks.map((b) => (
+              <button
+                key={b.id}
+                type="button"
+                onClick={() => onViewMcqs?.(b.id)}
+                className="inline-flex items-center gap-1 rounded-full border border-violet-300 bg-violet-50 px-2.5 py-1 text-[9px] font-semibold text-violet-700 hover:bg-violet-100 transition-colors"
+              >
+                <Eye className="h-2.5 w-2.5" /> {entry.banks.length > 1 ? b.langCode : "VIEW MCQs"}
+              </button>
+            ))}
+          </div>
         ) : (
           <span className="text-[9px] text-gray-300">—</span>
         )}
@@ -759,10 +791,17 @@ export function MCQBankClient() {
   // Build registry filtered/sorted from entries (already paginated from API)
   const filteredEntries = entries.filter((row) => {
     if (regDeptFilter !== "all" && row.department !== regDeptFilter) return false;
-    if (regLangFilter !== "All" && row.language !== regLangFilter) return false;
+    // row.language is "ENG" / "GUJ" / "ENG-GUJ"; a dual-language family matches both.
+    if (regLangFilter === "English" && row.language !== "ENG" && row.language !== "ENG-GUJ") return false;
+    if (regLangFilter === "Gujarati" && row.language !== "GUJ" && row.language !== "ENG-GUJ") return false;
     if (regSearch) {
       const q = regSearch.toLowerCase();
-      if (!row.identifier.toLowerCase().includes(q) && !row.sopName.toLowerCase().includes(q) && !row.department.toLowerCase().includes(q)) return false;
+      if (
+        !row.identifier.toLowerCase().includes(q) &&
+        !row.sopName.toLowerCase().includes(q) &&
+        !(row.sopNameGujarati ?? "").toLowerCase().includes(q) &&
+        !row.department.toLowerCase().includes(q)
+      ) return false;
     }
     return true;
   });
@@ -807,7 +846,7 @@ export function MCQBankClient() {
 
   // tmTotalCard is used directly for the grand Total card (avoids summing per-dept which double-counts)
 
-  const DEPT_ORDER = ["QA", "QC", "Microbiology", "Production", "Store", "Engineering", "Personnel"];
+  const DEPT_ORDER = ["QA", "QC", "Microbiology", "Production", "Store", "Engineering and Maintenance", "Personnel"];
   const orderedDepts = stats ? [
     ...DEPT_ORDER.map((n) => stats.departments.find((d) => d.department === n)).filter(Boolean) as DeptMCQStats[],
     ...stats.departments.filter((d) => !DEPT_ORDER.includes(d.department)),
@@ -1023,7 +1062,7 @@ export function MCQBankClient() {
                 <div>
                   <h3 className="text-sm font-black text-gray-800 uppercase tracking-widest">MCQ Registry</h3>
                   <p className="text-[10px] text-gray-500 mt-0.5">
-                    {regLoading ? "Loading…" : `${filteredEntries.length} of ${total} banks`}
+                    {regLoading ? "Loading…" : `${filteredEntries.length} of ${total} SOPs`}
                   </p>
                 </div>
               </div>
@@ -1075,12 +1114,12 @@ export function MCQBankClient() {
               <div className="mb-3 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{regError}</div>
             )}
 
-            {/* Table */}
-            <div className="rounded-2xl border border-gray-200 overflow-hidden bg-gray-100">
+            {/* Table — chrome matches the SOP Registry (sticky gray-100 header) */}
+            <div className="rounded-2xl border border-gray-200 overflow-hidden bg-gray-50">
               <div className="overflow-x-auto">
                 <table className="w-full text-left border-collapse">
                   <thead>
-                    <tr className="bg-gray-200/70 border-b border-gray-200">
+                    <tr className="bg-gray-100 border-b border-gray-300">
                       {([
                         ["identifier", "SOP No."],
                         ["name", "SOP Name"],
@@ -1096,12 +1135,12 @@ export function MCQBankClient() {
                         <th
                           key={col}
                           onClick={() => handleSort(col)}
-                          className="px-3 py-3 text-[9px] font-black uppercase tracking-widest text-gray-500 cursor-pointer hover:text-gray-800 whitespace-nowrap select-none transition-colors"
+                          className="px-3 py-3 text-[9px] font-bold uppercase tracking-wide text-gray-600 cursor-pointer hover:text-purple-700 whitespace-nowrap select-none transition-colors"
                         >
                           {label}<SortIcon col={col} current={sortCol} dir={sortDir} />
                         </th>
                       ))}
-                      <th className="px-3 py-3 text-[9px] font-black uppercase tracking-widest text-gray-500 whitespace-nowrap">Actions</th>
+                      <th className="px-3 py-3 text-[9px] font-bold uppercase tracking-wide text-gray-600 whitespace-nowrap">Actions</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -1123,9 +1162,9 @@ export function MCQBankClient() {
                       </tr>
                     ) : filteredEntries.map((entry, idx) => (
                       <RegistryRow
-                        key={`${entry.identifier}||${entry.language}||${entry.id}`}
+                        key={entry.id || `${entry.identifier}||${entry.language}`}
                         entry={entry}
-                        idx={idx}
+                        isEven={idx % 2 === 0}
                         onViewMcqs={(id) => setViewerBankId(id)}
                       />
                     ))}

@@ -2,9 +2,13 @@ import { NextRequest, NextResponse } from "next/server";
 import type { PipelineStage } from "mongoose";
 import mongoose from "mongoose";
 import { connectDB } from "@/lib/mongodb";
-import SOP from "@/models/SOP";
 import { requireAuth } from "@/lib/withAuth";
+import { getGroupedRegistryRows } from "@/lib/dashboardRegistrySource";
+import { sopFamilyGroupKey } from "@/lib/sop-utils";
 
+export const dynamic = "force-dynamic";
+
+// ── Subcategory prefix → canonical department (aligned with mcq-bank/stats) ──
 const SUBCAT_TO_DEPT: Record<string, string> = {
   QAGE: "QA", ANNE: "QA",
   QCGE: "QC", QAIC: "QC", QAIO: "QC",
@@ -14,7 +18,7 @@ const SUBCAT_TO_DEPT: Record<string, string> = {
   PRMA: "Production", PRPA: "Production",
   BSGE: "Store", STCL: "Store", STGE: "Store",
   STOP: "Store", STPA: "Store", STRM: "Store",
-  MAGE: "Engineering", PREG: "Engineering",
+  MAGE: "Engineering and Maintenance", PREG: "Engineering and Maintenance",
   PEGE: "Personnel",
 };
 
@@ -35,11 +39,11 @@ function normalizeDept(raw?: string | null): string {
   if (l === "qa" || l.includes("quality assurance")) return "QA";
   if (l === "qc" || l.includes("quality control")) return "QC";
   if (l.includes("micro")) return "Microbiology";
-  if (/engineer|maint/.test(l)) return "Engineering";
+  if (/engineer|maint/.test(l)) return "Engineering and Maintenance";
   if (l.includes("person") || l.includes("hr")) return "Personnel";
   if (l.includes("store")) return "Store";
   if (l.includes("prod")) return "Production";
-  return raw.trim();
+  return "Other";
 }
 
 function resolveDept(identifier: string, stored?: string | null): string {
@@ -67,40 +71,31 @@ export async function GET(request: NextRequest) {
     const page = Math.max(1, parseInt(searchParams.get("page") ?? "1"));
     const limit = Math.min(200, Math.max(10, parseInt(searchParams.get("limit") ?? "50")));
 
+    // ── 1. SOP universe = the SAME grouped families the Main Dashboard shows ──
+    // One row per SOP family (ENG+GUJ collapsed, version-collapsed). Sourcing the
+    // row set from here is what guarantees the MCQ Registry total always equals the
+    // Main Dashboard SOP count.
+    const grouped = (await getGroupedRegistryRows()).filter((r) => !r.isObsolete);
+
+    // ── 2. Aggregate MCQ banks, keyed by SOP family ──────────────────────────
     const mcqBankCol = db.collection("mcqbanks");
-
-    // ── Build aggregation pipeline ────────────────────────────────────────
-    const matchStage: Record<string, unknown> = { isObsolete: { $ne: true } };
-    if (languageFilter !== "all") {
-      matchStage.language = languageFilter === "ENG" ? "English" : "Gujarati";
-    }
-
     const pipeline: PipelineStage[] = [
-      { $match: matchStage } as PipelineStage,
+      { $match: { isObsolete: { $ne: true } } } as PipelineStage,
       {
         $project: {
           sopIdentifier: 1,
-          sopName: 1,
-          department: 1,
           language: 1,
           updatedAt: 1,
           totalQuestions: { $size: { $ifNull: ["$mcqs", []] } },
           checkedCount: {
-            $size: {
-              $filter: { input: { $ifNull: ["$mcqs", []] }, as: "q", cond: { $eq: ["$$q.isChecked", true] } },
-            },
+            $size: { $filter: { input: { $ifNull: ["$mcqs", []] }, as: "q", cond: { $eq: ["$$q.isChecked", true] } } },
           },
           reviewedCount: {
-            $size: {
-              $filter: { input: { $ifNull: ["$mcqs", []] }, as: "q", cond: { $eq: ["$$q.isReviewed", true] } },
-            },
+            $size: { $filter: { input: { $ifNull: ["$mcqs", []] }, as: "q", cond: { $eq: ["$$q.isReviewed", true] } } },
           },
           similarCount: {
-            $size: {
-              $filter: { input: { $ifNull: ["$mcqs", []] }, as: "q", cond: { $eq: ["$$q.isSimilar", true] } },
-            },
+            $size: { $filter: { input: { $ifNull: ["$mcqs", []] }, as: "q", cond: { $eq: ["$$q.isSimilar", true] } } },
           },
-          // Difficulty breakdown (only if filter requested)
           ...(difficulty !== "all"
             ? {
                 filteredCount: {
@@ -119,16 +114,45 @@ export async function GET(request: NextRequest) {
     ];
 
     const rawBanks = await mcqBankCol.aggregate(pipeline).toArray() as {
-      _id: unknown; sopIdentifier: string; sopName: string; department: string; language: string;
+      _id: unknown; sopIdentifier: string; language: string;
       totalQuestions: number; checkedCount: number; reviewedCount: number; similarCount: number;
       filteredCount?: number; updatedAt?: Date;
     }[];
 
-    // ── Enrich with resolved dept + filter ───────────────────────────────
+    interface FamilyBank {
+      totalQ: number; checkedQ: number; reviewedQ: number; similarQ: number;
+      difficultyMatches: number;
+      lastUpdated: Date | null;
+      banks: { id: string; langCode: "ENG" | "GUJ" }[];
+    }
+    const banksByFamily = new Map<string, FamilyBank>();
+
+    for (const b of rawBanks) {
+      const fam = sopFamilyGroupKey({ identifier: (b.sopIdentifier ?? "").trim() });
+      if (!banksByFamily.has(fam)) {
+        banksByFamily.set(fam, {
+          totalQ: 0, checkedQ: 0, reviewedQ: 0, similarQ: 0,
+          difficultyMatches: 0, lastUpdated: null, banks: [],
+        });
+      }
+      const e = banksByFamily.get(fam)!;
+      e.totalQ += b.totalQuestions;
+      e.checkedQ += b.checkedCount;
+      e.reviewedQ += b.reviewedCount;
+      e.similarQ += b.similarCount;
+      e.difficultyMatches += b.filteredCount ?? 0;
+      const langCode: "ENG" | "GUJ" = (b.language ?? "").toLowerCase() === "gujarati" ? "GUJ" : "ENG";
+      if (b._id) e.banks.push({ id: String(b._id), langCode });
+      const ts = b.updatedAt ? new Date(b.updatedAt) : null;
+      if (ts && (!e.lastUpdated || ts > e.lastUpdated)) e.lastUpdated = ts;
+    }
+
+    // ── 3. Build one registry row per SOP family ─────────────────────────────
     type RegistryEntry = {
       id: string;
       identifier: string;
       sopName: string;
+      sopNameGujarati: string | null;
       department: string;
       language: string;
       langCode: string;
@@ -138,105 +162,72 @@ export async function GET(request: NextRequest) {
       partial: number;
       similar: number;
       lastUpdated: Date | null;
+      banks: { id: string; langCode: "ENG" | "GUJ" }[];
     };
 
-    const entries: RegistryEntry[] = [];
-
-    for (const b of rawBanks) {
-      const rawId = (b.sopIdentifier ?? "").trim().toUpperCase();
-      const dept = resolveDept(rawId, b.department);
-
-      // Apply search filter
-      if (search) {
-        const lc = search.toLowerCase();
-        if (
-          !rawId.toLowerCase().includes(lc) &&
-          !(b.sopName ?? "").toLowerCase().includes(lc)
-        ) continue;
-      }
-
-      // Apply dept filter
-      if (deptFilter !== "all" && dept !== deptFilter) continue;
-
-      // Apply difficulty filter: skip bank if it has 0 questions of that difficulty
-      if (difficulty !== "all" && (b.filteredCount ?? 0) === 0) continue;
-
-      entries.push({
-        id: String(b._id),
-        identifier: b.sopIdentifier ?? rawId,
-        sopName: b.sopName ?? "",
+    let entries: RegistryEntry[] = grouped.map((row) => {
+      const fam = sopFamilyGroupKey(row);
+      const bank = banksByFamily.get(fam);
+      const dept = resolveDept(row.identifier, row.department);
+      return {
+        id: fam,
+        identifier: row.identifier,
+        sopName: row.name,
+        sopNameGujarati: row.nameGujarati ?? null,
         department: dept,
-        language: b.language ?? "English",
-        langCode: (b.language ?? "").toLowerCase() === "gujarati" ? "GUJ" : "ENG",
-        totalMcqs: b.totalQuestions,
-        remaining: Math.max(0, b.totalQuestions - b.checkedCount),
-        approved: b.checkedCount,
-        partial: b.reviewedCount,
-        similar: b.similarCount,
-        lastUpdated: b.updatedAt ?? null,
+        language: row.language,
+        langCode: row.language === "GUJ" ? "GUJ" : "ENG",
+        totalMcqs: bank?.totalQ ?? 0,
+        remaining: bank ? Math.max(0, bank.totalQ - bank.checkedQ) : 0,
+        approved: bank?.checkedQ ?? 0,
+        partial: bank?.reviewedQ ?? 0,
+        similar: bank?.similarQ ?? 0,
+        lastUpdated: bank?.lastUpdated ?? null,
+        banks: bank?.banks ?? [],
+      };
+    });
+
+    // ── 4. Filters ───────────────────────────────────────────────────────────
+    if (deptFilter !== "all") {
+      entries = entries.filter((e) => e.department === deptFilter);
+    }
+    if (languageFilter !== "all") {
+      // ENG matches English-bearing families (ENG, ENG-GUJ); GUJ matches GUJ, ENG-GUJ.
+      entries = entries.filter((e) =>
+        languageFilter === "ENG"
+          ? e.language === "ENG" || e.language === "ENG-GUJ"
+          : e.language === "GUJ" || e.language === "ENG-GUJ",
+      );
+    }
+    if (search) {
+      const lc = search.toLowerCase();
+      entries = entries.filter(
+        (e) =>
+          e.identifier.toLowerCase().includes(lc) ||
+          e.sopName.toLowerCase().includes(lc) ||
+          (e.sopNameGujarati ?? "").toLowerCase().includes(lc),
+      );
+    }
+    if (difficulty !== "all") {
+      // Only families with at least one MCQ of the requested difficulty.
+      entries = entries.filter((e) => {
+        const bank = banksByFamily.get(e.id);
+        return (bank?.difficultyMatches ?? 0) > 0;
       });
     }
 
-    // ── Include SOPs with no MCQ bank at all (zero rows) ─────────────────
-    if (difficulty === "all") {
-      const bankedIds = new Set(
-        rawBanks.map((b) => `${(b.sopIdentifier ?? "").trim().toUpperCase()}||${(b.language ?? "English")}`)
-      );
-
-      const sopQuery: Record<string, unknown> = { isObsolete: { $ne: true } };
-      if (languageFilter !== "all") {
-        sopQuery.language = languageFilter === "ENG" ? "English" : "Gujarati";
-      }
-      if (search) {
-        sopQuery.$or = [
-          { name: { $regex: search, $options: "i" } },
-          { identifier: { $regex: search, $options: "i" } },
-        ];
-      }
-
-      const allSops = await SOP.find(sopQuery)
-        .select("identifier name department language")
-        .lean();
-
-      // Deduplicate SOPs by identifier+language
-      const seen = new Set<string>();
-      for (const s of allSops) {
-        const lang = s.language ?? "English";
-        const key = `${s.identifier.trim().toUpperCase()}||${lang}`;
-        if (bankedIds.has(key) || seen.has(key)) continue;
-        seen.add(key);
-
-        const dept = resolveDept(s.identifier, s.department);
-        if (deptFilter !== "all" && dept !== deptFilter) continue;
-
-        entries.push({
-          id: "",
-          identifier: s.identifier,
-          sopName: s.name,
-          department: dept,
-          language: lang,
-          langCode: lang === "Gujarati" ? "GUJ" : "ENG",
-          totalMcqs: 0,
-          remaining: 0,
-          approved: 0,
-          partial: 0,
-          similar: 0,
-          lastUpdated: null,
-        });
-      }
-    }
-
-    // ── Sort ─────────────────────────────────────────────────────────────
+    // ── 5. Sort ──────────────────────────────────────────────────────────────
     entries.sort((a, b) => {
       let cmp = 0;
-      if (sortBy === "identifier") cmp = a.identifier.localeCompare(b.identifier);
-      else if (sortBy === "name") cmp = a.sopName.localeCompare(b.sopName);
-      else if (sortBy === "questions") cmp = b.totalMcqs - a.totalMcqs;
-      else if (sortBy === "date") {
-        const da = a.lastUpdated?.getTime() ?? 0;
-        const db2 = b.lastUpdated?.getTime() ?? 0;
-        cmp = db2 - da;
-      }
+      if (sortBy === "name") cmp = a.sopName.localeCompare(b.sopName);
+      else if (sortBy === "questions" || sortBy === "totalMcqs") cmp = b.totalMcqs - a.totalMcqs;
+      else if (sortBy === "remaining") cmp = b.remaining - a.remaining;
+      else if (sortBy === "approved") cmp = b.approved - a.approved;
+      else if (sortBy === "partial") cmp = b.partial - a.partial;
+      else if (sortBy === "similar") cmp = b.similar - a.similar;
+      else if (sortBy === "lastUpdated" || sortBy === "date") {
+        cmp = (b.lastUpdated?.getTime() ?? 0) - (a.lastUpdated?.getTime() ?? 0);
+      } else cmp = a.identifier.localeCompare(b.identifier);
       return sortDir === "desc" ? -cmp : cmp;
     });
 
