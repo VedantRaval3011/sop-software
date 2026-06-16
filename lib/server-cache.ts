@@ -1,5 +1,6 @@
 import type { RegistrySOP } from "@/lib/types";
 import { invalidatePersistentGroupedCache } from "@/lib/persistentGroupedCache";
+import { invalidateSopDerivedCaches } from "@/lib/sopCacheInvalidation";
 
 /* ─── Server-side grouped-registry cache ─────────────────────────────────
  * Must not be imported from client components — persistentGroupedCache uses
@@ -12,6 +13,10 @@ export function invalidateDashboardSopsCache() {
   serverGroupedCache = null;
   serverGroupedInFlight = null;
   void invalidatePersistentGroupedCache();
+  // Propagate to every other SOP-derived cache (training matrix, induction
+  // matrix, manage-SOPs view, LMS portal) so a single dashboard edit reflects
+  // everywhere instantly instead of waiting out each cache's TTL.
+  invalidateSopDerivedCaches();
 }
 
 export function getServerGroupedCache(): RegistrySOP[] | null {
@@ -66,4 +71,5 @@ export function bustServerDashboardCache() {
   serverGroupedCache = null;
   serverGroupedInFlight = null;
   void invalidatePersistentGroupedCache();
+  invalidateSopDerivedCaches();
 }
