@@ -5,7 +5,7 @@ import MCQBank from '@/models/MCQBank';
 import TrainingMatrixUpload from '@/models/TrainingMatrixUpload';
 import DepartmentTrainer from '@/models/DepartmentTrainer';
 import { groupSOPRecords, baseIdentifierFromIdentifier } from '@/lib/sop-utils';
-import { getServerGroupedCache, setServerGroupedCache, invalidateDashboardSopsCache } from '@/lib/cache';
+import { getServerGroupedCache, setServerGroupedCache, invalidateDashboardSopsCache } from '@/lib/server-cache';
 import { getTrainingMatrixCacheEntry, setTrainingMatrixCached } from '@/lib/trainingMatrixCache';
 import { resolveEngGujFilePaths } from '@/lib/pathLanguageDetection';
 

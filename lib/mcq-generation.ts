@@ -2,7 +2,7 @@ import MCQ from "@/models/MCQ";
 import MCQRecycle from "@/models/MCQRecycle";
 import SOP, { type ISOP } from "@/models/SOP";
 import { generateJson } from "@/lib/gemini";
-import { invalidateDashboardSopsCache } from "@/lib/cache";
+import { invalidateDashboardSopsCache } from "@/lib/server-cache";
 import { isSimilarQuestion, SIMILARITY_THRESHOLD } from "@/lib/similarity";
 import { connectDB } from "@/lib/mongodb";
 

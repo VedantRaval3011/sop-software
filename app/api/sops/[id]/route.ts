@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { connectDB } from "@/lib/mongodb";
 import SOP from "@/models/SOP";
-import { invalidateDashboardSopsCache } from "@/lib/cache";
+import { invalidateDashboardSopsCache } from "@/lib/server-cache";
+import { markMcqBanksObsoleteForIdentifier } from "@/lib/mcq-bank-sync";
 import { requireAuth } from "@/lib/withAuth";
 
 type RouteContext = { params: Promise<{ id: string }> };
@@ -66,6 +67,7 @@ export async function DELETE(_request: NextRequest, context: RouteContext) {
       obsoleteAt: now,
       obsoleteReason: "Moved to Obsolete SOPs",
     });
+    await markMcqBanksObsoleteForIdentifier(sop.identifier);
     invalidateDashboardSopsCache();
     return NextResponse.json({ success: true });
   } catch (error) {

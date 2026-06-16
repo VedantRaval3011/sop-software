@@ -1,6 +1,6 @@
 import { connectDB } from "@/lib/mongodb";
 import SOP from "@/models/SOP";
-import { invalidateDashboardSopsCache } from "@/lib/cache";
+import { invalidateDashboardSopsCache } from "@/lib/server-cache";
 import { getGroupedRegistryRows } from "@/lib/dashboardRegistrySource";
 import { isBunnyConfigured } from "@/lib/validateEnv";
 import {

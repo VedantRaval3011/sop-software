@@ -10,7 +10,8 @@ import {
   reviveRegistryGroup,
   sopFamilyIdentifierRegex,
 } from "@/lib/sop-utils";
-import { invalidateDashboardSopsCache } from "@/lib/cache";
+import { invalidateDashboardSopsCache } from "@/lib/server-cache";
+import { markMcqBanksObsoleteForIdentifier, reviveMcqBanksForIdentifier } from "@/lib/mcq-bank-sync";
 import { requireAuth } from "@/lib/withAuth";
 
 type RouteContext = { params: Promise<{ identifier: string }> };
@@ -89,6 +90,7 @@ export async function POST(_request: NextRequest, context: RouteContext) {
     }
 
     await reviveRegistryGroup(group);
+    await reviveMcqBanksForIdentifier(group[0].identifier);
     invalidateDashboardSopsCache();
     return NextResponse.json({ success: true, revived: true, identifier: group[0].identifier });
   } catch (error) {
@@ -129,6 +131,7 @@ export async function DELETE(request: NextRequest, context: RouteContext) {
     }
 
     await markRegistryObsolete(group);
+    await markMcqBanksObsoleteForIdentifier(group[0].identifier);
     invalidateDashboardSopsCache();
     return NextResponse.json({ success: true, identifier: group[0].identifier });
   } catch (error) {

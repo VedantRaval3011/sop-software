@@ -134,26 +134,43 @@ function extractValidityMonths(content: string): number | undefined {
   return months > 0 && months <= 120 ? months : undefined;
 }
 
+/** Page-header table dates (EFF. DATE / REVIEW DT.) — authoritative for version vs review. */
+function extractHeaderTableDates(content: string): Pick<ExtractedSopDates, "effectiveDate" | "reviewDate"> {
+  const header = content.slice(0, 3000);
+  const eff = header.match(/\bEFF\.?\s*DATE\s+(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4})\b/i);
+  const rev = header.match(/\bREVIEW\s*DT\.?\s+(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4})\b/i);
+  return {
+    effectiveDate: eff?.[1] ? (parseFlexibleSopDate(eff[1]) ?? undefined) : undefined,
+    reviewDate: rev?.[1] ? (parseFlexibleSopDate(rev[1]) ?? undefined) : undefined,
+  };
+}
+
 /** Pull effective / review / next-review dates from extracted DOCX text. */
 export function extractSopDatesFromContent(content: string): ExtractedSopDates {
   if (!content || content.startsWith("[")) return {};
+
+  const headerDates = extractHeaderTableDates(content);
 
   const nextReviewDate =
     matchLabeledDate(content, /next\s*review\s*date|date\s*of\s*next\s*review/i) ??
     matchLabeledDate(content, /next\s*review/i);
 
-  const reviewDate = matchLabeledDate(
-    content,
-    // English "review date / REVIEW DT." and Gujarati "ફેર ચકાસણી તારીખ".
-    /review\s*\/\s*expiry\s*date|review\s*date|review\s*dt\.?|date\s*of\s*review|ફેર\s*ચકાસણી\s*તારીખ/i,
-    { exclude: /next\s*review/i },
-  );
+  const reviewDate =
+    headerDates.reviewDate ??
+    matchLabeledDate(
+      content,
+      // English "review date / REVIEW DT." and Gujarati "ફેર ચકાસણી તારીખ".
+      /review\s*\/\s*expiry\s*date|review\s*date|review\s*dt\.?|date\s*of\s*review|ફેર\s*ચકાસણી\s*તારીખ/i,
+      { exclude: /next\s*review/i },
+    );
 
-  const effectiveDate = matchLabeledDate(
-    content,
-    // English "effective date / EFF. DATE" and Gujarati "લાગુ પડેલ તારીખ".
-    /effective\s*date|eff\.?\s*date|date\s*of\s*effect(?:ive|iveness)|implementation\s*date|લાગુ\s*પડેલ\s*તારીખ/i,
-  );
+  const effectiveDate =
+    headerDates.effectiveDate ??
+    matchLabeledDate(
+      content,
+      // English "effective date / EFF. DATE" and Gujarati "લાગુ પડેલ તારીખ".
+      /effective\s*date|eff\.?\s*date|date\s*of\s*effect(?:ive|iveness)|implementation\s*date|લાગુ\s*પડેલ\s*તારીખ/i,
+    );
 
   const revisionDate = extractLatestRevisionDate(content);
 
@@ -177,8 +194,17 @@ export function resolveSopDatesFromContent(content: string): ResolvedSopDates {
   // current version; a labeled "Effective Date" wins if the document carries one.
   const effectiveDate = extracted.effectiveDate ?? extracted.revisionDate;
 
-  let expiryDate = extracted.nextReviewDate;
-  let reviewDate = extracted.reviewDate;
+  // A review / next-review date must fall AFTER the effective date — a review can
+  // never precede the version it reviews. SOP headers occasionally carry a typo'd
+  // review year (e.g. QAGE01-10: EFF. DATE 31/10/2025 / REVIEW DT. 30/10/2025,
+  // where the review year should read 2027), which would otherwise be stored as a
+  // review/expiry date earlier than the SOP's own effective date. Discard such
+  // impossible values so expiry is recomputed from effective + validity below.
+  const afterEffective = (d?: Date): Date | undefined =>
+    d && (!effectiveDate || d > effectiveDate) ? d : undefined;
+
+  let expiryDate = afterEffective(extracted.nextReviewDate);
+  let reviewDate = afterEffective(extracted.reviewDate);
 
   if (!expiryDate && reviewDate) {
     const now = new Date();

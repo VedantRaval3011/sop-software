@@ -16,7 +16,9 @@ import type { RegistrySOP } from "@/lib/types";
  * (insert → count up, update → newer updatedAt, delete → count down) and we
  * treat the cache as stale. No mutation handler needs to know this exists. */
 
-const CACHE_KEY = "grouped-registry-v1";
+// Bump when grouped-registry computation logic changes (e.g. version-date rules).
+const CACHE_KEY = "grouped-registry-v3";
+const LEGACY_CACHE_KEYS = ["grouped-registry-v2", "grouped-registry-v1"] as const;
 
 interface Signature {
   count: number;
@@ -92,6 +94,17 @@ export async function readPersistentGroupedCache(): Promise<RegistrySOP[] | null
   } catch (e) {
     console.error("[persistentGroupedCache] read failed:", e);
     return null;
+  }
+}
+
+/** Drop persisted grouped rows so the next load recomputes from live records. */
+export async function invalidatePersistentGroupedCache(): Promise<void> {
+  try {
+    await DashboardGroupedCache.deleteMany({
+      key: { $in: [CACHE_KEY, ...LEGACY_CACHE_KEYS] },
+    });
+  } catch (e) {
+    console.error("[persistentGroupedCache] invalidate failed:", e);
   }
 }
 

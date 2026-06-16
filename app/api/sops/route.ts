@@ -7,7 +7,7 @@ import {
   parseFiltersFromSearchParams,
   sopVersionFields,
 } from "@/lib/sop-utils";
-import { invalidateDashboardSopsCache } from "@/lib/cache";
+import { invalidateDashboardSopsCache } from "@/lib/server-cache";
 import { loadGroupedRegistry } from "@/lib/dashboardRegistrySource";
 import { requireAuth } from "@/lib/withAuth";
 

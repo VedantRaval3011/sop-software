@@ -28,7 +28,7 @@ import {
 } from "@/lib/upload";
 import { extractTextFromBuffer } from "@/lib/extractContent";
 import { triggerMcqGenerationAsync } from "@/lib/mcq-generation";
-import { invalidateDashboardSopsCache } from "@/lib/cache";
+import { invalidateDashboardSopsCache } from "@/lib/server-cache";
 import { requireAuth } from "@/lib/withAuth";
 
 export async function processSopUpload(formData: FormData) {

@@ -169,7 +169,7 @@ export interface DashboardStats {
   guidelinesAnalyzed: number;
   departments: DepartmentCapsule[];
   priorVersionCount: number;
-  /** Number of superseded revisions held in the Prior Version Archive. */
+  /** Number of active SOP families with superseded revisions in the Prior Version Archive. */
   archivedVersionCount: number;
 }
 

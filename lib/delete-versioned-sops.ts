@@ -2,7 +2,7 @@ import fs from "fs";
 import path from "path";
 import { connectDB } from "@/lib/mongodb";
 import SOP from "@/models/SOP";
-import { invalidateDashboardSopsCache } from "@/lib/cache";
+import { invalidateDashboardSopsCache } from "@/lib/server-cache";
 import { groupRecordsByBase } from "@/lib/reconcile-sop-versions";
 import { recordsForVersion, maxVersionInGroup, versionFromIdentifier } from "@/lib/sop-utils";
 

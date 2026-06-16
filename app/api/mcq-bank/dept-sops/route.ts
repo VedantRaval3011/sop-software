@@ -4,49 +4,14 @@ import { connectDB } from "@/lib/mongodb";
 import SOP from "@/models/SOP";
 import User from "@/models/User";
 import { requireAuth } from "@/lib/withAuth";
-
-const SUBCAT_TO_DEPT: Record<string, string> = {
-  QAGE: "QA", ANNE: "QA",
-  QCGE: "QC", QAIC: "QC", QAIO: "QC",
-  QAMI: "Microbiology", QCMI: "Microbiology",
-  PRAA: "Production", PRCL: "Production", PRED: "Production",
-  PREO: "Production", PREP: "Production", PRGE: "Production",
-  PRMA: "Production", PRPA: "Production",
-  BSGE: "Store", STCL: "Store", STGE: "Store",
-  STOP: "Store", STPA: "Store", STRM: "Store",
-  MAGE: "Engineering and Maintenance", PREG: "Engineering and Maintenance",
-  PEGE: "Personnel",
-};
-
-function deptFromIdentifier(id?: string | null): string {
-  if (!id) return "Other";
-  const up = id.toUpperCase().trim();
-  const m = up.match(/^([A-Z]{2,6})\d/);
-  if (m && SUBCAT_TO_DEPT[m[1]]) return SUBCAT_TO_DEPT[m[1]];
-  for (let len = 6; len >= 2; len--) {
-    if (SUBCAT_TO_DEPT[up.slice(0, len)]) return SUBCAT_TO_DEPT[up.slice(0, len)];
-  }
-  return "Other";
-}
-
-function normalizeDept(raw?: string | null): string {
-  if (!raw) return "Other";
-  const l = raw.toLowerCase().trim();
-  if (l === "qa" || l.includes("quality assurance")) return "QA";
-  if (l === "qc" || l.includes("quality control")) return "QC";
-  if (l.includes("micro")) return "Microbiology";
-  if (/engineer|maint/.test(l)) return "Engineering and Maintenance";
-  if (l.includes("person") || l.includes("hr")) return "Personnel";
-  if (l.includes("store")) return "Store";
-  if (l.includes("prod")) return "Production";
-  return raw.trim();
-}
-
-function resolveDept(identifier: string, stored?: string | null): string {
-  const fromId = deptFromIdentifier(identifier);
-  if (fromId !== "Other") return fromId;
-  return normalizeDept(stored);
-}
+import { getGroupedRegistryRows } from "@/lib/dashboardRegistrySource";
+import { sopFamilyGroupKey } from "@/lib/sop-utils";
+import {
+  aggregateMcqBanksByFamily,
+  buildActiveSopFamilyMap,
+  findObsoleteMcqFamilies,
+  mcqResolveDept,
+} from "@/lib/mcq-bank-utils";
 
 // GET /api/mcq-bank/dept-sops?dept=QA
 export async function GET(request: NextRequest) {
@@ -101,10 +66,17 @@ export async function GET(request: NextRequest) {
       totalQuestions: number; checkedCount: number; reviewedCount: number; similarCount: number;
     }[];
 
-    // Filter to target department via identifier prefix resolution
+    const groupedRegistry = await getGroupedRegistryRows();
+    const activeFamilyMap = buildActiveSopFamilyMap(groupedRegistry);
+    const mcqFamilies = aggregateMcqBanksByFamily(allBanks as never[]);
+    const orphanFamKeys = new Set(
+      findObsoleteMcqFamilies(activeFamilyMap, mcqFamilies).map((f) => f.famKey),
+    );
+
     const deptBanks = allBanks.filter((b) => {
-      const resolved = resolveDept(b.sopIdentifier ?? "", b.department);
-      return resolved === dept;
+      const famKey = sopFamilyGroupKey({ identifier: (b.sopIdentifier ?? "").trim() });
+      if (orphanFamKeys.has(famKey)) return false;
+      return mcqResolveDept(b.sopIdentifier ?? "", b.department) === dept;
     });
 
     // Fetch SOP docs for trainer info

@@ -1,6 +1,6 @@
 import { connectDB } from "@/lib/mongodb";
 import SOP from "@/models/SOP";
-import { invalidateDashboardSopsCache } from "@/lib/cache";
+import { invalidateDashboardSopsCache } from "@/lib/server-cache";
 import { resolveDepartmentForExistingSop } from "@/lib/sop-utils";
 
 export async function reconcileAllDepartments(options?: { onlyGeneral?: boolean }) {

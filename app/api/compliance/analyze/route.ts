@@ -9,7 +9,7 @@ import {
   complianceStatusFromScore,
   getPipelineProgress,
 } from "@/lib/pipeline";
-import { invalidateDashboardSopsCache } from "@/lib/cache";
+import { invalidateDashboardSopsCache } from "@/lib/server-cache";
 import { requireAuth } from "@/lib/withAuth";
 import type { IComplianceFinding } from "@/models/ComplianceAnalysis";
 import mongoose from "mongoose";

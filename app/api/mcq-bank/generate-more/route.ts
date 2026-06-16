@@ -5,7 +5,7 @@ import MCQRecycle from "@/models/MCQRecycle";
 import SOP from "@/models/SOP";
 import { generateJson } from "@/lib/gemini";
 import { isSimilarQuestion } from "@/lib/similarity";
-import { invalidateDashboardSopsCache } from "@/lib/cache";
+import { invalidateDashboardSopsCache } from "@/lib/server-cache";
 import { requireAuth } from "@/lib/withAuth";
 
 const REPLACE_PROMPT = `Generate replacement MCQ questions that are NOT similar to the excluded questions.

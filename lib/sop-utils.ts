@@ -137,6 +137,61 @@ function recordVersionNum(record: ISOP): number {
   return versionNumber(recordVersion(record));
 }
 
+/** A stored version date must be present, calendar-valid, and not an upload-time placeholder. */
+function isValidVersionDateValue(date: Date | undefined, uploadedAt?: Date): boolean {
+  if (!date) return false;
+  const t = new Date(date).getTime();
+  if (Number.isNaN(t)) return false;
+  const year = new Date(date).getFullYear();
+  if (year < 1990 || year > 2100) return false;
+  if (uploadedAt && Math.abs(t - new Date(uploadedAt).getTime()) <= 10_000) return false;
+  return true;
+}
+
+/** Version date = the document's effective / revision date only — not review or expiry. */
+function resolveVersionDateForValidation(
+  record: ISOP,
+  inheritFrom?: Date,
+): Date | undefined {
+  if (
+    record.effectiveDate &&
+    isValidVersionDateValue(record.effectiveDate, record.uploadedAt)
+  ) {
+    return record.effectiveDate;
+  }
+  if (inheritFrom && isValidVersionDateValue(inheritFrom, record.uploadedAt)) {
+    return inheritFrom;
+  }
+  return undefined;
+}
+
+/**
+ * Current-version date completeness for one language: the required docx + pdf pair
+ * must both be on file with a valid effective (version) date from the docx. The pdf
+ * may inherit the docx date when its own effectiveDate is missing or invalid.
+ * Review / expiry dates are never used for this check.
+ */
+function currentVersionLangDateComplete(
+  group: ISOP[],
+  currentVersionNum: number,
+  guj: boolean,
+): boolean {
+  const langRecords = group.filter(
+    (r) =>
+      recordVersionNum(r) === currentVersionNum &&
+      (guj ? r.language === "Gujarati" : r.language !== "Gujarati") &&
+      (r.fileType === "docx" || r.fileType === "pdf"),
+  );
+  const docx = langRecords.find((r) => r.fileType === "docx" && r.fileUrl);
+  const pdf = langRecords.find((r) => r.fileType === "pdf" && r.fileUrl);
+  if (!docx || !pdf) return false;
+
+  const docxDate = resolveVersionDateForValidation(docx);
+  if (!docxDate) return false;
+
+  return Boolean(resolveVersionDateForValidation(pdf, docxDate));
+}
+
 function pickFamilyDate(
   records: ISOP[],
   field: "expiryDate" | "effectiveDate" | "reviewDate",
@@ -514,27 +569,12 @@ export function groupSOPRecords(records: ISOP[]): RegistrySOP[] {
 
     const hasVersion = group.some((r) => r.version || versionFromIdentifier(r.identifier));
 
-    // Version date = every prior-version DOCX for a language has a real effectiveDate.
-    // "Real" means it differs from uploadedAt by >10 s (rules out the upload-timestamp
-    // placeholder that was auto-stamped on old records).
+    // Version date = the current-version docx + pdf pair for each required language
+    // carries a valid extracted date. Single-language SOPs need 2 files; dual-language
+    // SOPs need all 4 (EN docx/pdf + GU docx/pdf).
     const currentVersionNum = versionNumber(currentVersion);
-    const isRealDate = (r: ISOP): boolean => {
-      if (!r.effectiveDate) return false;
-      return (
-        Math.abs(new Date(r.effectiveDate).getTime() - new Date(r.uploadedAt).getTime()) > 10_000
-      );
-    };
-    const priorDocxEn = group.filter(
-      (r) => recordVersionNum(r) < currentVersionNum && r.fileType === "docx" && r.language !== "Gujarati",
-    );
-    const priorDocxGu = group.filter(
-      (r) => recordVersionNum(r) < currentVersionNum && r.fileType === "docx" && r.language === "Gujarati",
-    );
-    // every() on an empty array is vacuously true — SOPs with no prior history
-    // are not "missing" version dates; only SOPs whose prior DOCXs exist but
-    // lack a real effectiveDate count as missing.
-    const hasVersionDateEn = priorDocxEn.every(isRealDate);
-    const hasVersionDateGu = priorDocxGu.every(isRealDate);
+    const hasVersionDateEn = currentVersionLangDateComplete(group, currentVersionNum, false);
+    const hasVersionDateGu = currentVersionLangDateComplete(group, currentVersionNum, true);
     const hasVersionDate = (() => {
       const langNeedsEn = language === "ENG" || language === "ENG-GUJ";
       const langNeedsGu = language === "GUJ" || language === "ENG-GUJ";
@@ -1123,7 +1163,7 @@ export function buildDashboardStats(registry: RegistrySOP[], extraDepartments: s
       (s, r) => s + r.priorVersions.filter((pv) => !pv.missing).length,
       0,
     ),
-    archivedVersionCount: active.reduce((s, r) => s + r.archivedVersions.length, 0),
+    archivedVersionCount: active.filter((r) => r.archivedVersions.length > 0).length,
   };
 }
 

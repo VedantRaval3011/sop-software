@@ -1,7 +1,7 @@
 import { connectDB } from '@/lib/mongodb';
 import SOP from '@/models/SOP';
 import { groupSOPRecords } from '@/lib/sop-utils';
-import { getOrBuildServerGroupedCache } from '@/lib/cache';
+import { getOrBuildServerGroupedCache } from "@/lib/server-cache";
 import {
   readPersistentGroupedCache,
   writePersistentGroupedCache,

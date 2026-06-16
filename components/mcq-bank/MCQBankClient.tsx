@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   AlertTriangle,
@@ -18,12 +18,9 @@ import {
   RefreshCw,
   Search,
   Upload,
-  UserCheck,
-  Users,
   X,
 } from "lucide-react";
 import { MCQViewerModal } from "./MCQViewerModal";
-import { DeptDetailModal } from "./DeptDetailModal";
 import { DeptGridSkeleton } from "./MCQSkeleton";
 import { displaySopCode, displaySopTitle } from "@/lib/sop-display";
 
@@ -75,19 +72,11 @@ interface MCQBankGlobalStats {
   enRemaining: number;
   guRemaining: number;
   departments: DeptMCQStats[];
-}
-
-interface TrainingDeptData {
-  employeeCount: number;
-  fullyTrained: number;
-  incomplete: number;
-  trainersAssigned: number;
-  sopTrainersAssigned: number;
-  mcqCreatedCount: number;
-  mcqNotCreatedCount: number;
-  sopCount: number;
-  foundInDb: number;
-  dbSopCount: number;
+  obsoleteMcqs?: {
+    count: number;
+    identifiers: string[];
+    totalQuestions: number;
+  };
 }
 
 interface RegistryEntry {
@@ -103,8 +92,12 @@ interface RegistryEntry {
   approved: number;
   partial: number;
   similar: number;
+  easyCount: number;
+  mediumCount: number;
+  hardCount: number;
   lastUpdated: string | null;
   banks: { id: string; langCode: "ENG" | "GUJ" }[];
+  isObsoleteMcq?: boolean;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -207,8 +200,8 @@ function StatusCard({
   totalSopEng, totalSopGuj, remainingEng, remainingGuj,
   mcqFound, mcqNotFound,
   genCompleted, genTarget, genRemaining,
-  trainingData,
   onOpen, onRowClick,
+  onMcqWithClick, onMcqWithoutClick,
 }: {
   title: string; subtitle: string; isGrand?: boolean;
   totalSOPs: number; sopWithMCQs: number; sopWithoutMCQs: number;
@@ -216,12 +209,13 @@ function StatusCard({
   totalSopEng: number; totalSopGuj: number; remainingEng: number; remainingGuj: number;
   mcqFound?: number; mcqNotFound?: number;
   genCompleted?: number; genTarget?: number; genRemaining?: number;
-  trainingData?: TrainingDeptData;
   onOpen?: () => void;
   onRowClick?: (f: "approved" | "partial" | "pending" | "similar") => void;
+  onMcqWithClick?: () => void;
+  onMcqWithoutClick?: () => void;
 }) {
   return (
-    <div className={`flex w-full min-w-0 flex-col rounded-[10px] border px-2 py-1.5 text-left shadow-sm ${
+    <div className={`flex h-full w-full min-w-0 flex-col rounded-[10px] border px-2 py-1.5 text-left shadow-sm ${
       isGrand ? "border-purple-300 bg-purple-50" : "border-gray-200 bg-white"
     }`}>
       {/* Header */}
@@ -245,18 +239,23 @@ function StatusCard({
         </div>
       </div>
 
-      {/* Total card extra rows */}
-      {isGrand && mcqFound !== undefined && (
-        <div className="flex flex-col gap-0 border-t border-transparent pt-0.5 mb-1">
-          <CM label="Unique SOPs" value={totalSOPs} />
-          <CM label="MCQ Found" value={mcqFound} vc="text-emerald-600" />
-          <CM label="Not Found" value={mcqNotFound ?? 0} vc={(mcqNotFound ?? 0) > 0 ? "text-red-600" : "text-gray-900"} />
-        </div>
-      )}
+      {/* Summary block — same on Total and every department capsule */}
+      <div className={`flex flex-col gap-0 border-t border-transparent pt-0.5 mb-1 ${isGrand ? "" : "border-b border-gray-100 pb-1"}`}>
+        <CM label="Unique SOPs" value={totalSOPs} onClick={onOpen} />
+        <CM label="MCQ Found" value={mcqFound ?? sopWithMCQs} vc="text-emerald-600" onClick={onMcqWithClick ?? onOpen} />
+        <CM
+          label="Not Found"
+          value={mcqNotFound ?? sopWithoutMCQs}
+          vc={(mcqNotFound ?? sopWithoutMCQs) > 0 ? "text-red-600" : "text-gray-900"}
+          onClick={onMcqWithoutClick ?? onOpen}
+        />
+      </div>
 
       {/* SOP counts */}
       <div className="flex flex-col gap-0 border-t border-transparent pt-0.5">
         <CM label="SOPs" value={totalSOPs} onClick={onOpen} />
+        <CM label="w/ MCQs" value={sopWithMCQs} vc="text-emerald-600" onClick={onMcqWithClick ?? onOpen} />
+        <CM label="w/o MCQs" value={sopWithoutMCQs} vc={sopWithoutMCQs > 0 ? "text-red-600" : "text-gray-900"} onClick={onMcqWithoutClick ?? onOpen} />
         <CM label="w/ EN" value={totalSopEng} />
         <CM label="w/ GU" value={totalSopGuj} vc="text-orange-500" />
         <TripleRow items={[
@@ -267,15 +266,13 @@ function StatusCard({
         <CM label="Similar" value={similarSOPs} onClick={onRowClick ? () => onRowClick("similar") : undefined} />
       </div>
 
-      {/* Remaining SOPs section */}
+      {/* Remaining language slots */}
       <div className={`mt-1.5 pt-1.5 border-t ${isGrand ? "border-purple-200" : "border-gray-100"}`}>
         <div className="flex items-center gap-1.5 mb-1">
           <FileText className="h-3.5 w-3.5 shrink-0 text-amber-500" />
-          <span className="min-w-0 flex-1 text-[11px] font-bold leading-tight text-gray-800">Remaining</span>
+          <span className="min-w-0 flex-1 text-[11px] font-bold leading-tight text-gray-800">Lang Remaining</span>
         </div>
         <div className="flex flex-col gap-0">
-          <CM label="w/ MCQs"   value={sopWithMCQs}    vc="text-emerald-600" onClick={onOpen} />
-          <CM label="Remaining" value={sopWithoutMCQs} vc={sopWithoutMCQs > 0 ? "text-red-600" : "text-gray-900"} />
           <TripleRow items={[
             { label: "EN rem.", value: remainingEng, vc: remainingEng > 0 ? "text-red-600" : "text-gray-900" },
             { label: "GU rem.", value: remainingGuj, vc: remainingGuj > 0 ? "text-red-600" : "text-gray-900" },
@@ -301,26 +298,6 @@ function StatusCard({
         </div>
       )}
 
-      {/* Training Matrix section */}
-      {trainingData && (
-        <div className={`mt-1.5 pt-1.5 border-t ${isGrand ? "border-purple-200" : "border-gray-100"}`}>
-          <div className="flex items-center gap-1.5 mb-1">
-            <Users className="h-3.5 w-3.5 shrink-0 text-indigo-500" />
-            <span className="min-w-0 flex-1 text-[11px] font-bold leading-tight text-gray-800">Training</span>
-          </div>
-          <div className="flex flex-col gap-0">
-            <CM label="Employees" value={trainingData.employeeCount} />
-            <TripleRow items={[
-              { label: "Trained",    value: trainingData.fullyTrained,  vc: "text-emerald-600" },
-              { label: "Incomplete", value: trainingData.incomplete,    vc: trainingData.incomplete > 0 ? "text-amber-500" : "text-gray-900" },
-            ]} />
-            <CM label="SOPs w/ Trainer" value={trainingData.sopTrainersAssigned} vc="text-indigo-600" />
-            {trainingData.dbSopCount > 0 && (
-              <CM label="SOPs (DB)" value={trainingData.dbSopCount} vc="text-blue-600" />
-            )}
-          </div>
-        </div>
-      )}
     </div>
   );
 }
@@ -329,11 +306,12 @@ function StatusCard({
 // Colorful dept card (By Department section)
 // ─────────────────────────────────────────────────────────────
 function DeptColorCard({
-  dept, trainingData, onClick,
+  dept, onClick, onMcqWithClick, onMcqWithoutClick,
 }: {
   dept: DeptMCQStats;
-  trainingData?: TrainingDeptData;
   onClick?: () => void;
+  onMcqWithClick?: () => void;
+  onMcqWithoutClick?: () => void;
 }) {
   const theme = getDeptTheme(dept.department);
   const [expanded, setExpanded] = useState(false);
@@ -385,28 +363,35 @@ function DeptColorCard({
           </button>
         </div>
 
-        {/* Top stats */}
-        <div className={`grid gap-1.5 w-full mb-3 ${trainingData ? "grid-cols-4" : "grid-cols-2"}`}>
-          <div className={`${theme.statBg} rounded-lg p-2 text-left border border-gray-100`}>
-            <p className="text-gray-400 text-[8px] uppercase tracking-wider font-bold mb-0.5">SOP</p>
-            <span className={`text-base font-black leading-none ${theme.accent}`}>{dept.sopWithMcqs}</span>
+        {/* Top stats — SOP MCQ coverage */}
+        <div className="grid grid-cols-3 gap-1.5 w-full mb-3">
+          <div
+            role="button" tabIndex={0}
+            onClick={(e) => { e.stopPropagation(); onClick?.(); }}
+            onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onClick?.(); } }}
+            className={`${theme.statBg} rounded-lg p-2 text-left border border-gray-100 cursor-pointer hover:opacity-90`}
+          >
+            <p className="text-gray-400 text-[8px] uppercase tracking-wider font-bold mb-0.5">SOPs</p>
+            <span className={`text-base font-black leading-none ${theme.accent}`}>{dept.sopCount}</span>
           </div>
-          <div className={`${theme.statBg} rounded-lg p-2 text-left border border-gray-100`}>
-            <p className="text-gray-400 text-[8px] uppercase tracking-wider font-bold mb-0.5">Questions</p>
-            <span className="text-base font-black leading-none text-gray-800">{fmt(dept.totalQuestions)}</span>
+          <div
+            role="button" tabIndex={0}
+            onClick={(e) => { e.stopPropagation(); onMcqWithClick?.(); }}
+            onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onMcqWithClick?.(); } }}
+            className="bg-emerald-50 rounded-lg p-2 text-left border border-emerald-100 cursor-pointer hover:opacity-90"
+          >
+            <p className="text-emerald-400 text-[8px] uppercase tracking-wider font-bold mb-0.5">w/ MCQs</p>
+            <span className="text-base font-black leading-none text-emerald-600">{dept.sopWithMcqs}</span>
           </div>
-          {trainingData && (
-            <>
-              <div className="bg-indigo-50 rounded-lg p-2 text-left border border-indigo-100">
-                <p className="text-indigo-300 text-[8px] uppercase tracking-wider font-bold mb-0.5">Employees</p>
-                <span className="text-base font-black leading-none text-indigo-700">{trainingData.employeeCount}</span>
-              </div>
-              <div className={`rounded-lg p-2 text-left border ${trainingData.fullyTrained === trainingData.employeeCount && trainingData.employeeCount > 0 ? "bg-emerald-50 border-emerald-100" : "bg-amber-50 border-amber-100"}`}>
-                <p className="text-[8px] uppercase tracking-wider font-bold mb-0.5 text-gray-400">Trained</p>
-                <span className={`text-base font-black leading-none ${trainingData.fullyTrained === trainingData.employeeCount && trainingData.employeeCount > 0 ? "text-emerald-600" : "text-amber-600"}`}>{trainingData.fullyTrained}</span>
-              </div>
-            </>
-          )}
+          <div
+            role="button" tabIndex={0}
+            onClick={(e) => { e.stopPropagation(); onMcqWithoutClick?.(); }}
+            onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onMcqWithoutClick?.(); } }}
+            className={`rounded-lg p-2 text-left border cursor-pointer hover:opacity-90 ${dept.sopWithoutMcqs > 0 ? "bg-red-50 border-red-100" : "bg-gray-50 border-gray-100"}`}
+          >
+            <p className="text-[8px] uppercase tracking-wider font-bold mb-0.5 text-gray-400">w/o MCQs</p>
+            <span className={`text-base font-black leading-none ${dept.sopWithoutMcqs > 0 ? "text-red-600" : "text-gray-400"}`}>{dept.sopWithoutMcqs}</span>
+          </div>
         </div>
 
         {/* Coverage bar */}
@@ -485,51 +470,19 @@ function DeptColorCard({
         )}
       </div>
 
-      {/* Expanded training details */}
+      {/* Expanded details */}
       {expanded && (
         <div className={`border-t ${theme.border} ${theme.statBg} px-3 py-2 flex flex-col gap-1.5`}>
-          {trainingData && trainingData.employeeCount > 0 && (
-            <>
-              {/* Training completion bar */}
-              <div className="bg-white border border-gray-100 rounded-lg px-2.5 py-2">
-                <div className="flex items-center justify-between mb-1">
-                  <div className="flex items-center gap-1.5">
-                    <UserCheck className={`h-3 w-3 ${theme.iconText}`} />
-                    <span className="text-[8px] font-bold text-gray-500 uppercase tracking-wider">Training Completion</span>
-                  </div>
-                  <span className={`text-[9px] font-black ${trainingData.employeeCount > 0 ? theme.accent : "text-gray-400"}`}>
-                    {trainingData.employeeCount > 0 ? Math.round((trainingData.fullyTrained / trainingData.employeeCount) * 100) : 0}%
-                  </span>
-                </div>
-                <div className="w-full h-1.5 bg-gray-100 rounded-full overflow-hidden">
-                  <div
-                    className="h-full rounded-full bg-indigo-500 transition-all duration-700"
-                    style={{ width: `${trainingData.employeeCount > 0 ? Math.round((trainingData.fullyTrained / trainingData.employeeCount) * 100) : 0}%` }}
-                  />
-                </div>
-                <div className="flex items-center gap-3 mt-1.5">
-                  <span className="text-[8px] text-emerald-600 font-bold">{trainingData.fullyTrained} Trained</span>
-                  <span className="text-[8px] text-amber-500 font-bold">{trainingData.incomplete} Incomplete</span>
-                  {trainingData.sopTrainersAssigned > 0 && (
-                    <span className="text-[8px] text-indigo-500 font-bold ml-auto">{trainingData.sopTrainersAssigned} SOPs w/ Trainer</span>
-                  )}
-                </div>
-              </div>
-              {/* DB SOP count */}
-              {trainingData.dbSopCount > 0 && (
-                <div className="flex items-center gap-2 px-2 py-1.5 rounded-lg bg-white border border-gray-100">
-                  <FileText className={`h-3 w-3 ${theme.iconText} shrink-0`} />
-                  <span className="text-[9px] text-gray-500">
-                    <span className={`font-bold ${theme.accent}`}>{trainingData.dbSopCount}</span> SOPs in DB ·
-                    <span className="font-bold text-indigo-600 ml-1">{trainingData.foundInDb}</span> in Training Matrix
-                  </span>
-                </div>
-              )}
-            </>
-          )}
+          <div className="flex items-center gap-2 px-2 py-1.5 rounded-lg bg-white border border-gray-100">
+            <FileText className={`h-3 w-3 ${theme.iconText} shrink-0`} />
+            <span className="text-[9px] text-gray-500">
+              <span className={`font-bold ${theme.accent}`}>{fmt(dept.totalQuestions)}</span> total questions ·
+              <span className="font-bold text-emerald-600 ml-1">{dept.approvedSops}</span> approved SOPs
+            </span>
+          </div>
           <div className="flex items-center gap-2 px-2 py-1.5 rounded-lg bg-white border border-gray-200">
             <FolderOpen className={`h-3 w-3 ${theme.iconText} shrink-0`} />
-            <span className="text-[9px] text-gray-500">{dept.subcategories} subcategor{dept.subcategories !== 1 ? "ies" : "y"} — click department header to view</span>
+            <span className="text-[9px] text-gray-500">{dept.subcategories} subcategor{dept.subcategories !== 1 ? "ies" : "y"} — click card to filter MCQ Registry</span>
           </div>
         </div>
       )}
@@ -658,93 +611,39 @@ export function MCQBankClient() {
 
   // Modal state
   const [viewerBankId, setViewerBankId] = useState<string | null>(null);
-  const [viewerSourceDept, setViewerSourceDept] = useState<string | null>(null);
-  const [deptModal, setDeptModal] = useState<string | null>(null);
 
   // Data state
   const [stats, setStats] = useState<MCQBankGlobalStats | null>(null);
   const [statsLoading, setStatsLoading] = useState(true);
   const [statsError, setStatsError] = useState<string | null>(null);
 
-  const [tmPerDept, setTmPerDept] = useState<Record<string, TrainingDeptData> | null>(null);
-  const [tmTotalCard, setTmTotalCard] = useState<TrainingDeptData | null>(null);
-
-  const [entries, setEntries] = useState<RegistryEntry[]>([]);
-  const [total, setTotal] = useState(0);
+  const [allActiveEntries, setAllActiveEntries] = useState<RegistryEntry[]>([]);
+  const [allObsoleteEntries, setAllObsoleteEntries] = useState<RegistryEntry[]>([]);
   const [regLoading, setRegLoading] = useState(true);
   const [regError, setRegError] = useState<string | null>(null);
 
-  // Filters
+  // Filters — applied client-side for instant capsule/card clicks (same pattern as Dashboard)
   const [search, setSearch] = useState("");
   const [difficulty, setDifficulty] = useState<"all" | "easy" | "medium" | "hard">("all");
-  const [langFilter, setLangFilter] = useState("all");
   const [deptFilter, setDeptFilter] = useState("all");
+  const [obsoleteOnly, setObsoleteOnly] = useState(false);
   const [sortCol, setSortCol] = useState("identifier");
   const [sortDir, setSortDir] = useState("asc");
-  const [page, setPage] = useState(1);
-  const limit = 50;
+  const [regLangFilter, setRegLangFilter] = useState("All");
 
   // UI state
   const [showDeptCards, setShowDeptCards] = useState(true);
   const [refreshKey, setRefreshKey] = useState(0);
-  const [regSearch, setRegSearch] = useState("");
-  const [regDeptFilter, setRegDeptFilter] = useState("all");
-  const [regLangFilter, setRegLangFilter] = useState("All");
 
   const mcqRegistryRef = useRef<HTMLDivElement>(null);
-  const searchRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const fetchStats = useCallback(async () => {
     setStatsLoading(true);
     setStatsError(null);
     try {
-      const [statsRes, tmRes] = await Promise.all([
-        fetch("/api/mcq-bank/stats"),
-        fetch("/api/training-matrix/overview"),
-      ]);
+      const statsRes = await fetch("/api/mcq-bank/stats");
       if (!statsRes.ok) throw new Error((await statsRes.json()).error ?? "Failed to load MCQ stats");
       setStats(await statsRes.json());
-
-      if (tmRes.ok) {
-        const tmData = await tmRes.json();
-        if (tmData.success && tmData.perDept) {
-          // dbSopCountsByDept lives in totalCard (per-dept DB SOP counts)
-          const dbCounts: Record<string, number> = tmData.totalCard?.dbSopCountsByDept ?? {};
-
-          // Per-dept slim records
-          const slim: Record<string, TrainingDeptData> = {};
-          for (const [dept, d] of Object.entries(tmData.perDept as Record<string, Record<string, number>>)) {
-            slim[dept] = {
-              employeeCount: d.employeeCount ?? 0,
-              fullyTrained: d.fullyTrained ?? 0,
-              incomplete: d.incomplete ?? 0,
-              trainersAssigned: d.trainersAssigned ?? 0,
-              sopTrainersAssigned: d.sopTrainersAssigned ?? 0,
-              mcqCreatedCount: d.mcqCreatedCount ?? 0,
-              mcqNotCreatedCount: d.mcqNotCreatedCount ?? 0,
-              sopCount: d.sopCount ?? 0,
-              foundInDb: d.foundInDb ?? 0,
-              dbSopCount: (dbCounts[dept] as number) ?? 0,
-            };
-          }
-          setTmPerDept(slim);
-
-          // totalCard has correct aggregated values (avoids double-counting when summing per-dept)
-          const tc = tmData.totalCard ?? {};
-          setTmTotalCard({
-            employeeCount: tc.employeeCount ?? 0,
-            fullyTrained: tc.fullyTrained ?? 0,
-            incomplete: tc.incomplete ?? 0,
-            trainersAssigned: tc.trainersAssigned ?? 0,
-            sopTrainersAssigned: tc.sopTrainersAssigned ?? 0,
-            mcqCreatedCount: tc.mcqCreatedCount ?? 0,
-            mcqNotCreatedCount: tc.mcqNotCreatedCount ?? 0,
-            sopCount: tc.excelSopCount ?? tc.sopCount ?? 0,
-            foundInDb: tc.foundInDb ?? 0,
-            dbSopCount: tc.dbSopCount ?? 0, // = dbBaseSet.size, matches TM "SOPs (DB)"
-          });
-        }
-      }
     } catch (e) {
       setStatsError(e instanceof Error ? e.message : "Failed to load stats");
     } finally {
@@ -756,63 +655,72 @@ export function MCQBankClient() {
     setRegLoading(true);
     setRegError(null);
     try {
-      const params = new URLSearchParams({
-        search, difficulty, language: langFilter, dept: deptFilter,
-        sortBy: sortCol, sortDir, page: String(page), limit: String(limit),
-      });
-      const res = await fetch(`/api/mcq-bank/registry?${params}`);
+      const res = await fetch("/api/mcq-bank/registry?all=1");
       if (!res.ok) throw new Error((await res.json()).error ?? "Failed");
       const data = await res.json();
-      setEntries(data.items);
-      setTotal(data.total);
+      setAllActiveEntries(data.active ?? []);
+      setAllObsoleteEntries(data.obsolete ?? []);
     } catch (e) {
       setRegError(e instanceof Error ? e.message : "Failed to load registry");
     } finally {
       setRegLoading(false);
     }
-  }, [search, difficulty, langFilter, deptFilter, sortCol, sortDir, page]);
+  }, []);
 
   useEffect(() => { fetchStats(); }, [fetchStats, refreshKey]);
-
-  useEffect(() => {
-    if (searchRef.current) clearTimeout(searchRef.current);
-    searchRef.current = setTimeout(() => { setPage(1); fetchRegistry(); }, search ? 300 : 0);
-    return () => { if (searchRef.current) clearTimeout(searchRef.current); };
-  }, [fetchRegistry, search]);
-
   useEffect(() => { fetchRegistry(); }, [fetchRegistry, refreshKey]);
 
   const handleSort = (field: string) => {
     if (sortCol === field) setSortDir((d) => (d === "asc" ? "desc" : "asc"));
     else { setSortCol(field); setSortDir("asc"); }
-    setPage(1);
   };
 
-  // Build registry filtered/sorted from entries (already paginated from API)
-  const filteredEntries = entries.filter((row) => {
-    if (regDeptFilter !== "all" && row.department !== regDeptFilter) return false;
-    // row.language is "ENG" / "GUJ" / "ENG-GUJ"; a dual-language family matches both.
-    if (regLangFilter === "English" && row.language !== "ENG" && row.language !== "ENG-GUJ") return false;
-    if (regLangFilter === "Gujarati" && row.language !== "GUJ" && row.language !== "ENG-GUJ") return false;
-    if (regSearch) {
-      const q = regSearch.toLowerCase();
-      if (
-        !row.identifier.toLowerCase().includes(q) &&
-        !row.sopName.toLowerCase().includes(q) &&
-        !(row.sopNameGujarati ?? "").toLowerCase().includes(q) &&
-        !row.department.toLowerCase().includes(q)
-      ) return false;
+  const { filteredEntries, total } = useMemo(() => {
+    let rows = obsoleteOnly ? allObsoleteEntries : allActiveEntries;
+
+    if (deptFilter !== "all") {
+      rows = rows.filter((e) => e.department === deptFilter);
     }
-    return true;
-  });
+    if (regLangFilter === "English") {
+      rows = rows.filter((e) => e.language === "ENG" || e.language === "ENG-GUJ");
+    } else if (regLangFilter === "Gujarati") {
+      rows = rows.filter((e) => e.language === "GUJ" || e.language === "ENG-GUJ");
+    }
+    if (search.trim()) {
+      const q = search.trim().toLowerCase();
+      rows = rows.filter(
+        (e) =>
+          e.identifier.toLowerCase().includes(q) ||
+          e.sopName.toLowerCase().includes(q) ||
+          (e.sopNameGujarati ?? "").toLowerCase().includes(q) ||
+          e.department.toLowerCase().includes(q),
+      );
+    }
+    if (difficulty === "easy") rows = rows.filter((e) => e.easyCount > 0);
+    else if (difficulty === "medium") rows = rows.filter((e) => e.mediumCount > 0);
+    else if (difficulty === "hard") rows = rows.filter((e) => e.hardCount > 0);
 
-  const totalPages = Math.ceil(total / limit);
-  const totalBanks = stats?.totalMcqBanks ?? total;
+    const sorted = [...rows].sort((a, b) => {
+      let cmp = 0;
+      if (sortCol === "name") cmp = a.sopName.localeCompare(b.sopName);
+      else if (sortCol === "questions" || sortCol === "totalMcqs") cmp = b.totalMcqs - a.totalMcqs;
+      else if (sortCol === "remaining") cmp = b.remaining - a.remaining;
+      else if (sortCol === "approved") cmp = b.approved - a.approved;
+      else if (sortCol === "partial") cmp = b.partial - a.partial;
+      else if (sortCol === "similar") cmp = b.similar - a.similar;
+      else if (sortCol === "lastUpdated" || sortCol === "date") {
+        cmp = (Date.parse(b.lastUpdated ?? "") || 0) - (Date.parse(a.lastUpdated ?? "") || 0);
+      } else cmp = a.identifier.localeCompare(b.identifier);
+      return sortDir === "desc" ? -cmp : cmp;
+    });
 
-  const getDeptColor = (dept: string) => {
-    const theme = getDeptTheme(dept);
-    return { bg: theme.cardBg, bar: "bg-white/80", badge: theme.statBg };
-  };
+    return { filteredEntries: sorted, total: sorted.length };
+  }, [
+    allActiveEntries, allObsoleteEntries, obsoleteOnly, deptFilter, regLangFilter,
+    search, difficulty, sortCol, sortDir,
+  ]);
+
+  const totalBanks = stats?.totalMcqBanks ?? allActiveEntries.length;
 
   // Aggregate global totals for StatusCard
   const globalCard = stats ? {
@@ -829,22 +737,19 @@ export function MCQBankClient() {
     remainingGuj: stats.guRemaining,
   } : null;
 
-  // Resolve TM data for an MCQ-bank dept name (handles "Engineering and Maintenance" → "Engineering")
-  const getTmData = useCallback((deptName: string): TrainingDeptData | undefined => {
-    if (!tmPerDept) return undefined;
-    if (tmPerDept[deptName]) return tmPerDept[deptName];
-    // Strip "and <word>" suffix (e.g. "Engineering and Maintenance" → "Engineering")
-    const stripped = deptName.replace(/\s+and\s+\w+/gi, "").trim();
-    if (tmPerDept[stripped]) return tmPerDept[stripped];
-    // Case-insensitive prefix match
-    const lower = deptName.toLowerCase();
-    for (const key of Object.keys(tmPerDept)) {
-      if (lower.startsWith(key.toLowerCase()) || key.toLowerCase().startsWith(lower)) return tmPerDept[key];
-    }
-    return undefined;
-  }, [tmPerDept]);
+  const applyDeptFilter = useCallback((department: string) => {
+    setObsoleteOnly(false);
+    setDeptFilter(department === "Total" ? "all" : department);
+    setSearch("");
+    mcqRegistryRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, []);
 
-  // tmTotalCard is used directly for the grand Total card (avoids summing per-dept which double-counts)
+  const toggleObsoleteView = useCallback(() => {
+    setObsoleteOnly((v) => !v);
+    setDeptFilter("all");
+    setSearch("");
+    mcqRegistryRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, []);
 
   const DEPT_ORDER = ["QA", "QC", "Microbiology", "Production", "Store", "Engineering and Maintenance", "Personnel"];
   const orderedDepts = stats ? [
@@ -860,28 +765,8 @@ export function MCQBankClient() {
       {viewerBankId && (
         <MCQViewerModal
           bankId={viewerBankId}
-          onClose={() => { setViewerBankId(null); setViewerSourceDept(null); }}
-          onBack={() => {
-            setViewerBankId(null);
-            if (viewerSourceDept) {
-              setDeptModal(viewerSourceDept);
-              setViewerSourceDept(null);
-            }
-          }}
-        />
-      )}
-
-      {/* Dept Detail Modal */}
-      {deptModal && (
-        <DeptDetailModal
-          dept={deptModal}
-          deptColor={getDeptColor(deptModal)}
-          onClose={() => setDeptModal(null)}
-          onViewMcqs={(id) => {
-            setViewerSourceDept(deptModal);
-            setDeptModal(null);
-            setViewerBankId(id);
-          }}
+          onClose={() => setViewerBankId(null)}
+          onBack={() => setViewerBankId(null)}
         />
       )}
 
@@ -913,9 +798,11 @@ export function MCQBankClient() {
                   className="flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-700">
                   <RefreshCw className={`h-3.5 w-3.5 ${statsLoading ? "animate-spin" : ""}`} /> Refresh
                 </button>
-                <button type="button"
-                  className="flex items-center gap-1.5 rounded-lg bg-red-500 px-3 py-1.5 text-xs font-semibold text-white hover:bg-red-600">
-                  Obsolete Details
+                <button type="button" onClick={toggleObsoleteView}
+                  className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold text-white transition-colors ${
+                    obsoleteOnly ? "bg-red-700 hover:bg-red-800 ring-2 ring-red-300" : "bg-red-500 hover:bg-red-600"
+                  }`}>
+                  Obsolete MCQs{stats?.obsoleteMcqs?.count ? ` (${stats.obsoleteMcqs.count})` : ""}
                 </button>
                 <button type="button"
                   className="flex items-center gap-1.5 rounded-lg bg-orange-500 px-3 py-1.5 text-xs font-semibold text-white hover:bg-orange-600">
@@ -963,7 +850,7 @@ export function MCQBankClient() {
                   ))}
                 </div>
               ) : stats && globalCard ? (
-                <div className="grid gap-3" style={{ gridTemplateColumns: `repeat(${totalStatusCards}, minmax(150px, 1fr))` }}>
+                <div className="grid items-stretch gap-3" style={{ gridTemplateColumns: `repeat(${totalStatusCards}, minmax(165px, 1fr))` }}>
                   {/* Total card */}
                   <StatusCard
                     title="Total"
@@ -982,9 +869,10 @@ export function MCQBankClient() {
                     remainingGuj={globalCard.remainingGuj}
                     mcqFound={stats.mcqFound}
                     mcqNotFound={stats.notFound}
-                    trainingData={tmTotalCard ?? undefined}
+                    onOpen={() => applyDeptFilter("Total")}
+                    onMcqWithClick={() => applyDeptFilter("Total")}
+                    onMcqWithoutClick={() => applyDeptFilter("Total")}
                   />
-                  {/* Per-dept cards */}
                   {orderedDepts.map((dept) => (
                     <StatusCard
                       key={dept.department}
@@ -997,13 +885,16 @@ export function MCQBankClient() {
                       partialSOPs={dept.partialSops}
                       pendingSOPs={dept.pendingSops}
                       similarSOPs={dept.similarSops}
-                      totalSopEng={dept.totalSopEng}
-                      totalSopGuj={dept.totalSopGuj}
+                      totalSopEng={dept.withEnglish}
+                      totalSopGuj={dept.withGujarati}
                       remainingEng={dept.enRemaining}
                       remainingGuj={dept.guRemaining}
-                      trainingData={getTmData(dept.department)}
-                      onOpen={() => setDeptModal(dept.department)}
-                      onRowClick={(f) => setDeptModal(dept.department)}
+                      mcqFound={dept.sopWithMcqs}
+                      mcqNotFound={dept.sopWithoutMcqs}
+                      onOpen={() => applyDeptFilter(dept.department)}
+                      onMcqWithClick={() => applyDeptFilter(dept.department)}
+                      onMcqWithoutClick={() => applyDeptFilter(dept.department)}
+                      onRowClick={() => applyDeptFilter(dept.department)}
                     />
                   ))}
                 </div>
@@ -1043,8 +934,9 @@ export function MCQBankClient() {
                   <DeptColorCard
                     key={dept.department}
                     dept={dept}
-                    trainingData={getTmData(dept.department)}
-                    onClick={() => setDeptModal(dept.department)}
+                    onClick={() => applyDeptFilter(dept.department)}
+                    onMcqWithClick={() => applyDeptFilter(dept.department)}
+                    onMcqWithoutClick={() => applyDeptFilter(dept.department)}
                   />
                 ))}
               </div>
@@ -1060,9 +952,13 @@ export function MCQBankClient() {
                   <LayoutList className="h-5 w-5 text-purple-400" />
                 </div>
                 <div>
-                  <h3 className="text-sm font-black text-gray-800 uppercase tracking-widest">MCQ Registry</h3>
+                  <h3 className="text-sm font-black text-gray-800 uppercase tracking-widest">
+                    {obsoleteOnly ? "Obsolete MCQs" : "MCQ Registry"}
+                  </h3>
                   <p className="text-[10px] text-gray-500 mt-0.5">
-                    {regLoading ? "Loading…" : `${filteredEntries.length} of ${total} SOPs`}
+                    {regLoading ? "Loading…" : obsoleteOnly
+                      ? `${total} obsolete MCQ ${total === 1 ? "family" : "families"}`
+                      : `${total} SOP${total === 1 ? "" : "s"}${deptFilter !== "all" ? ` · ${deptFilter}` : ""}`}
                   </p>
                 </div>
               </div>
@@ -1074,21 +970,32 @@ export function MCQBankClient() {
                   <input
                     type="text"
                     placeholder="Search SOPs..."
-                    value={regSearch}
-                    onChange={(e) => setRegSearch(e.target.value)}
+                    value={search}
+                    onChange={(e) => setSearch(e.target.value)}
                     className="pl-8 pr-3 py-1.5 rounded-lg bg-white border border-gray-300 text-gray-800 text-[11px] placeholder-gray-400 focus:outline-none focus:border-purple-400 w-44 transition-colors"
                   />
                 </div>
-                <select
-                  value={regDeptFilter}
-                  onChange={(e) => setRegDeptFilter(e.target.value)}
-                  className="px-2.5 py-1.5 rounded-lg bg-white border border-gray-300 text-gray-800 text-[11px] focus:outline-none focus:border-purple-400 cursor-pointer"
-                >
-                  <option value="all">All Depts</option>
-                  {stats?.departments.map((d) => (
-                    <option key={d.department} value={d.department}>{d.department}</option>
-                  ))}
-                </select>
+                {!obsoleteOnly && (
+                  <select
+                    value={deptFilter}
+                    onChange={(e) => setDeptFilter(e.target.value)}
+                    className="px-2.5 py-1.5 rounded-lg bg-white border border-gray-300 text-gray-800 text-[11px] focus:outline-none focus:border-purple-400 cursor-pointer"
+                  >
+                    <option value="all">All Depts</option>
+                    {stats?.departments.map((d) => (
+                      <option key={d.department} value={d.department}>{d.department}</option>
+                    ))}
+                  </select>
+                )}
+                {deptFilter !== "all" && !obsoleteOnly && (
+                  <button
+                    type="button"
+                    onClick={() => setDeptFilter("all")}
+                    className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-purple-100 border border-purple-300 text-purple-700 text-[10px] font-bold hover:bg-purple-200 transition-colors"
+                  >
+                    {deptFilter} <X className="h-3 w-3 ml-0.5" />
+                  </button>
+                )}
                 <select
                   value={regLangFilter}
                   onChange={(e) => setRegLangFilter(e.target.value)}
@@ -1098,10 +1005,10 @@ export function MCQBankClient() {
                   <option value="English">English</option>
                   <option value="Gujarati">Gujarati</option>
                 </select>
-                {regSearch && (
+                {search && (
                   <button
                     type="button"
-                    onClick={() => setRegSearch("")}
+                    onClick={() => setSearch("")}
                     className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-gray-100 border border-gray-300 text-gray-600 text-[10px] font-bold hover:bg-gray-200 transition-colors"
                   >
                     Clear <X className="h-3 w-3 ml-0.5" />
@@ -1171,43 +1078,6 @@ export function MCQBankClient() {
                   </tbody>
                 </table>
               </div>
-
-              {/* Pagination */}
-              {totalPages > 1 && (
-                <div className="flex items-center justify-between border-t border-gray-200 bg-white px-5 py-3">
-                  <p className="text-xs text-gray-500">Page {page} of {totalPages} · {total} total</p>
-                  <div className="flex items-center gap-1">
-                    <button type="button" disabled={page === 1}
-                      onClick={() => setPage((p) => Math.max(1, p - 1))}
-                      className="rounded border border-gray-300 px-2.5 py-1 text-xs text-gray-600 hover:bg-gray-50 disabled:opacity-40">
-                      Prev
-                    </button>
-                    {(() => {
-                      const windowSize = Math.min(5, totalPages);
-                      let start = Math.max(1, page - 2);
-                      if (start + windowSize - 1 > totalPages) start = Math.max(1, totalPages - windowSize + 1);
-                      return [...Array(windowSize)].map((_, i) => {
-                        const pg = start + i;
-                        return (
-                          <button key={i} type="button" onClick={() => setPage(pg)}
-                            className={`rounded border px-2.5 py-1 text-xs ${
-                              pg === page
-                                ? "border-violet-600 bg-violet-600 text-white"
-                                : "border-gray-300 text-gray-600 hover:bg-gray-50"
-                            }`}>
-                            {pg}
-                          </button>
-                        );
-                      });
-                    })()}
-                    <button type="button" disabled={page === totalPages}
-                      onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-                      className="rounded border border-gray-300 px-2.5 py-1 text-xs text-gray-600 hover:bg-gray-50 disabled:opacity-40">
-                      Next
-                    </button>
-                  </div>
-                </div>
-              )}
             </div>
           </div>
 

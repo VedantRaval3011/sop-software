@@ -7,7 +7,7 @@ import {
   uploadFileToBunny,
 } from "@/lib/bunny";
 import { getContentType } from "@/lib/extractContent";
-import { invalidateDashboardSopsCache } from "@/lib/cache";
+import { invalidateDashboardSopsCache } from "@/lib/server-cache";
 import { requireAuth } from "@/lib/withAuth";
 import { isBunnyConfigured } from "@/lib/validateEnv";
 

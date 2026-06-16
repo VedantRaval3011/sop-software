@@ -2,7 +2,7 @@ import { connectDB } from "@/lib/mongodb";
 import SOP from "@/models/SOP";
 import { asMediaArray, extractIdentifierFromFilename } from "@/lib/sop-utils";
 import { detectLanguageFromFilename, saveMediaFile } from "@/lib/upload";
-import { invalidateDashboardSopsCache } from "@/lib/cache";
+import { invalidateDashboardSopsCache } from "@/lib/server-cache";
 
 type MediaResult = {
   file: string;

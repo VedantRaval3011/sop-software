@@ -1,61 +1,16 @@
 import { NextResponse } from "next/server";
 import mongoose from "mongoose";
 import { connectDB } from "@/lib/mongodb";
-import SOP from "@/models/SOP";
 import User from "@/models/User";
 import { requireAuth } from "@/lib/withAuth";
-import { sopFamilyGroupKey } from "@/lib/sop-utils";
-
-// ── Subcategory prefix → canonical department (aligned with canonDept() in TM overview) ──
-const SUBCAT_TO_DEPT: Record<string, string> = {
-  QAGE: "QA", ANNE: "QA",
-  QCGE: "QC", QAIC: "QC", QAIO: "QC",
-  QAMI: "Microbiology", QCMI: "Microbiology",
-  PRAA: "Production", PRCL: "Production", PRED: "Production",
-  PREO: "Production", PREP: "Production", PRGE: "Production",
-  PRMA: "Production", PRPA: "Production",
-  BSGE: "Store", STCL: "Store", STGE: "Store",
-  STOP: "Store", STPA: "Store", STRM: "Store",
-  MAGE: "Engineering and Maintenance", PREG: "Engineering and Maintenance",
-  PEGE: "Personnel",
-};
-
-const DEPARTMENT_ORDER = [
-  "QA", "QC", "Microbiology", "Production",
-  "Store", "Engineering and Maintenance", "Personnel",
-];
-
-function deptFromIdentifier(id?: string | null): string {
-  if (!id) return "Other";
-  const up = id.toUpperCase().trim();
-  const m = up.match(/^([A-Z]{2,6})\d/);
-  if (m && SUBCAT_TO_DEPT[m[1]]) return SUBCAT_TO_DEPT[m[1]];
-  for (let len = 6; len >= 2; len--) {
-    const pfx = up.slice(0, len);
-    if (SUBCAT_TO_DEPT[pfx]) return SUBCAT_TO_DEPT[pfx];
-  }
-  return "Other";
-}
-
-// Mirrors canonDept() from training-matrix/overview so dept names stay aligned
-function normalizeDeptName(raw?: string | null): string {
-  if (!raw) return "Other";
-  const lower = raw.toLowerCase().trim();
-  if (/\bqa\b|quality.?assur/.test(lower)) return "QA";
-  if (/\bqc\b|quality.?cont/.test(lower)) return "QC";
-  if (/micro/.test(lower)) return "Microbiology";
-  if (/engineer|maint/.test(lower)) return "Engineering and Maintenance";
-  if (/person|\bhr\b/.test(lower)) return "Personnel";
-  if (/store/.test(lower)) return "Store";
-  if (/prod/.test(lower)) return "Production";
-  return "Other";
-}
-
-function resolveDept(identifier: string, storedDept?: string | null): string {
-  const fromId = deptFromIdentifier(identifier);
-  if (fromId !== "Other") return fromId;
-  return normalizeDeptName(storedDept);
-}
+import { getGroupedRegistryRows } from "@/lib/dashboardRegistrySource";
+import {
+  MCQ_DEPARTMENT_ORDER,
+  aggregateMcqBanksByFamily,
+  buildActiveSopFamilyMap,
+  findObsoleteMcqFamilies,
+} from "@/lib/mcq-bank-utils";
+import { reconcileMcqBankObsoleteFlags } from "@/lib/mcq-bank-sync";
 
 export async function GET() {
   const auth = await requireAuth(["admin", "trainer", "viewer"]);
@@ -68,34 +23,17 @@ export async function GET() {
 
     const mcqBankCol = db.collection("mcqbanks");
 
-    // ── 1. All non-obsolete SOPs → per-dept SOP counts ────────────────────
-    const sops = await SOP.find({ isObsolete: { $ne: true } })
-      .select("identifier name department language processArea sopBaseId")
-      .lean();
+    // ── 1. Active SOP families — same source as the Main Dashboard ───────────
+    const grouped = await getGroupedRegistryRows();
+    const sopFamilyMap = buildActiveSopFamilyMap(grouped);
 
-    // Unique SOP families per dept. Group with sopFamilyGroupKey — the SAME key the
-    // Main Dashboard uses (zero-padding-insensitive, version-collapsed). SOPs that
-    // resolve to "Other" (unmapped prefix + no known stored department) are dropped,
-    // matching the source project — the capsules only ever show named departments.
-    const sopFamilyMap = new Map<string, { dept: string; languages: Set<string>; processAreas: Set<string>; name: string }>();
-    for (const s of sops) {
-      const famKey = sopFamilyGroupKey(s);
-      const dept = resolveDept(s.identifier, s.department);
-      if (dept === "Other") continue;
-      if (!sopFamilyMap.has(famKey)) {
-        sopFamilyMap.set(famKey, { dept, languages: new Set(), processAreas: new Set(), name: s.name });
-      }
-      const e = sopFamilyMap.get(famKey)!;
-      if (s.language) e.languages.add(s.language);
-      if (s.processArea) e.processAreas.add(s.processArea);
-    }
-
-    // ── 2. Aggregate MCQBank data ─────────────────────────────────────────
+    // ── 2. Aggregate MCQBank data (non-obsolete banks only) ───────────────────
     const bankAgg = await mcqBankCol.aggregate([
       { $match: { isObsolete: { $ne: true } } },
       {
         $project: {
           sopIdentifier: 1,
+          sopName: 1,
           department: 1,
           language: 1,
           totalQuestions: { $size: { $ifNull: ["$mcqs", []] } },
@@ -117,44 +55,64 @@ export async function GET() {
           updatedAt: 1,
         },
       },
-    ]).toArray() as {
-      sopIdentifier: string; department: string; language: string;
-      totalQuestions: number; checkedCount: number; reviewedCount: number; similarCount: number; updatedAt?: Date;
-    }[];
+    ]).toArray();
 
-    // Bank lookup: SOP family key → aggregated stats. Use sopFamilyGroupKey so banks
-    // collapse to the SAME families the SOP counts use (and the Main Dashboard uses).
-    const bankByIdentifier = new Map<string, {
-      dept: string;
-      totalQ: number; checkedQ: number; reviewedQ: number; similarQ: number;
-      hasEn: boolean; hasGu: boolean;
-    }>();
+    const obsoleteBankAgg = await mcqBankCol.aggregate([
+      { $match: { isObsolete: true } },
+      {
+        $project: {
+          sopIdentifier: 1,
+          sopName: 1,
+          department: 1,
+          language: 1,
+          totalQuestions: { $size: { $ifNull: ["$mcqs", []] } },
+          checkedCount: {
+            $size: {
+              $filter: { input: { $ifNull: ["$mcqs", []] }, as: "q", cond: { $eq: ["$$q.isChecked", true] } },
+            },
+          },
+          reviewedCount: {
+            $size: {
+              $filter: { input: { $ifNull: ["$mcqs", []] }, as: "q", cond: { $eq: ["$$q.isReviewed", true] } },
+            },
+          },
+          similarCount: {
+            $size: {
+              $filter: { input: { $ifNull: ["$mcqs", []] }, as: "q", cond: { $eq: ["$$q.isSimilar", true] } },
+            },
+          },
+          updatedAt: 1,
+        },
+      },
+    ]).toArray();
 
-    for (const b of bankAgg) {
-      const rawId = (b.sopIdentifier ?? "").trim();
-      const id = sopFamilyGroupKey({ identifier: rawId });
-      const dept = resolveDept(rawId, b.department);
-      if (dept === "Other") continue; // drop unmapped/"Other" banks — never shown
-      if (!bankByIdentifier.has(id)) {
-        bankByIdentifier.set(id, { dept, totalQ: 0, checkedQ: 0, reviewedQ: 0, similarQ: 0, hasEn: false, hasGu: false });
-      }
-      const e = bankByIdentifier.get(id)!;
-      e.totalQ += b.totalQuestions;
-      e.checkedQ += b.checkedCount;
-      e.reviewedQ += b.reviewedCount;
-      e.similarQ += b.similarCount;
-      if ((b.language ?? "").toLowerCase() === "gujarati") e.hasGu = true;
-      else e.hasEn = true;
+    const bankByIdentifier = aggregateMcqBanksByFamily(bankAgg as never[]);
+    const markedObsoleteFamilies = aggregateMcqBanksByFamily(obsoleteBankAgg as never[]);
+
+    const orphanMcqFamilies = findObsoleteMcqFamilies(sopFamilyMap, bankByIdentifier);
+    void reconcileMcqBankObsoleteFlags(new Set(sopFamilyMap.keys()), bankByIdentifier);
+
+    const obsoleteMcqFamilyMap = new Map<string, typeof orphanMcqFamilies[number]>();
+    for (const fam of orphanMcqFamilies) obsoleteMcqFamilyMap.set(fam.famKey, fam);
+    for (const [famKey, fam] of markedObsoleteFamilies) {
+      if (!obsoleteMcqFamilyMap.has(famKey)) obsoleteMcqFamilyMap.set(famKey, fam);
     }
+    const obsoleteMcqFamilies = [...obsoleteMcqFamilyMap.values()].sort((a, b) =>
+      a.identifier.localeCompare(b.identifier),
+    );
 
-    // ── 3. Trainer lookup ─────────────────────────────────────────────────
+    // Active MCQ families only (must match an active SOP family)
+    const activeMcqFamilies = [...bankByIdentifier.entries()]
+      .filter(([famKey]) => sopFamilyMap.has(famKey));
+
+    // ── 3. Trainer lookup ───────────────────────────────────────────────────
     const trainers = await User.find({ role: "trainer" }).select("name department").lean();
     const trainerByDept = new Map<string, string>();
     for (const t of trainers) {
       if (t.department && !trainerByDept.has(t.department)) trainerByDept.set(t.department, t.name);
     }
 
-    // ── 4. Compute per-dept stats ─────────────────────────────────────────
+    // ── 4. Compute per-dept stats ───────────────────────────────────────────
     interface DeptAcc {
       identifiers: Set<string>;
       processAreas: Set<string>;
@@ -177,19 +135,17 @@ export async function GET() {
       remainingEng: 0, remainingGuj: 0,
     });
 
-    // Tally SOPs per dept
-    for (const [identifier, sopData] of sopFamilyMap) {
+    for (const [famKey, sopData] of sopFamilyMap) {
       const dept = sopData.dept;
       if (!deptMap.has(dept)) deptMap.set(dept, initAcc());
       const d = deptMap.get(dept)!;
-      d.identifiers.add(identifier);
+      d.identifiers.add(famKey);
       for (const pa of sopData.processAreas) d.processAreas.add(pa);
       if (sopData.languages.has("English")) d.totalSopEng++;
       if (sopData.languages.has("Gujarati")) d.totalSopGuj++;
     }
 
-    // Tally MCQBank stats per dept
-    for (const [identifier, bank] of bankByIdentifier) {
+    for (const [famKey, bank] of activeMcqFamilies) {
       const dept = bank.dept;
       if (!deptMap.has(dept)) deptMap.set(dept, initAcc());
       const d = deptMap.get(dept)!;
@@ -199,10 +155,9 @@ export async function GET() {
       d.checkedQ += bank.checkedQ;
       d.reviewedQ += bank.reviewedQ;
       d.similarQ += bank.similarQ;
-      if (bank.hasEn) { d.sopEng++; }
-      if (bank.hasGu) { d.sopGuj++; }
+      if (bank.hasEn) d.sopEng++;
+      if (bank.hasGu) d.sopGuj++;
 
-      // SOP-level approval status
       if (bank.totalQ > 0 && bank.checkedQ >= bank.totalQ) {
         d.approvedSops++;
       } else if (bank.similarQ > 0) {
@@ -212,16 +167,16 @@ export async function GET() {
       } else if (bank.totalQ > 0) {
         d.pendingSops++;
       }
+
+      void famKey; // family key used for matching only
     }
 
-    // Compute remaining (SOPs that have SOP records but no MCQ bank)
     for (const [, d] of deptMap) {
       d.remainingEng = Math.max(0, d.totalSopEng - d.sopEng);
       d.remainingGuj = Math.max(0, d.totalSopGuj - d.sopGuj);
     }
 
-    // ── 5. Build department result array ──────────────────────────────────
-    const departments = DEPARTMENT_ORDER.map((deptName) => {
+    const departments = MCQ_DEPARTMENT_ORDER.map((deptName) => {
       const d = deptMap.get(deptName) ?? initAcc();
       const sopCount = d.identifiers.size;
       return {
@@ -229,10 +184,10 @@ export async function GET() {
         sopCount,
         subcategories: d.processAreas.size || 1,
         totalQuestions: d.totalQ,
-        checkedQuestions: d.checkedQ,   // "approved"
-        reviewedQuestions: d.reviewedQ, // "partial"
+        checkedQuestions: d.checkedQ,
+        reviewedQuestions: d.reviewedQ,
         similarQuestions: d.similarQ,
-        remainingQuestions: Math.max(0, d.totalQ - d.checkedQ), // not yet checked
+        remainingQuestions: Math.max(0, d.totalQ - d.checkedQ),
         mcqCoverage: d.totalQ > 0 ? Math.round((d.checkedQ / d.totalQ) * 100) : 0,
         withEnglish: d.sopEng,
         withGujarati: d.sopGuj,
@@ -250,10 +205,6 @@ export async function GET() {
       };
     });
 
-    // No "Other" bucket: only the named departments above are reported, matching
-    // the source project (which drops every SOP/bank that resolves to "Other").
-
-    // ── 6. Overall totals ─────────────────────────────────────────────────
     const overall = departments.reduce(
       (acc, d) => {
         acc.totalUniqueSops += d.sopCount;
@@ -275,17 +226,34 @@ export async function GET() {
         return acc;
       },
       {
-        totalUniqueSops: 0, totalVersions: sops.length, totalMcqBanks: bankAgg.length,
-        mcqFound: 0, notFound: 0,
-        withEnglish: 0, withGujarati: 0,
-        approvedSops: 0, partialSops: 0, pendingSops: 0, similarSops: 0,
-        totalQuestions: 0, checkedQuestions: 0, reviewedQuestions: 0,
-        similarQuestions: 0, remainingQuestions: 0,
-        enRemaining: 0, guRemaining: 0,
+        totalUniqueSops: 0,
+        totalVersions: grouped.filter((r) => !r.isObsolete).length,
+        totalMcqBanks: bankAgg.length,
+        mcqFound: 0,
+        notFound: 0,
+        withEnglish: 0,
+        withGujarati: 0,
+        approvedSops: 0,
+        partialSops: 0,
+        pendingSops: 0,
+        similarSops: 0,
+        totalQuestions: 0,
+        checkedQuestions: 0,
+        reviewedQuestions: 0,
+        similarQuestions: 0,
+        remainingQuestions: 0,
+        enRemaining: 0,
+        guRemaining: 0,
       },
     );
 
-    return NextResponse.json({ ...overall, departments });
+    const obsoleteMcqs = {
+      count: obsoleteMcqFamilies.length,
+      identifiers: obsoleteMcqFamilies.map((f) => f.identifier),
+      totalQuestions: obsoleteMcqFamilies.reduce((s, f) => s + f.totalQ, 0),
+    };
+
+    return NextResponse.json({ ...overall, departments, obsoleteMcqs });
   } catch (error) {
     console.error("[mcq-bank/stats] error:", error);
     return NextResponse.json(
