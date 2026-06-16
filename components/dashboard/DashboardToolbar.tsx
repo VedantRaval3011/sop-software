@@ -15,6 +15,7 @@ import {
   Languages,
   MapPin,
   Plus,
+  RefreshCw,
   Shield,
   Upload,
   Video,
@@ -27,6 +28,7 @@ import { Btn } from "./ui";
 interface DashboardToolbarProps {
   stats: DashboardStats | null;
   onRefresh: () => void;
+  onHardRefresh: () => void;
   onExport: () => void;
   canMutate: boolean;
   isAdmin: boolean;
@@ -35,6 +37,7 @@ interface DashboardToolbarProps {
 export function DashboardToolbar({
   stats,
   onRefresh,
+  onHardRefresh,
   canMutate,
   isAdmin,
 }: DashboardToolbarProps) {
@@ -211,6 +214,14 @@ export function DashboardToolbar({
           </Btn>
 
           <div className="absolute right-0 top-full z-30 hidden w-56 rounded-lg border border-slate-200 bg-white py-1 shadow-xl group-hover:block">
+            {/* Hard Refresh — cold reload with console timing */}
+            <DropdownItem
+              icon={<RefreshCw className="h-3.5 w-3.5 text-indigo-500" />}
+              label="Hard Refresh (cold)"
+              onClick={onHardRefresh}
+            />
+            <div className="my-1 border-t border-slate-100" />
+
             {/* Guidelines */}
             <DropdownItem
               icon={<BookOpen className="h-3.5 w-3.5 text-indigo-600" />}

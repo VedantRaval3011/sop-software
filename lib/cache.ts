@@ -13,9 +13,27 @@ let serverGroupedCache: { items: RegistrySOP[]; expiresAt: number } | null = nul
 // The dashboard fires /api/sops and /api/sops/stats together on first load, so
 // this single guard turns a double cold-start into one.
 let serverGroupedInFlight: Promise<RegistrySOP[]> | null = null;
-const SERVER_TTL_MS = 5 * 60 * 1000;
+// Short TTL bounds cross-container staleness. The in-memory cache is per-process,
+// so a mutation on one serverless instance can't reach a sibling's warm cache — a
+// long TTL there would keep serving the pre-mutation registry. With a 60s TTL the
+// sibling revalidates quickly, and because revalidation goes through the persistent
+// grouped cache (validated by a cheap collection signature), an expiry usually costs
+// two light indexed queries, not a full re-scan. The mutating instance itself is
+// always fresh: invalidateDashboardSopsCache() drops its cache outright.
+const SERVER_TTL_MS = 60 * 1000;
 
 export function invalidateDashboardSopsCache() {
+  // Drop the cached registry entirely so the NEXT read rebuilds fresh.
+  //
+  // This used to keep the old items and mark them expired, so the cache would
+  // serve stale-while-revalidate after a mutation. That was a workaround for the
+  // old ~31s cold rebuild, but it had a correctness cost: right after marking an
+  // SOP obsolete (or reviving it), the next refresh got the PRE-mutation registry
+  // back — the change appeared to vanish — until a slow background rebuild caught
+  // up minutes later. The rebuild is now fast (no DB-side sort + a persistent
+  // grouped cache), so a blocking fresh rebuild is correct and cheap. The
+  // persistent cache self-invalidates via its collection signature (the mutation
+  // bumps updatedAt / changes the doc count), so the rebuild reads live data.
   serverGroupedCache = null;
   serverGroupedInFlight = null;
 }
@@ -30,15 +48,44 @@ export function setServerGroupedCache(items: RegistrySOP[]) {
 }
 
 /**
- * Returns the cached grouped registry, building it via `build` on a miss. When
- * several requests miss at the same time they all await the same in-flight build
- * rather than each hammering the database independently.
+ * Returns the cached grouped registry, building it via `build` on a miss.
+ *
+ * Three tiers:
+ *  1. Fresh  — TTL not yet expired → return immediately, no DB hit.
+ *  2. Stale  — TTL expired but data exists (set by invalidateDashboardSopsCache
+ *              after a mutation) → return the old data NOW so the caller gets a
+ *              fast response, and kick off a background rebuild so the next
+ *              request gets fresh data. No user ever waits 31s for a cold query.
+ *  3. Cold   — null (first load or after bustDashboardCache) → must block and
+ *              build. Concurrent callers share one in-flight promise.
  */
 export async function getOrBuildServerGroupedCache(
   build: () => Promise<RegistrySOP[]>,
 ): Promise<RegistrySOP[]> {
-  const cached = getServerGroupedCache();
-  if (cached) return cached;
+  // Tier 1: fresh
+  const fresh = getServerGroupedCache();
+  if (fresh) return fresh;
+
+  // Tier 2: stale — serve immediately, rebuild in background
+  if (serverGroupedCache?.items.length) {
+    if (!serverGroupedInFlight) {
+      serverGroupedInFlight = (async () => {
+        try {
+          const items = await build();
+          setServerGroupedCache(items);
+          return items;
+        } finally {
+          serverGroupedInFlight = null;
+        }
+      })();
+      serverGroupedInFlight.catch((e) =>
+        console.error("[cache] Background registry rebuild failed:", e),
+      );
+    }
+    return serverGroupedCache.items;
+  }
+
+  // Tier 3: cold — block until built
   if (serverGroupedInFlight) return serverGroupedInFlight;
 
   serverGroupedInFlight = (async () => {
@@ -90,6 +137,10 @@ export function writeClientCache(key: string, field: string, value: unknown) {
 }
 
 export function bustDashboardCache() {
-  invalidateDashboardSopsCache();
+  // Hard reset — null the cache entirely so the next request does a cold rebuild.
+  // Use this only for explicit user-triggered refreshes; mutations should call
+  // invalidateDashboardSopsCache() instead so stale data can be served instantly.
+  serverGroupedCache = null;
+  serverGroupedInFlight = null;
   clearClientDashboardCache();
 }

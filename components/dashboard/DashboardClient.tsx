@@ -140,6 +140,88 @@ export function DashboardClient() {
     await Promise.allSettled([fetchStats(), fetchSops()]);
   }, [fetchStats, fetchSops]);
 
+  // Hard refresh: wipes every cache layer, forces a cold sequential fetch, and
+  // reports per-API timing to the console so you can see what's slow.
+  const hardRefresh = useCallback(async () => {
+    bustDashboardCache();
+    setAllItems([]);
+    setStats(null);
+    setLoading(true);
+    setError(null);
+
+    console.group(
+      `%c[Hard Refresh] Cold reload — ${new Date().toLocaleTimeString()}`,
+      "color:#6366f1;font-weight:bold",
+    );
+
+    type Timing = { api: string; fetchMs: number; parseMs: number; totalMs: number; status: string };
+    const timings: Timing[] = [];
+
+    // Stats — sequential so timings are independent
+    {
+      const t0 = performance.now();
+      try {
+        const res = await fetch(`/api/sops/stats?_t=${Date.now()}`, { cache: "no-store" });
+        const t1 = performance.now();
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const t2 = performance.now();
+        setStats(data);
+        setDepartmentList(data.departmentList ?? []);
+        writeClientCache(DASHBOARD_STATS_CACHE_KEY, "stats", data);
+        timings.push({ api: "/api/sops/stats", fetchMs: Math.round(t1 - t0), parseMs: Math.round(t2 - t1), totalMs: Math.round(t2 - t0), status: "ok" });
+        console.log(`[Hard Refresh] /api/sops/stats  →  ${Math.round(t2 - t0)}ms  (fetch ${Math.round(t1 - t0)}ms + parse ${Math.round(t2 - t1)}ms)`);
+      } catch (e) {
+        const dur = Math.round(performance.now() - t0);
+        timings.push({ api: "/api/sops/stats", fetchMs: dur, parseMs: 0, totalMs: dur, status: "ERROR" });
+        console.error(`[Hard Refresh] /api/sops/stats  →  FAILED after ${dur}ms`, e);
+      }
+    }
+
+    // SOPs — wait for stats to finish first (maximum cold-load path)
+    {
+      const t0 = performance.now();
+      try {
+        const res = await fetch(`/api/sops?all=1&_t=${Date.now()}`, { cache: "no-store" });
+        const t1 = performance.now();
+        if (!res.ok) {
+          const err = await res.json();
+          throw new Error(err.error ?? "Failed to load SOPs");
+        }
+        const data = await res.json();
+        const t2 = performance.now();
+        setAllItems(data.items);
+        writeClientCache(DASHBOARD_CACHE_KEY, "all", data.items);
+        timings.push({ api: "/api/sops?all=1", fetchMs: Math.round(t1 - t0), parseMs: Math.round(t2 - t1), totalMs: Math.round(t2 - t0), status: "ok" });
+        console.log(`[Hard Refresh] /api/sops?all=1   →  ${Math.round(t2 - t0)}ms  (fetch ${Math.round(t1 - t0)}ms + parse ${Math.round(t2 - t1)}ms)`);
+      } catch (e) {
+        const dur = Math.round(performance.now() - t0);
+        timings.push({ api: "/api/sops?all=1", fetchMs: dur, parseMs: 0, totalMs: dur, status: "ERROR" });
+        setError(e instanceof Error ? e.message : "Failed to load");
+        setAllItems([]);
+        console.error(`[Hard Refresh] /api/sops?all=1  →  FAILED after ${dur}ms`, e);
+      }
+    }
+
+    setLoading(false);
+
+    const slowest = [...timings].sort((a, b) => b.totalMs - a.totalMs)[0];
+    console.log(
+      `%c[Hard Refresh] Slowest: ${slowest.api}  (${slowest.totalMs}ms)`,
+      "color:#f59e0b;font-weight:bold",
+    );
+    console.table(
+      timings.map(({ api, fetchMs, parseMs, totalMs, status }) => ({
+        "API": api,
+        "Fetch (ms)": fetchMs,
+        "Parse (ms)": parseMs,
+        "Total (ms)": totalMs,
+        "Status": status,
+      })),
+    );
+    console.groupEnd();
+  }, []);
+
   // Mark an SOP family obsolete with an instant, optimistic update: flip the
   // family's `isObsolete` flag locally so it leaves the active list and joins the
   // Obsolete view immediately, then recompute the dashboard stats from the same
@@ -328,6 +410,7 @@ export function DashboardClient() {
       <DashboardToolbar
         stats={stats}
         onRefresh={refresh}
+        onHardRefresh={hardRefresh}
         onExport={handleExport}
         canMutate={userCanMutate}
         isAdmin={userIsAdmin}
