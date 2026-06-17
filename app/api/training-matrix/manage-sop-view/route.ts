@@ -13,6 +13,7 @@ import {
   invalidateTrainingMatrixCache,
 } from "@/lib/trainingMatrixCache";
 import { invalidateInductionTrainingMatrixCache } from "@/lib/inductionTrainingMatrixCache";
+import { invalidateEmployeeAssignmentsCache } from "@/lib/employeeAssignments";
 import {
   getManageSopViewCacheEntry,
   getManageSopViewMemoryEntry,
@@ -1089,6 +1090,26 @@ async function buildManageSopViewResponse(
       }
     }
 
+    // Reflect manage-sop-manual designation picks in each row's deptStats so reload
+    // shows the same ticks as the grid (not only via the separate manualDesignations map).
+    for (const sop of sops) {
+      const code = stripVersion(sop.sopCode).toUpperCase();
+      const byDept = manualDesignations[code];
+      if (!byDept) continue;
+      for (const ds of sop.deptStats) {
+        const manualDesigs = byDept[ds.department];
+        if (!manualDesigs?.length) continue;
+        for (const desig of manualDesigs) {
+          const existing = ds.designations.find((d) => d.designation === desig);
+          if (existing) {
+            existing.isAssigned = true;
+          } else {
+            ds.designations.push({ designation: desig, isAssigned: true, count: 0 });
+          }
+        }
+      }
+    }
+
     const responseBuildStartMs = nowMs();
     const response: ManageSOPViewResponse = {
       sops: sops.sort((a: SOPViewRow, b: SOPViewRow) => {
@@ -1240,7 +1261,12 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     for (const e of normEntries) {
       for (const m of e.months) uploadIdKeys.add(`${e.department}|${e.year}|${m}`);
     }
-    const uniqueDepts = [...new Set(normEntries.map((e) => e.department))];
+    const uniqueDepts = [
+      ...new Set([
+        ...normEntries.map((e) => e.department),
+        ...normRemovals.map((r) => r.department),
+      ]),
+    ];
 
     const [removalResults, employeeResults, mainUploads, uploadIdResults] = await Promise.all([
       // All deletions in parallel
@@ -1288,6 +1314,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     // ── Phase 2 (parallel): all bulkWrites + all snapshot updates ───────────
     type SnapshotPatch = { sopCode: string; sopName: string; months: number[]; designations: string[] };
     const snapshotPatches = new Map<string, SnapshotPatch[]>(); // dept → patches
+    const snapshotRemovalPatches = new Map<string, NormRemoval[]>(); // dept → removals
 
     const bulkWriteOps = validEntries.map((e, idx) => {
       const emps = employeeResults[normEntries.indexOf(e)] as any[];
@@ -1322,6 +1349,36 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       });
       return ops;
     });
+
+    for (const r of normRemovals) {
+      if (!snapshotRemovalPatches.has(r.department)) snapshotRemovalPatches.set(r.department, []);
+      snapshotRemovalPatches.get(r.department)!.push(r);
+    }
+
+    // Final designation applicability per (sop, dept) — drives Training Matrix assignment rows.
+    const assignmentDesigByKey = new Map<
+      string,
+      { sopCode: string; department: string; designations: string[] }
+    >();
+    for (const e of normEntries) {
+      const key = `${stripVersion(e.sopCode)}|${e.department}`;
+      assignmentDesigByKey.set(key, {
+        sopCode: e.sopCode,
+        department: e.department,
+        designations: e.designations,
+      });
+    }
+    for (const r of normRemovals) {
+      if (!r.removeAllDesignations) continue;
+      const key = `${stripVersion(r.sopCode)}|${r.department}`;
+      if (!assignmentDesigByKey.has(key)) {
+        assignmentDesigByKey.set(key, {
+          sopCode: r.sopCode,
+          department: r.department,
+          designations: [],
+        });
+      }
+    }
 
     const [bulkResults, ...snapshotResults] = await Promise.all([
       // All bulkWrites in parallel
@@ -1376,6 +1433,56 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
           warnings.push(`Failed to sync ${dept} snapshot: ${(e as Error).message}`);
         }
       }),
+      // Clear training flags in snapshot when designations/months are removed.
+      ...[...snapshotRemovalPatches.entries()].map(async ([dept, removals]) => {
+        try {
+          const mainUpload: any = mainUploadByDept.get(dept);
+          if (!mainUpload?._id) return;
+          const snapshotEmployees: Array<{ designation?: string; training?: Record<string, boolean> }> =
+            Array.isArray(mainUpload?.snapshot?.employees) ? mainUpload.snapshot.employees : [];
+          const update: Record<string, unknown> = { $set: {} };
+          const setFields = update.$set as Record<string, boolean>;
+
+          for (const removal of removals) {
+            if (removal.removeAllDesignations) {
+              snapshotEmployees.forEach((emp, idx) => {
+                setFields[`snapshot.employees.${idx}.training.${removal.sopCode}`] = false;
+              });
+              continue;
+            }
+            const desigSet = new Set(removal.designations.map((d) => d.toLowerCase()));
+            snapshotEmployees.forEach((emp, idx) => {
+              if (desigSet.has(String(emp?.designation || "").toLowerCase())) {
+                setFields[`snapshot.employees.${idx}.training.${removal.sopCode}`] = false;
+              }
+            });
+          }
+
+          if (Object.keys(setFields).length > 0) {
+            await TrainingMatrixUpload.updateOne({ _id: mainUpload._id }, update);
+          }
+        } catch (e) {
+          warnings.push(`Failed to sync ${dept} snapshot removals: ${(e as Error).message}`);
+        }
+      }),
+      // Keep MatrixSOPAssignment.designationApplicability aligned with Manage SOP edits.
+      ...[...assignmentDesigByKey.values()].map(async (u) => {
+        try {
+          const base = stripVersion(u.sopCode);
+          await MatrixSOPAssignment.updateMany(
+            {
+              department: u.department,
+              isActive: true,
+              $or: [{ sopCode: u.sopCode }, { sopCode: base }],
+            },
+            { $set: { designationApplicability: u.designations } },
+          );
+        } catch (e) {
+          warnings.push(
+            `Failed to sync matrix assignment for ${u.sopCode} in ${u.department}: ${(e as Error).message}`,
+          );
+        }
+      }),
     ]);
 
     let totalInserted = 0, totalMatched = 0, totalUnchanged = 0;
@@ -1388,8 +1495,9 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       totalUnchanged += matched - modified;
     }
 
-    // Drop caches after all writes — best-effort, non-blocking on the response.
-    void Promise.all([
+    // Drop caches before responding so the client's ?refresh=1 fetch never reads stale data.
+    invalidateEmployeeAssignmentsCache();
+    await Promise.all([
       invalidateTrainingMatrixCache(),
       invalidateInductionTrainingMatrixCache(),
       invalidateManageSopViewCache(),

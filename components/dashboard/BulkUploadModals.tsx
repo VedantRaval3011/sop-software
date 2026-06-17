@@ -21,11 +21,14 @@ import {
   ExpectedStructureBox,
   HiddenBulkInputs,
   HowItWorksBox,
+  sopUploadToastMessage,
+  summarizeSopUploadResults,
   useBulkFileSelection,
+  type SopUploadResult,
   type UploadProgress,
 } from "./BulkUploadShell";
 
-type UploadResult = { file: string; success: boolean; error?: string };
+type UploadResult = SopUploadResult;
 
 const SKIP_PATTERN = /annexure|appendix|cover\s*page|index/i;
 
@@ -211,17 +214,14 @@ export function SopFolderUploadModal({
         (completed, total) => setUploadProgress({ completed, total }),
       );
       setResults(uploadResults);
-      const count = uploadResults.filter((r) => r.success).length;
-      if (count > 0) {
+      const summary = summarizeSopUploadResults(uploadResults);
+      if (summary.success > 0) {
         clearFiles();
-        // No post-upload reprocessing needed: each file was saved with its correct version
-        // fields and the server invalidated the dashboard cache during the upload, so the
-        // refetch triggered by onSuccess regroups fresh and shows accurate counts immediately.
-        showToast(`Uploaded ${count} file(s) — dashboard updated`);
+        showToast(sopUploadToastMessage(summary));
         onSuccess();
-        if (uploadResults.every((r) => r.success)) handleClose();
+        if (summary.failed === 0) handleClose();
       } else {
-        showToast("All files failed — see details below");
+        showToast(sopUploadToastMessage(summary));
       }
     } catch (err) {
       showToast(err instanceof Error ? err.message : "Upload failed");
@@ -398,14 +398,14 @@ export function GujaratiFolderUploadModal({
         (completed, total) => setUploadProgress({ completed, total }),
       );
       setResults(uploadResults);
-      const count = uploadResults.filter((r) => r.success).length;
-      if (count > 0) {
-        showToast(`Uploaded ${count} Gujarati file(s) successfully`);
+      const summary = summarizeSopUploadResults(uploadResults);
+      if (summary.success > 0) {
+        showToast(sopUploadToastMessage(summary));
         clearFiles();
         onSuccess();
-        if (uploadResults.every((r) => r.success)) handleClose();
+        if (summary.failed === 0) handleClose();
       } else {
-        showToast("All files failed — see details below");
+        showToast(sopUploadToastMessage(summary));
       }
     } catch (err) {
       showToast(err instanceof Error ? err.message : "Upload failed");
@@ -509,14 +509,14 @@ export function BulkPdfUploadModal({
         (completed, total) => setUploadProgress({ completed, total }),
       );
       setResults(uploadResults);
-      const count = uploadResults.filter((r) => r.success).length;
-      if (count > 0) {
-        showToast(`Uploaded ${count} PDF(s) successfully`);
+      const summary = summarizeSopUploadResults(uploadResults);
+      if (summary.success > 0) {
+        showToast(sopUploadToastMessage(summary));
         clearFiles();
         onSuccess();
-        if (uploadResults.every((r) => r.success)) handleClose();
+        if (summary.failed === 0) handleClose();
       } else {
-        showToast("All files failed — see details below");
+        showToast(sopUploadToastMessage(summary));
       }
     } catch (err) {
       showToast(err instanceof Error ? err.message : "Upload failed");

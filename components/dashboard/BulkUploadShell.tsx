@@ -141,33 +141,101 @@ export function ExpectedStructureBox() {
         The first path segment is used for department keywords (QA, QC, Microbiology, Store,
         etc.). SOP number, title, and version (e.g. V8) are detected from folder names. Prior
         revisions are kept by default. Files are stored in Bunny and processed in batches.
-        Annexure/appendix files are skipped. Only <strong>.docx</strong> is used for review and
-        effective dates. After upload, prior versions are re-scanned and dashboard counts refresh.
+        Annexure/appendix files are skipped. Only <strong>.docx</strong> is checked for EFF. DATE /
+        REVIEW DT.; invalid DOCX files are skipped in red and do not block other files in the batch.
+        After upload, prior versions are re-scanned and dashboard counts refresh.
       </p>
     </div>
   );
 }
 
+export type SopUploadResult = {
+  file: string;
+  success: boolean;
+  error?: string;
+  identifier?: string;
+  headerDateError?: boolean;
+  headerDateErrors?: string[];
+};
+
+export function summarizeSopUploadResults(results: SopUploadResult[]) {
+  const success = results.filter((r) => r.success).length;
+  const failed = results.filter((r) => !r.success);
+  const headerDateFailed = failed.filter((r) => r.headerDateError);
+  return {
+    total: results.length,
+    success,
+    failed: failed.length,
+    headerDateFailed: headerDateFailed.length,
+  };
+}
+
+export function sopUploadToastMessage(summary: ReturnType<typeof summarizeSopUploadResults>) {
+  if (summary.success === 0) {
+    if (summary.headerDateFailed > 0) {
+      return `All ${summary.total} file(s) rejected — fix EFF. DATE / REVIEW DT. in the page header`;
+    }
+    return `All ${summary.total} file(s) failed — see details below`;
+  }
+  if (summary.failed === 0) {
+    return `Uploaded ${summary.success} file(s) — dashboard updated`;
+  }
+  if (summary.headerDateFailed > 0) {
+    return `Uploaded ${summary.success} of ${summary.total} — ${summary.headerDateFailed} DOCX rejected (header dates invalid). Others saved.`;
+  }
+  return `Uploaded ${summary.success} of ${summary.total} — ${summary.failed} failed. See red items below.`;
+}
+
 export function BulkUploadResults({
   results,
 }: {
-  results: Array<{ file: string; success: boolean; error?: string }>;
+  results: SopUploadResult[];
 }) {
   if (!results.length) return null;
+  const summary = summarizeSopUploadResults(results);
   return (
-    <div className="max-h-32 space-y-1 overflow-y-auto rounded-lg border border-slate-200 p-2">
-      {results.map((r, i) => (
-        <div
-          key={`${r.file}-${i}`}
-          className={`flex items-start gap-1.5 rounded px-2 py-1 text-[10px] ${
-            r.success ? "bg-emerald-50 text-emerald-800" : "bg-red-50 text-red-700"
-          }`}
-        >
-          <span className="shrink-0 font-bold">{r.success ? "✓" : "✗"}</span>
-          <span className="min-w-0 truncate font-medium">{r.file}</span>
-          {r.error ? <span className="ml-auto shrink-0 text-red-500">{r.error}</span> : null}
-        </div>
-      ))}
+    <div className="space-y-2">
+      {summary.failed > 0 ? (
+        <p className="rounded-md border border-red-200 bg-red-50 px-2 py-1.5 text-[10px] font-medium leading-snug text-red-800">
+          {summary.success} file{summary.success === 1 ? "" : "s"} uploaded,{" "}
+          <span className="font-bold">{summary.failed} skipped</span>
+          {summary.headerDateFailed > 0
+            ? ` (${summary.headerDateFailed} with invalid EFF. DATE / REVIEW DT.)`
+            : null}
+          . Valid files were not blocked.
+        </p>
+      ) : null}
+      <div className="max-h-44 space-y-1 overflow-y-auto rounded-lg border border-slate-200 p-2">
+        {results.map((r, i) => (
+          <div
+            key={`${r.file}-${i}`}
+            className={`rounded px-2 py-1.5 text-[10px] ${
+              r.success ? "bg-emerald-50 text-emerald-800" : "bg-red-50 text-red-800"
+            }`}
+          >
+            <div className="flex min-w-0 items-start gap-1.5">
+              <span className="shrink-0 font-bold">{r.success ? "✓" : "✗"}</span>
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
+                  <span className={`font-semibold ${r.success ? "" : "text-red-700"}`}>
+                    {r.file}
+                  </span>
+                  {!r.success && r.headerDateError ? (
+                    <span className="rounded bg-red-200/80 px-1 py-px text-[8px] font-bold uppercase tracking-wide text-red-900">
+                      Header dates
+                    </span>
+                  ) : null}
+                </div>
+                {!r.success && r.error ? (
+                  <p className="mt-0.5 text-[9px] font-medium leading-snug text-red-600">
+                    {r.error}
+                  </p>
+                ) : null}
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

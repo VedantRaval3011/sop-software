@@ -247,15 +247,23 @@ function applyRecordFileLinks(
 function collectVersionFiles(records: ISOP[]) {
   const docx: { en?: string; gu?: string } = {};
   const pdf: { en?: string; gu?: string } = {};
+  const docxDateError: { en?: boolean; gu?: boolean } = {};
 
   for (const record of records) {
     if (!record.fileUrl) continue;
     const key = langKey(record.language);
-    if (record.fileType === "docx") docx[key] = record.fileUrl;
+    if (record.fileType === "docx") {
+      docx[key] = record.fileUrl;
+      if (record.headerDatesValid === false) docxDateError[key] = true;
+    }
     if (record.fileType === "pdf") pdf[key] = record.fileUrl;
   }
 
-  return { docx, pdf };
+  return {
+    docx,
+    pdf,
+    ...(docxDateError.en || docxDateError.gu ? { docxDateError } : {}),
+  };
 }
 
 function hasFile(links: { en?: string; gu?: string }, lang: "en" | "gu") {
@@ -569,22 +577,16 @@ export function groupSOPRecords(records: ISOP[]): RegistrySOP[] {
 
     const hasVersion = group.some((r) => r.version || versionFromIdentifier(r.identifier));
 
-    // Version date = the current-version docx + pdf pair for each required language
-    // carries a valid extracted date. Single-language SOPs need 2 files; dual-language
-    // SOPs need all 4 (EN docx/pdf + GU docx/pdf).
-    const currentVersionNum = versionNumber(currentVersion);
-    const hasVersionDateEn = currentVersionLangDateComplete(group, currentVersionNum, false);
-    const hasVersionDateGu = currentVersionLangDateComplete(group, currentVersionNum, true);
-    const hasVersionDate = (() => {
-      const langNeedsEn = language === "ENG" || language === "ENG-GUJ";
-      const langNeedsGu = language === "GUJ" || language === "ENG-GUJ";
-      return (langNeedsEn ? hasVersionDateEn : true) && (langNeedsGu ? hasVersionDateGu : true);
-    })();
     const { prior: priorVersions, archived: archivedVersions } = buildPriorVersions(
       group,
       currentVersion,
       language,
     );
+    // Version date = prior-version DOCX header dates in the registry window (Prior Versions column).
+    const priorDates = priorDocxHeaderDatesOk(priorVersions, language);
+    const hasVersionDateEn = priorDates.en;
+    const hasVersionDateGu = priorDates.gu;
+    const hasVersionDate = priorDates.all;
 
     const displayIdentifier =
       currentRecords.find((r) => {
@@ -661,6 +663,8 @@ type PriorVersionEntry = {
   docx?: string;
   pdf?: string;
   missing?: boolean;
+  /** DOCX header EFF. DATE / REVIEW DT. pair is missing, empty, invalid, or illogical. */
+  docxDateError?: boolean;
 };
 
 /**
@@ -682,7 +686,17 @@ function buildPriorVersions(group: ISOP[], currentVersion: string, language = "E
   const keptThreshold = currentNum - 2;
 
   // Collect every uploaded prior-version file, keyed by "<versionNum>-<lang>".
-  const uploaded = new Map<string, { versionNum: number; version: string; lang: string; docx?: string; pdf?: string }>();
+  const uploaded = new Map<
+    string,
+    {
+      versionNum: number;
+      version: string;
+      lang: string;
+      docx?: string;
+      pdf?: string;
+      headerDatesValid?: boolean;
+    }
+  >();
   for (const record of group) {
     const num = recordVersionNum(record);
     if (num >= currentNum) continue;
@@ -690,16 +704,21 @@ function buildPriorVersions(group: ISOP[], currentVersion: string, language = "E
     const key = `${num}-${lang}`;
     const entry = uploaded.get(key) ?? { versionNum: num, version: recordVersion(record), lang };
     applyRecordFileLinks(record, entry);
+    if (record.fileType === "docx") {
+      entry.headerDatesValid = record.headerDatesValid;
+    }
     uploaded.set(key, entry);
   }
 
   const prior: PriorVersionEntry[] = [];
   const archived: PriorVersionEntry[] = [];
 
-  for (const { versionNum, version, lang, docx, pdf } of uploaded.values()) {
+  for (const { versionNum, version, lang, docx, pdf, headerDatesValid } of uploaded.values()) {
     if (!docx && !pdf) continue;
-    const entry: PriorVersionEntry = { version, language: lang, docx, pdf };
-    if (versionNum >= keptThreshold) prior.push(entry);
+    const inPriorWindow = versionNum >= keptThreshold;
+    const docxDateError = inPriorWindow && Boolean(docx && headerDatesValid !== true);
+    const entry: PriorVersionEntry = { version, language: lang, docx, pdf, docxDateError };
+    if (inPriorWindow) prior.push(entry);
     else archived.push(entry);
   }
 
@@ -731,6 +750,32 @@ function buildPriorVersions(group: ISOP[], currentVersion: string, language = "E
   const byVersionDesc = (a: PriorVersionEntry, b: PriorVersionEntry) =>
     versionNumber(b.version) - versionNumber(a.version);
   return { prior: prior.sort(byVersionDesc), archived: archived.sort(byVersionDesc) };
+}
+
+/**
+ * Whether every prior-version DOCX in the registry window for one language has valid
+ * header dates (EFF. DATE / REVIEW DT.). Mirrors the green/red DOCX links in Prior Versions.
+ * SOPs with no prior DOCX slots for that language are treated as valid (nothing to flag).
+ */
+function priorDocxHeaderDatesOkForLang(
+  priorVersions: PriorVersionEntry[],
+  lang: "ENG" | "GUJ",
+): boolean {
+  const docxSlots = priorVersions.filter(
+    (pv) => pv.language === lang && pv.docx && !pv.missing,
+  );
+  return docxSlots.every((pv) => !pv.docxDateError);
+}
+
+function priorDocxHeaderDatesOk(
+  priorVersions: PriorVersionEntry[],
+  language: LanguageCode,
+): { en: boolean; gu: boolean; all: boolean } {
+  const needsEn = language === "ENG" || language === "ENG-GUJ";
+  const needsGu = language === "GUJ" || language === "ENG-GUJ";
+  const en = !needsEn || priorDocxHeaderDatesOkForLang(priorVersions, "ENG");
+  const gu = !needsGu || priorDocxHeaderDatesOkForLang(priorVersions, "GUJ");
+  return { en, gu, all: en && gu };
 }
 
 /**
@@ -1084,11 +1129,10 @@ function buildCapsule(department: string, sops: RegistrySOP[]): DepartmentCapsul
       if (needsGu(sop)) { capsule.version.docx.gu.missing++; capsule.version.pdf.gu.missing++; }
     }
 
-    // SOP-level: date-complete only when EVERY required language has real version dates.
+    // SOP-level: prior DOCX header dates valid for every required language (Prior Versions column).
     if (sop.hasVersionDate) capsule.versionDate.found++;
     else capsule.versionDate.missing++;
-    // Per-language: each language is judged on ITS OWN dates, not the combined flag, so a
-    // dual SOP with English dates but missing Gujarati dates is counted accurately on each side.
+    // Per-language: each language is judged on its own prior DOCX header dates.
     if (needsEn(sop)) {
       if (sop.hasVersionDateEn) capsule.versionDate.en.found++;
       else capsule.versionDate.en.missing++;

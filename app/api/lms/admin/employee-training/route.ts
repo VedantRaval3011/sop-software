@@ -1,0 +1,286 @@
+import { NextRequest, NextResponse } from 'next/server';
+import { getServerSession } from 'next-auth';
+import { authOptions } from '@/lib/auth';
+import { connectDB } from '@/lib/mongodb';
+import {
+  getOrBuildLmsCache,
+  lmsCacheControl,
+  lmsServerKeys,
+  lmsServerTtl,
+} from '@/lib/lmsCache';
+import Employee from '@/models/Employee';
+import LearningProgress from '@/models/lms/LearningProgress';
+import TrainingMatrixUpload from '@/models/TrainingMatrixUpload';
+import { getEmployeeAssignmentsMap } from '@/lib/employeeAssignments';
+import { getJourneyContent } from '@/lib/lmsJourneyContent';
+
+export const dynamic = 'force-dynamic';
+
+const MONTH_NAMES = [
+  '', 'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December',
+];
+
+function monthNameToNum(name: string): number | null {
+  const idx = MONTH_NAMES.findIndex(
+    (m) => m && m.toLowerCase() === String(name || '').trim().toLowerCase(),
+  );
+  return idx > 0 ? idx : null;
+}
+
+function stripVersion(code: string): string {
+  return String(code || '').toUpperCase().replace(/-\d+$/, '').trim();
+}
+
+/**
+ * The training-matrix records store one row per SOP per *tracking* month, so a
+ * single SOP repeats across several months. The authoritative *scheduled* month
+ * for each SOP lives in the latest upload snapshot's `sopMonthMap`. This builds
+ * department → (base SOP code → scheduled month numbers) from those snapshots,
+ * mirroring how the matrix UI lays SOPs out across Jan–Dec. A SOP scheduled in
+ * multiple months (e.g. "January,March") maps to each of those months.
+ */
+async function buildSopScheduleByDept(): Promise<Map<string, Map<string, number[]>>> {
+  const uploads = await TrainingMatrixUpload.find({
+    fileType: 'main',
+    'snapshot.sopMonthMap': { $exists: true },
+  })
+    .sort({ uploadedAt: -1 })
+    .select('department snapshot.sopMonthMap')
+    .lean<Array<{ department?: string; snapshot?: { sopMonthMap?: Record<string, string> } }>>();
+
+  const byDept = new Map<string, Map<string, number[]>>();
+  for (const up of uploads) {
+    const dept = String(up.department || '').trim().toLowerCase();
+    const sopMonthMap = up.snapshot?.sopMonthMap;
+    if (!dept || byDept.has(dept) || !sopMonthMap) continue; // keep latest upload per dept
+
+    const sched = new Map<string, number[]>();
+    for (const [rawKey, monthVal] of Object.entries(sopMonthMap)) {
+      const base = stripVersion(rawKey);
+      const months = String(monthVal)
+        .split(',')
+        .map((s) => monthNameToNum(s))
+        .filter((m): m is number => m !== null);
+      if (!base || months.length === 0) continue;
+      sched.set(base, [...new Set(months)]);
+    }
+    byDept.set(dept, sched);
+  }
+  return byDept;
+}
+
+/** Per training-component completion state for a single SOP. */
+export type ComponentStatus = 'completed' | 'partial' | 'not_completed' | 'na';
+/** Roll-up completion state for a single assigned SOP. */
+export type SopStatus = 'completed' | 'partial' | 'not_completed';
+
+// Which raw progress step keys feed each component column shown to the admin.
+const COMPONENT_GROUPS = {
+  videos: ['videoEn', 'videoGu'],
+  slides: ['slidesEn', 'slidesGu'],
+  sopDoc: ['sopPdf'],
+  mcq:    ['quiz'],
+} as const;
+
+type ComponentKey = keyof typeof COMPONENT_GROUPS;
+
+export interface SopBreakdown {
+  sopCode: string;
+  sopName: string;
+  status: SopStatus;
+  /** Scheduled month numbers (1 = Jan … 12 = Dec) from the matrix snapshot. */
+  months: number[];
+  /** SOP has an MCQ assessment / exam. */
+  hasExam: boolean;
+  components: Record<ComponentKey, ComponentStatus>;
+}
+
+export interface EmployeeTrainingRecord {
+  employeeId: string;
+  employeeName: string;
+  designation: string;
+  department: string;
+  isActive: boolean;
+  totalSops: number;
+  completedSops: number;
+  partialSops: number;
+  notCompletedSops: number;
+  overallPct: number;
+  /** Count of assigned SOPs per month, index 0 = Jan … 11 = Dec. */
+  monthlyCounts: number[];
+  sops: SopBreakdown[];
+}
+
+function empKey(department: string, name: string): string {
+  return `${department}||${name}`.trim().toLowerCase();
+}
+
+type StepState = { completed?: boolean } | undefined;
+
+function isStepDone(steps: Record<string, unknown> | undefined, stepId: string): boolean {
+  const s = steps?.[stepId] as StepState;
+  return Boolean(s && s.completed);
+}
+
+/** Status of a component column given the SOP's available steps + learner progress. */
+function componentStatus(
+  availableSet: Set<string>,
+  steps: Record<string, unknown> | undefined,
+  groupSteps: readonly string[],
+): ComponentStatus {
+  const present = groupSteps.filter((s) => availableSet.has(s));
+  if (present.length === 0) return 'na'; // SOP has no material of this kind
+  const done = present.filter((s) => isStepDone(steps, s)).length;
+  if (done === 0) return 'not_completed';
+  if (done === present.length) return 'completed';
+  return 'partial';
+}
+
+// GET /api/lms/admin/employee-training?department=QA
+export async function GET(req: NextRequest) {
+  const session = await getServerSession(authOptions);
+  if (!session) return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
+
+  const { searchParams } = req.nextUrl;
+  const department = searchParams.get('department');
+
+  try {
+    const body = await getOrBuildLmsCache(
+      lmsServerKeys.adminEmployeeTraining(department || 'all'),
+      lmsServerTtl.adminEmployeeTraining,
+      async () => {
+        await connectDB();
+
+        const empFilter: Record<string, unknown> = {};
+        if (department) empFilter.department = { $regex: new RegExp(`^${department}$`, 'i') };
+
+        const employees = await Employee.find(empFilter)
+          .select('_id name designation department isActive')
+          .sort({ name: 1 })
+          .lean<{ _id: unknown; name: string; designation: string; department: string; isActive: boolean }[]>();
+
+        const employeeIds = employees.map((e) => e._id);
+        const [assignmentsMap, scheduleByDept] = await Promise.all([
+          getEmployeeAssignmentsMap(),
+          buildSopScheduleByDept(),
+        ]);
+
+        // Progress keyed by employeeId + uppercased SOP code (matches the
+        // convention used by the training-status endpoint).
+        const progressList = await LearningProgress.find({ employeeId: { $in: employeeIds } })
+          .select('employeeId sopCode steps')
+          .lean();
+        const progressMap = new Map<string, Record<string, unknown>>();
+        for (const p of progressList) {
+          const id  = String((p as { employeeId: unknown }).employeeId);
+          const sop = String((p as { sopCode: string }).sopCode).toUpperCase();
+          progressMap.set(`${id}::${sop}`, (p as { steps?: Record<string, unknown> }).steps || {});
+        }
+
+        // Available steps only depend on the SOP, so resolve each unique code once.
+        const uniqueSopCodes = new Set<string>();
+        for (const emp of employees) {
+          const assignments = assignmentsMap.get(empKey(emp.department, emp.name)) ?? [];
+          for (const a of assignments) uniqueSopCodes.add(a.sopCode);
+        }
+        const contentEntries = await Promise.all(
+          [...uniqueSopCodes].map(
+            async (code) => [code, await getJourneyContent(code)] as const,
+          ),
+        );
+        const availableByCode = new Map<string, string[]>(
+          contentEntries.map(([code, content]) => [code, content.availableStepIds]),
+        );
+        // The SOP collection holds the authoritative display name; prefer it over
+        // the matrix assignment's name (which is often just the code).
+        const nameByCode = new Map<string, string>(
+          contentEntries
+            .filter(([, content]) => content.sop?.name)
+            .map(([code, content]) => [code, content.sop!.name]),
+        );
+
+        const records: EmployeeTrainingRecord[] = employees.map((emp) => {
+          const id          = String(emp._id);
+          const assignments = assignmentsMap.get(empKey(emp.department, emp.name)) ?? [];
+
+          let completedSops = 0;
+          let partialSops = 0;
+          let notCompletedSops = 0;
+          let totalSteps = 0;
+          let doneSteps = 0;
+
+          // Per-month assigned-SOP counts come from the scheduled month
+          // (sopMonthMap), not the tracking records' month.
+          const sched = scheduleByDept.get(String(emp.department || '').trim().toLowerCase());
+          const monthlyCounts = new Array(12).fill(0) as number[];
+          if (sched) {
+            for (const a of assignments) {
+              const months = sched.get(stripVersion(a.sopCode));
+              if (months) for (const m of months) monthlyCounts[m - 1]++;
+            }
+          }
+
+          const sops: SopBreakdown[] = assignments.map((a) => {
+
+            const available = availableByCode.get(a.sopCode) ?? [];
+            const availableSet = new Set(available);
+            const steps = progressMap.get(`${id}::${a.sopCode.toUpperCase()}`);
+
+            const doneCount = available.filter((s) => isStepDone(steps, s)).length;
+            totalSteps += available.length;
+            doneSteps += doneCount;
+
+            let status: SopStatus;
+            if (available.length === 0 || doneCount === 0) status = 'not_completed';
+            else if (doneCount === available.length) status = 'completed';
+            else status = 'partial';
+
+            if (status === 'completed') completedSops++;
+            else if (status === 'partial') partialSops++;
+            else notCompletedSops++;
+
+            const components = Object.fromEntries(
+              (Object.keys(COMPONENT_GROUPS) as ComponentKey[]).map((key) => [
+                key,
+                componentStatus(availableSet, steps, COMPONENT_GROUPS[key]),
+              ]),
+            ) as Record<ComponentKey, ComponentStatus>;
+
+            return {
+              sopCode: a.sopCode,
+              sopName: nameByCode.get(a.sopCode) || a.sopName || a.sopCode,
+              status,
+              months: sched?.get(stripVersion(a.sopCode)) ?? [],
+              hasExam: availableSet.has('quiz'),
+              components,
+            };
+          });
+
+          const overallPct = totalSteps > 0 ? Math.round((doneSteps / totalSteps) * 100) : 0;
+
+          return {
+            employeeId:       id,
+            employeeName:     emp.name,
+            designation:      emp.designation,
+            department:       emp.department,
+            isActive:         emp.isActive,
+            totalSops:        assignments.length,
+            completedSops,
+            partialSops,
+            notCompletedSops,
+            overallPct,
+            monthlyCounts,
+            sops,
+          };
+        });
+
+        return { records };
+      },
+    );
+
+    return NextResponse.json(body, { headers: lmsCacheControl(120) });
+  } catch (err: unknown) {
+    return NextResponse.json({ error: err instanceof Error ? err.message : String(err) }, { status: 500 });
+  }
+}

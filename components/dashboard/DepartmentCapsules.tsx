@@ -643,9 +643,10 @@ const DepartmentCard = memo(function DepartmentCard({
           onFoundClick={() => f({ versionDate: "found" })}
           onMissingClick={() => f({ versionDate: "missing" })}
         />
-        <LangPairPills
-          l1="ENG" f1={cap.versionDate.en?.found ?? 0} m1={cap.versionDate.en?.missing ?? 0}
-          l2="GUJ" f2={cap.versionDate.gu?.found ?? 0} m2={cap.versionDate.gu?.missing ?? 0}
+        <FormatLangPairRow
+          formatLabel="DOCX"
+          l1="EN" f1={cap.versionDate.en?.found ?? 0} m1={cap.versionDate.en?.missing ?? 0}
+          l2="GJ" f2={cap.versionDate.gu?.found ?? 0} m2={cap.versionDate.gu?.missing ?? 0}
           onF1={() => f({ versionDate: "found", language: "ENG" })}
           onM1={() => f({ versionDate: "missing", language: "ENG" })}
           onF2={() => f({ versionDate: "found", language: "GUJ" })}

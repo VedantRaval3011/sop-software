@@ -16,6 +16,7 @@ const SERVER_TTL_MS = {
   userProgress: 30_000,
   userDashboard: 60_000,
   adminTrainingStatus: 2 * 60_000,
+  adminEmployeeTraining: 2 * 60_000,
   adminMeta: 5 * 60_000,
   adminExamSettings: 2 * 60_000,
   certificate: 5 * 60_000,
@@ -138,6 +139,7 @@ export const lmsServerKeys = {
   journey: (employeeId: string, sopCode: string) => `lms:journey:${employeeId}:${sopCode}`,
   journeyContent: (sopCode: string) => `lms:journey-content:${sopCode.toUpperCase()}`,
   adminTrainingStatus: (department: string) => `lms:admin:training-status:${department || 'all'}`,
+  adminEmployeeTraining: (department: string) => `lms:admin:employee-training:${department || 'all'}`,
   adminMeta: () => 'lms:admin:meta',
   adminExamSettings: () => 'lms:admin:exam-settings',
 } as const;
@@ -203,6 +205,7 @@ export const lmsClientFields = {
   journey: (sopCode: string) => `journey:${sopCode}`,
   certificate: (sopCode: string) => `certificate:${sopCode}`,
   adminTrainingStatus: (dept: string) => `admin:training-status:${dept || 'all'}`,
+  adminEmployeeTraining: (dept: string) => `admin:employee-training:${dept || 'all'}`,
   adminMeta: 'admin:meta',
   adminExamSettings: 'admin:exam-settings',
 } as const;

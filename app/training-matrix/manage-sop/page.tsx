@@ -12,13 +12,14 @@ import React, {
   createContext,
   memo,
 } from 'react';
-import { Search, Download, ArrowLeft, Filter, ScrollText, Users, Tag } from 'lucide-react';
+import { Search, Download, ArrowLeft, Filter, ScrollText, Users, Tag, Wand2 } from 'lucide-react';
 import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
 import * as XLSX from 'xlsx';
 import { useAuthGuard } from '@/hooks/useAuthGuard';
 
 const MONTH_SHORT = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
+const MONTH_FULL = ['JANUARY', 'FEBRUARY', 'MARCH', 'APRIL', 'MAY', 'JUNE', 'JULY', 'AUGUST', 'SEPTEMBER', 'OCTOBER', 'NOVEMBER', 'DECEMBER'];
 
 const DEPT_ABBR: Record<string, string> = {
   QA: 'QA',
@@ -92,6 +93,11 @@ function sortDesignations(list: string[]): string[] {
 }
 
 // Strip the leading "CODE-VV_" prefix (e.g. "BSGE01-05_Handling..." -> "Handling...")
+// Match server manualAllocations / manualDesignations keys (stripVersion + uppercase).
+function sopCacheKey(code: string): string {
+  return String(code || '').toUpperCase().replace(/-\d+$/, '').trim();
+}
+
 function cleanSopName(raw: string): string {
   if (!raw) return '';
   const trimmed = raw.trim();
@@ -136,7 +142,7 @@ interface ManageSOPViewResponse {
   year: number | 'all';
 }
 
-const MANAGE_SOP_VIEW_LOCAL_CACHE_KEY = 'manage_sop_view_cache_v5';
+const MANAGE_SOP_VIEW_LOCAL_CACHE_KEY = 'manage_sop_view_cache_v6';
 const ESTIMATED_ROW_HEIGHT = 132;
 const ESTIMATED_ROW_HEIGHT_EMPLOYEE = 160;
 const EMPLOYEE_DISPLAY_COLUMNS = 3;
@@ -365,6 +371,7 @@ export default function ManageSOPDashboard() {
   }, []);
 
   const [applying, setApplying] = useState(false);
+  const [autoAssigning, setAutoAssigning] = useState(false);
   const [applyMsg, setApplyMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
 
   // Audit-log modal — lists every (sop, dept, month, year) the user has allocated
@@ -383,6 +390,8 @@ export default function ManageSOPDashboard() {
     updatedAt: string;
   }
   const [logsOpen, setLogsOpen] = useState(false);
+  const [exportMenuOpen, setExportMenuOpen] = useState(false);
+  const exportMenuRef = useRef<HTMLDivElement>(null);
   const [logs, setLogs] = useState<LogEntry[] | null>(null);
   const [logsLoading, setLogsLoading] = useState(false);
   const [logsError, setLogsError] = useState('');
@@ -502,7 +511,7 @@ export default function ManageSOPDashboard() {
     const sop = viewData.sops.find((s) => s.sopCode === addEmpModal.sopCode);
     const deptStat = sop?.deptStats.find((d) => d.department === addEmpModal.dept);
     const manualMonths =
-      viewData.manualAllocations?.[addEmpModal.sopCode.toUpperCase()]?.[addEmpModal.dept] || [];
+      viewData.manualAllocations?.[sopCacheKey(addEmpModal.sopCode)]?.[addEmpModal.dept] || [];
     const sopMonth = monthCells[addEmpModal.sopCode] || EMPTY_INNER;
     let hasSelectedMonth = false;
     for (let m = 1; m <= 12; m++) {
@@ -581,12 +590,20 @@ export default function ManageSOPDashboard() {
   //   - `removals`: unchecked month cells (or unchecked designations) to delete from
   //     manual allocations.
   // This ensures unchecking is persisted instead of being treated as "nothing to save".
-  const applyChanges = async () => {
+  const applyChanges = async (
+    monthCellsArg: PerSop = monthCells,
+    overridesArg: PerSop = overrides,
+  ) => {
     if (!viewData) return;
     setApplyMsg(null);
 
     const designationsByDept = viewData.designationsByDept || {};
     const manualDesignations = viewData.manualDesignations || {};
+    const manualAllocations = viewData.manualAllocations || {};
+    const departments = viewData.departments || [];
+    const allDesignations = sortDesignations([
+      ...new Set(Object.values(designationsByDept).flat()),
+    ]);
     const currentYear = new Date().getFullYear();
     const grouped = new Map<
       string,
@@ -602,88 +619,139 @@ export default function ManageSOPDashboard() {
       year: number;
     }> = [];
 
-    for (const [sopCode, innerCells] of Object.entries(monthCells)) {
-      const sopOverrides = overrides[sopCode] || {};
-      for (const [k, on] of Object.entries(innerCells)) {
-        const [dept, monthStr] = k.split('|');
-        const month = parseInt(monthStr, 10);
-        if (!dept || !Number.isInteger(month)) continue;
+    const sopCodesToProcess = new Set<string>();
+    for (const k of Object.keys(overridesArg)) {
+      if (JSON.stringify(overridesArg[k] || {}) !== JSON.stringify(appliedOverrides[k] || {})) {
+        sopCodesToProcess.add(k);
+      }
+    }
+    for (const k of Object.keys(monthCellsArg)) {
+      if (JSON.stringify(monthCellsArg[k] || {}) !== JSON.stringify(appliedMonthCells[k] || {})) {
+        sopCodesToProcess.add(k);
+      }
+    }
 
-        const sop = viewData.sops.find(s => s.sopCode === sopCode);
-        if (!sop) continue;
+    if (sopCodesToProcess.size === 0) {
+      setApplyMsg({ kind: 'ok', text: 'No changes to apply.' });
+      return;
+    }
 
-        // Resolve "checked designations" the same way the UI displays them: a designation
-        // counts as checked if (a) the user explicitly toggled it on, OR (b) there is no
-        // override AND the fallback from MatrixSOPAssignment says it's assigned. Without
-        // this, selecting only the month cell for an already-assigned SOP saves nothing
-        // ("0 updates").
-        const deptStat = sop.deptStats.find(s => s.department === dept);
-        const allDeptDesigs = sortDesignations(designationsByDept[dept] || []);
-        const manualDesigList = (manualDesignations[sopCode.toUpperCase()]?.[dept] || []);
-        const realDesigs = allDeptDesigs.filter(fullName => {
-          const key = desigKey(dept, fullName);
-          if (key in sopOverrides) return !!sopOverrides[key];
-          // Fallback: match the same 3-way logic the month-cell "active" check uses,
-          // so a month cell that the UI allows clicking always produces an insertion.
-          return (deptStat?.designations || []).some(
-            d => d.designation === fullName && (d.isAssigned || (d.count || 0) > 0)
-          ) || manualDesigList.includes(fullName);
+    const resolveCheckedDesignations = (
+      dept: string,
+      sopOverrides: Record<string, boolean>,
+      deptStat: ManageSOPViewResponse['sops'][0]['deptStats'][0] | undefined,
+      manualDesigList: string[],
+    ): string[] =>
+      allDesignations.filter((fullName) => {
+        const key = desigKey(dept, fullName);
+        if (key in sopOverrides) return !!sopOverrides[key];
+        return (
+          (deptStat?.designations || []).some(
+            (d) => d.designation === fullName && (d.isAssigned || (d.count || 0) > 0),
+          ) || manualDesigList.includes(fullName)
+        );
+      });
+
+    const resolveMonthSelected = (
+      dept: string,
+      month: number,
+      sopMonthCells: Record<string, boolean>,
+      manualMonths: number[],
+      scheduledMonth?: number | null,
+    ): boolean => {
+      const key = cellInnerKey(dept, month);
+      const persisted = manualMonths.includes(month) || scheduledMonth === month;
+      return key in sopMonthCells ? !!sopMonthCells[key] : persisted;
+    };
+
+  // Walk every edited SOP × dept × month using the same effective state the grid shows.
+    // Previously we only iterated explicit monthCells edits, so designation-only
+    // changes against persisted schedule/month cells produced "0 updates".
+    for (const sop of viewData.sops) {
+      if (!sopCodesToProcess.has(sop.sopCode)) continue;
+      const sopCode = sop.sopCode;
+      const sopOverrides = overridesArg[sopCode] || {};
+      const sopMonthCells = monthCellsArg[sopCode] || {};
+      const manualMonthsByDept = manualAllocations[sopCacheKey(sopCode)] || {};
+      const manualDesigsByDept = manualDesignations[sopCacheKey(sopCode)] || {};
+
+      for (const dept of departments) {
+        const deptStat = sop.deptStats.find((s) => s.department === dept);
+        const manualMonths = manualMonthsByDept[dept] || [];
+        const manualDesigList = manualDesigsByDept[dept] || [];
+        const realDesigs = resolveCheckedDesignations(dept, sopOverrides, deptStat, manualDesigList);
+        const hasDesigOverride = Object.keys(sopOverrides).some((k) => k.startsWith(`${dept}|`));
+
+        let monthsToProcess = Array.from({ length: 12 }, (_, i) => {
+          const month = i + 1;
+          return {
+            month,
+            on: resolveMonthSelected(dept, month, sopMonthCells, manualMonths, deptStat?.scheduledMonth),
+          };
         });
 
-        // Explicitly unchecked month cell => remove all manual allocations for that cell.
-        if (!on) {
-          removals.push({
-            sopCode,
-            sopName: sop.sopName,
-            department: dept,
-            months: [month],
-            removeAllDesignations: true,
-            year: currentYear,
-          });
-          continue;
+        if (!monthsToProcess.some((m) => m.on) && realDesigs.length > 0 && hasDesigOverride) {
+          const fallback = deptStat?.scheduledMonth || manualMonths[0] || (new Date().getMonth() + 1);
+          monthsToProcess = monthsToProcess.map((m) =>
+            m.month === fallback ? { ...m, on: true } : m,
+          );
         }
 
-        if (realDesigs.length === 0) {
-          // Month is selected but no designation is selected anymore => clear existing
-          // manual allocations for this (sop, dept, month).
-          removals.push({
-            sopCode,
-            sopName: sop.sopName,
-            department: dept,
-            months: [month],
-            removeAllDesignations: true,
-            year: currentYear,
-          });
-          continue;
-        }
+        for (const { month, on } of monthsToProcess) {
+          if (!on) {
+            if (manualMonths.includes(month) || sopMonthCells[cellInnerKey(dept, month)] === false) {
+              removals.push({
+                sopCode,
+                sopName: sop.sopName,
+                department: dept,
+                months: [month],
+                removeAllDesignations: true,
+                year: currentYear,
+              });
+            }
+            continue;
+          }
 
-        const groupKey = `${sopCode}|${dept}`;
-        let entry = grouped.get(groupKey);
-        if (!entry) {
-          entry = {
-            sopCode,
-            sopName: sop.sopName,
-            department: dept,
-            designations: new Set<string>(),
-            months: new Set<number>(),
-          };
-          grouped.set(groupKey, entry);
-        }
-        realDesigs.forEach(d => entry!.designations.add(d));
-        entry.months.add(month);
+          if (realDesigs.length === 0) {
+            removals.push({
+              sopCode,
+              sopName: sop.sopName,
+              department: dept,
+              months: [month],
+              removeAllDesignations: true,
+              year: currentYear,
+            });
+            continue;
+          }
 
-        const realSet = new Set(realDesigs);
-        const deselectedDesigs = allDeptDesigs.filter(d => !realSet.has(d));
-        if (deselectedDesigs.length > 0) {
-          removals.push({
-            sopCode,
-            sopName: sop.sopName,
-            department: dept,
-            designations: deselectedDesigs,
-            months: [month],
-            removeAllDesignations: false,
-            year: currentYear,
-          });
+          const groupKey = `${sopCode}|${dept}`;
+          let entry = grouped.get(groupKey);
+          if (!entry) {
+            entry = {
+              sopCode,
+              sopName: sop.sopName,
+              department: dept,
+              designations: new Set<string>(),
+              months: new Set<number>(),
+            };
+            grouped.set(groupKey, entry);
+          }
+          realDesigs.forEach((d) => entry!.designations.add(d));
+          entry.months.add(month);
+
+          const realSet = new Set(realDesigs);
+          const deselectedDesigs = allDesignations.filter((d) => !realSet.has(d));
+          if (deselectedDesigs.length > 0) {
+            removals.push({
+              sopCode,
+              sopName: sop.sopName,
+              department: dept,
+              designations: deselectedDesigs,
+              months: [month],
+              removeAllDesignations: false,
+              year: currentYear,
+            });
+          }
         }
       }
     }
@@ -698,9 +766,8 @@ export default function ManageSOPDashboard() {
     }));
 
     if (entries.length === 0 && removals.length === 0) {
-      // Nothing to persist — still snapshot the local preview state for visual feedback.
-      setAppliedOverrides({ ...overrides });
-      setAppliedMonthCells({ ...monthCells });
+      setAppliedOverrides({ ...overridesArg });
+      setAppliedMonthCells({ ...monthCellsArg });
       setApplyMsg({ kind: 'ok', text: 'No changes to apply.' });
       return;
     }
@@ -715,58 +782,74 @@ export default function ManageSOPDashboard() {
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error || 'Apply failed');
 
-      setAppliedOverrides({ ...overrides });
-      setAppliedMonthCells({ ...monthCells });
+      const warnings: string[] = Array.isArray(data?.warnings) ? data.warnings : [];
       setApplyMsg({
-        kind: 'ok',
-        text: `Updated training records: ${data.inserted || 0} added${data.updated ? `, ${data.updated} updated` : ''}${data.removed ? `, ${data.removed} removed` : ''}${data.unchanged ? `; ${data.unchanged} already existed` : ''}${data.inserted === 0 && !data.updated && !data.removed && !data.unchanged ? ' — no matching employees or records found' : ''}.`,
+        kind: warnings.length > 0 ? 'err' : 'ok',
+        text:
+          `Updated training records: ${data.inserted || 0} added${data.updated ? `, ${data.updated} updated` : ''}${data.removed ? `, ${data.removed} removed` : ''}${data.unchanged ? `; ${data.unchanged} already existed` : ''}${data.inserted === 0 && !data.updated && !data.removed && !data.unchanged ? ' — no matching employees or records found' : ''}.` +
+          // Surface the per-entry warnings (e.g. ticked a designation with no employees in
+          // that department) so a partial/no-op save isn't a silent revert of the ticks.
+          (warnings.length > 0
+            ? ` Some selections were not saved: ${warnings.join('; ')}`
+            : ''),
       });
 
-      // Both matrix pages cache overview payloads in localStorage for 5 minutes.
-      // Clear both so navigating back to either shows fresh counts after Update.
+      // Bust client + matrix overview caches so reload and navigation see fresh data.
       try {
         if (typeof window !== 'undefined') {
+          localStorage.removeItem(MANAGE_SOP_VIEW_LOCAL_CACHE_KEY);
           localStorage.removeItem('training_matrix_overview_cache_v5');
           localStorage.removeItem('induction_training_matrix_overview_cache_v5');
         }
       } catch { /* storage unavailable — non-fatal */ }
 
-      // Optimistically update manualAllocations/manualDesignations so that the
-      // highlighted cells survive a page reload without waiting for a full rebuild.
-      setViewData(prev => {
-        if (!prev) return prev;
-        const newAllocs: Record<string, Record<string, number[]>> = JSON.parse(JSON.stringify(prev.manualAllocations || {}));
-        const newDesigs: Record<string, Record<string, string[]>> = JSON.parse(JSON.stringify(prev.manualDesignations || {}));
+      // Commit the just-saved edits as the new baseline immediately. This keeps the
+      // ticks/counts the user set on screen even if the rebuild below is slow or fails —
+      // the local override buffers (overrides/monthCells) still drive the checkboxes,
+      // and appliedOverrides/appliedMonthCells keep the live counts in sync.
+      setAppliedOverrides({ ...overridesArg });
+      setAppliedMonthCells({ ...monthCellsArg });
 
-        for (const removal of removals) {
-          const code = removal.sopCode.toUpperCase();
-          if (!newAllocs[code]?.[removal.department]) continue;
-          newAllocs[code][removal.department] = newAllocs[code][removal.department].filter(m => !removal.months.includes(m));
-        }
-        for (const entry of entries) {
-          const code = entry.sopCode.toUpperCase();
-          if (!newAllocs[code]) newAllocs[code] = {};
-          const existing = newAllocs[code][entry.department] || [];
-          newAllocs[code][entry.department] = [...new Set([...existing, ...entry.months])];
-          if (entry.designations.length > 0) {
-            if (!newDesigs[code]) newDesigs[code] = {};
-            const existingDesigs = newDesigs[code][entry.department] || [];
-            newDesigs[code][entry.department] = [...new Set([...existingDesigs, ...entry.designations])];
+      // Rebuild from DB (await) — do not rely on optimistic patches that can drift.
+      let fresh: ManageSOPViewResponse | null = null;
+      try {
+        const freshRes = await fetch('/api/training-matrix/manage-sop-view?year=all&refresh=1', {
+          cache: 'no-store',
+        });
+        fresh = freshRes.ok ? await freshRes.json() : null;
+      } catch {
+        fresh = null;
+      }
+
+      if (fresh) {
+        setViewData(fresh);
+        try {
+          if (typeof window !== 'undefined') {
+            localStorage.setItem(MANAGE_SOP_VIEW_LOCAL_CACHE_KEY, JSON.stringify(fresh));
           }
-        }
+        } catch { /* non-fatal */ }
 
-        return { ...prev, manualAllocations: newAllocs, manualDesignations: newDesigs };
-      });
-
-      // Background refresh to update count bubbles — non-blocking so the UI stays
-      // responsive immediately after Update. Use refresh=1 so the server rebuilds
-      // synchronously AND pulls a fresh overview snapshot; otherwise the
-      // Total/Assigned/Unassigned cards keep showing the pre-save counts (the
-      // cached overview that drives the unassigned list is stale until recomputed).
-      fetch(`/api/training-matrix/manage-sop-view?year=all&refresh=1`, { cache: 'no-store' })
-        .then(r => r.ok ? r.json() : null)
-        .then(fresh => { if (fresh) setViewData(fresh); })
-        .catch(() => {});
+        // Server truth now includes these edits — drop the local edit buffers so the
+        // checkboxes read straight from the refreshed snapshot. Only safe to clear AFTER
+        // fresh data has been applied; otherwise the grid would revert to the pre-save
+        // view and the just-made ticks would disappear.
+        const clearSopLocalState = (prev: PerSop, codes: Set<string>) => {
+          const next = { ...prev };
+          for (const code of codes) delete next[code];
+          return next;
+        };
+        setOverrides((prev) => clearSopLocalState(prev, sopCodesToProcess));
+        setMonthCells((prev) => clearSopLocalState(prev, sopCodesToProcess));
+        setAppliedOverrides((prev) => clearSopLocalState(prev, sopCodesToProcess));
+        setAppliedMonthCells((prev) => clearSopLocalState(prev, sopCodesToProcess));
+      } else {
+        // Rebuild failed/aborted: keep the local edit buffers so the ticks the user just
+        // saved stay visible. The next page load reads the persisted records from the DB.
+        setApplyMsg((prev) => ({
+          kind: 'ok',
+          text: `${prev?.text ? prev.text + ' ' : ''}(Saved — the view will fully refresh on next reload.)`,
+        }));
+      }
     } catch (err) {
       setApplyMsg({
         kind: 'err',
@@ -774,6 +857,158 @@ export default function ManageSOPDashboard() {
       });
     } finally {
       setApplying(false);
+    }
+  };
+
+  // ─── Auto-Assign ──────────────────────────────────────────────────────────────
+  // Spread every currently-unassigned SOP across the calendar year. The allocator is
+  // a greedy least-loaded-month pass:
+  //   • monthLoad is seeded from the existing per-month SOP counts, so already-scheduled
+  //     SOPs are respected and the spread balances on top of them.
+  //   • Each SOP is placed in the lightest month, breaking ties toward its department's
+  //     existing timeframe so SOPs of the same department cluster together.
+  // Only unassigned SOPs are touched; existing assignments are never modified. The
+  // computed selection is fed through the same persistence path as a manual Update.
+  const AUTO_ASSIGN_AFFINITY_WEIGHT = 0.5;
+  const autoAssign = async () => {
+    if (!viewData || autoAssigning || applying) return;
+    setApplyMsg(null);
+
+    const designationsByDept = viewData.designationsByDept || {};
+    const deptHasDesigs = (d: string) => (designationsByDept[d]?.length || 0) > 0;
+
+    // Resolve each unassigned SOP to a target department that actually has employees
+    // (designations). Without a resolvable department we can't create training records,
+    // so such SOPs are reported as skipped rather than mis-assigned.
+    type Plan = { sopCode: string; sopName: string; dept: string; designations: string[] };
+    const plans: Plan[] = [];
+    let skipped = 0;
+    for (const sop of viewData.sops) {
+      if (!unassignedSet.has(sop.sopCode.toUpperCase())) continue;
+      // Defensive: never touch an SOP that is already scheduled somewhere.
+      if (sop.deptStats.some((ds) => ds.scheduledMonth)) continue;
+
+      let dept =
+        sop.primaryDepartment && deptHasDesigs(sop.primaryDepartment)
+          ? sop.primaryDepartment
+          : '';
+      if (!dept) {
+        let best = '';
+        let bestScore = -1;
+        for (const ds of sop.deptStats) {
+          if (!deptHasDesigs(ds.department)) continue;
+          const score = ds.designations.filter((d) => d.isAssigned || (d.count || 0) > 0).length;
+          if (score > bestScore) {
+            bestScore = score;
+            best = ds.department;
+          }
+        }
+        dept = best;
+      }
+      if (!dept) {
+        skipped += 1;
+        continue;
+      }
+      plans.push({
+        sopCode: sop.sopCode,
+        sopName: sop.sopName,
+        dept,
+        designations: sortDesignations(designationsByDept[dept] || []),
+      });
+    }
+
+    if (plans.length === 0) {
+      setApplyMsg({
+        kind: 'ok',
+        text: skipped > 0
+          ? `No assignable SOPs — ${skipped} unassigned SOP(s) have no department with employees.`
+          : 'No unassigned SOPs to assign.',
+      });
+      return;
+    }
+
+    const ok = typeof window === 'undefined'
+      ? true
+      : window.confirm(
+          `Auto-assign ${plans.length} unassigned SOP(s) across the year?\n\n` +
+          `Each is scheduled into the least-busy month for its department and saved into ` +
+          `the training matrix. Existing assignments are not changed.` +
+          (skipped > 0 ? `\n\n${skipped} SOP(s) will be skipped (no department with employees).` : ''),
+        );
+    if (!ok) return;
+
+    // monthLoad[1..12] — existing global SOP count per month, grown as we place SOPs.
+    const monthLoad: number[] = Array.from({ length: 13 }, (_, m) =>
+      m === 0 ? 0 : viewData.sopCountsByMonth?.[m] || 0,
+    );
+
+    // Group by department and process in the canonical department order so each
+    // department is laid down as one timeframe-clustered block.
+    const byDept = new Map<string, Plan[]>();
+    for (const p of plans) {
+      const list = byDept.get(p.dept);
+      if (list) list.push(p);
+      else byDept.set(p.dept, [p]);
+    }
+
+    const chosenMonth = new Map<Plan, number>();
+    for (const dept of viewData.departments || []) {
+      const group = byDept.get(dept);
+      if (!group) continue;
+      group.sort((a, b) => a.sopCode.localeCompare(b.sopCode));
+
+      // Seed the affinity centre from the department's EXISTING assignments so new
+      // SOPs cluster near where the department already trains.
+      const existing = viewData.sopCountsByDeptMonth?.[dept] || {};
+      let sumMonth = 0;
+      let cnt = 0;
+      for (let m = 1; m <= 12; m++) {
+        const c = existing[m] || 0;
+        sumMonth += m * c;
+        cnt += c;
+      }
+
+      for (const p of group) {
+        const center = cnt > 0 ? sumMonth / cnt : null;
+        let best = 1;
+        let bestScore = Infinity;
+        for (let m = 1; m <= 12; m++) {
+          const affinity = center === null ? 0 : Math.abs(m - center);
+          const score = monthLoad[m] + affinity * AUTO_ASSIGN_AFFINITY_WEIGHT;
+          if (score < bestScore - 1e-9) {
+            bestScore = score;
+            best = m;
+          }
+        }
+        chosenMonth.set(p, best);
+        monthLoad[best] += 1;
+        sumMonth += best;
+        cnt += 1;
+      }
+    }
+
+    // Translate the plan into the same month-cell + designation selections the manual
+    // editor produces, then drive it through applyChanges with an explicit payload
+    // (state updates are async, so we can't rely on monthCells/overrides being set yet).
+    const newMonthCells: PerSop = { ...monthCells };
+    const newOverrides: PerSop = { ...overrides };
+    for (const [p, month] of chosenMonth) {
+      newMonthCells[p.sopCode] = {
+        ...(newMonthCells[p.sopCode] || {}),
+        [cellInnerKey(p.dept, month)]: true,
+      };
+      const inner = { ...(newOverrides[p.sopCode] || {}) };
+      for (const d of p.designations) inner[desigKey(p.dept, d)] = true;
+      newOverrides[p.sopCode] = inner;
+    }
+
+    setAutoAssigning(true);
+    try {
+      setMonthCells(newMonthCells);
+      setOverrides(newOverrides);
+      await applyChanges(newMonthCells, newOverrides);
+    } finally {
+      setAutoAssigning(false);
     }
   };
 
@@ -829,11 +1064,13 @@ export default function ManageSOPDashboard() {
     }
 
     const controller = new AbortController();
-    const fetchData = async (refresh = false) => {
+    const fetchData = async () => {
       try {
         if (!viewData && !cached) setLoading(true);
         else setRefreshing(true);
-        const url = `/api/training-matrix/manage-sop-view?year=all${refresh ? '&refresh=1' : ''}`;
+        // Always rebuild on load so a reload never reapplies a stale server snapshot
+        // over fresher data written by the last Update.
+        const url = '/api/training-matrix/manage-sop-view?year=all&refresh=1';
         const res = await fetch(url, { cache: 'no-store', signal: controller.signal });
         if (!res.ok) throw new Error('Failed to fetch');
         const data: ManageSOPViewResponse = await res.json();
@@ -859,7 +1096,7 @@ export default function ManageSOPDashboard() {
         }
       }
     };
-    void fetchData(false);
+    void fetchData();
     return () => controller.abort();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -921,9 +1158,9 @@ export default function ManageSOPDashboard() {
         // allocated (training checked + at least one selected month in that dept).
         const sopOverrides = overrides[sop.sopCode] || EMPTY_INNER;
         const sopMonth = monthCells[sop.sopCode] || EMPTY_INNER;
-        const sopManual = viewData.manualAllocations?.[sop.sopCode.toUpperCase()] || EMPTY_MANUAL;
+        const sopManual = viewData.manualAllocations?.[sopCacheKey(sop.sopCode)] || EMPTY_MANUAL;
         const sopManualDesigs =
-          viewData.manualDesignations?.[sop.sopCode.toUpperCase()] || EMPTY_MANUAL_DESIG;
+          viewData.manualDesignations?.[sopCacheKey(sop.sopCode)] || EMPTY_MANUAL_DESIG;
         const employeesByDept = viewData.employeesByDept || EMPTY_EMP_BY_DEPT;
 
         for (const dept of viewData.departments || []) {
@@ -1123,7 +1360,7 @@ export default function ManageSOPDashboard() {
     const out = new Set<string>();
     for (const ds of sop.deptStats) {
       if (deptFilter && ds.department !== deptFilter) continue;
-      const manualDesigList = (viewData?.manualDesignations?.[sop.sopCode.toUpperCase()]?.[ds.department] || []);
+      const manualDesigList = (viewData?.manualDesignations?.[sopCacheKey(sop.sopCode)]?.[ds.department] || []);
       const sopOverrides = overrides[sop.sopCode] || {};
       const deptUniverse = sortDesignations(designationsByDeptRef.current[ds.department] || []);
 
@@ -1296,47 +1533,135 @@ export default function ManageSOPDashboard() {
     return () => window.removeEventListener('keydown', onKey);
   }, [popup]);
 
-  const handleExport = () => {
-    if (!viewData) return;
-    const departments = viewData.departments || [];
-    const rows = filteredSops.map((sop, idx) => {
-      const deptDesigText = departments
-        .map(dept => {
-          const deptStat = sop.deptStats.find(s => s.department === dept);
-          const deptDesigs = sortDesignations(viewData.designationsByDept?.[dept] || []);
-          const tokens = deptDesigs.map(fullName => {
-            const isAssigned = (deptStat?.designations || []).some(
-              d => d.designation === fullName && d.isAssigned
-            );
-            return `${isAssigned ? '[x]' : '[ ]'} ${desigAbbr(fullName)}`;
-          });
-          return `${DEPT_ABBR[dept]}: ${tokens.join('  ')}`;
-        })
-        .join('\n');
+  // Close the export dropdown on outside click.
+  useEffect(() => {
+    if (!exportMenuOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (exportMenuRef.current && !exportMenuRef.current.contains(e.target as Node)) {
+        setExportMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [exportMenuOpen]);
 
-      const monthText = MONTH_SHORT.map((m, mIdx) => {
-        const monthNum = mIdx + 1;
-        const entries = departments.map(dept => {
-          const ds = sop.deptStats.find(s => s.department === dept);
-          return { dept, count: ds?.monthlyCounts[monthNum] || 0 };
-        });
-        return `${m}\n${entries.map(e => `  ${DEPT_ABBR[e.dept]} (${e.count})`).join('\n')}`;
-      }).join('\n\n');
+  // Build a department training-matrix worksheet matching the reference Excel format
+  // (docs/excel/*.xlsx):
+  //   • Row 1: "Employee Name" | "Designation" | <MONTH names> (each month merged
+  //            across the SOP columns scheduled in that month)
+  //   • Row 2: blank | blank | <SOP codes>
+  //   • Body : one row per employee → name, designation, then √ / X per SOP
+  //            (√ when the SOP is assigned to that employee's designation in this dept).
+  // Returns null when the department has no assigned SOPs so it can be skipped.
+  const buildDeptMatrixSheet = (dept: string): XLSX.WorkSheet | null => {
+    if (!viewData) return null;
+    const designationsByDept = viewData.designationsByDept || {};
+    const manualDesignations = viewData.manualDesignations || {};
+    const manualAllocations = viewData.manualAllocations || {};
+    const employees = viewData.employeesByDept?.[dept] || [];
+    const deptDesigs = sortDesignations(designationsByDept[dept] || []);
 
-      return {
-        'SR NO': idx + 1,
-        'SOP NO': sop.sopCode,
-        'SOP NAME': sop.sopName + (sop.gujaratiName ? ` / ${sop.gujaratiName}` : ''),
-        'DEPARTMENT WITH DESIGNATION': deptDesigText,
-        'MONTHS': monthText,
-        'TOTAL': sop.grandTotal
-      };
+    type Col = { code: string; month: number; assigned: Set<string> };
+    const cols: Col[] = [];
+    for (const sop of viewData.sops) {
+      const cacheKey = sopCacheKey(sop.sopCode);
+      const deptStat = sop.deptStats.find(s => s.department === dept);
+      const manualDesigList = manualDesignations[cacheKey]?.[dept] || [];
+      const assigned = new Set(
+        deptDesigs.filter(fullName =>
+          (deptStat?.designations || []).some(
+            d => d.designation === fullName && (d.isAssigned || (d.count || 0) > 0),
+          ) || manualDesigList.includes(fullName),
+        ),
+      );
+      if (assigned.size === 0) continue; // not assigned to this department
+
+      let month = deptStat?.scheduledMonth || 0;
+      if (!month) {
+        const ms = manualAllocations[cacheKey]?.[dept] || [];
+        if (ms.length) month = Math.min(...ms);
+      }
+      cols.push({ code: sop.sopCode, month, assigned });
+    }
+
+    if (cols.length === 0) return null;
+
+    // Scheduled SOPs first (Jan → Dec), unscheduled (month 0) last; sopCode within a month.
+    cols.sort((a, b) => {
+      const ma = a.month || 13;
+      const mb = b.month || 13;
+      if (ma !== mb) return ma - mb;
+      return a.code.localeCompare(b.code);
     });
 
-    const ws = XLSX.utils.json_to_sheet(rows);
+    const monthLabel = (m: number) => (m >= 1 && m <= 12 ? MONTH_FULL[m - 1] : 'NOT SCHEDULED');
+
+    // Header rows.
+    const headerMonths: (string | number)[] = ['Employee Name', 'Designation'];
+    const headerCodes: (string | number)[] = ['', ''];
+    const merges: XLSX.Range[] = [
+      { s: { c: 0, r: 0 }, e: { c: 0, r: 1 } }, // Employee Name
+      { s: { c: 1, r: 0 }, e: { c: 1, r: 1 } }, // Designation
+    ];
+    let groupStart = 0;
+    cols.forEach((col, i) => {
+      const colIdx = i + 2; // SOP columns start at column C
+      headerCodes.push(col.code);
+      const isGroupStart = i === 0 || col.month !== cols[i - 1].month;
+      headerMonths.push(isGroupStart ? monthLabel(col.month) : '');
+      // When a month group ends, emit its horizontal merge across the header row.
+      const isGroupEnd = i === cols.length - 1 || col.month !== cols[i + 1].month;
+      if (isGroupStart) groupStart = colIdx;
+      if (isGroupEnd && colIdx > groupStart) {
+        merges.push({ s: { c: groupStart, r: 0 }, e: { c: colIdx, r: 0 } });
+      }
+    });
+
+    const aoa: (string | number)[][] = [headerMonths, headerCodes];
+    for (const emp of employees) {
+      const row: (string | number)[] = [emp.name, emp.designation];
+      for (const col of cols) {
+        row.push(col.assigned.has(emp.designation) ? '√' : 'X');
+      }
+      aoa.push(row);
+    }
+
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    ws['!merges'] = merges;
+    ws['!cols'] = [{ wch: 22 }, { wch: 16 }, ...cols.map(() => ({ wch: 9 }))];
+    return ws;
+  };
+
+  // target: 'all' → one workbook with a sheet per department; otherwise a single dept file.
+  const handleExport = (target: 'all' | string = 'all') => {
+    if (!viewData) return;
+    setExportMenuOpen(false);
+    const departments = viewData.departments || [];
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Manage SOPs');
-    XLSX.writeFile(wb, `manage-sop-${new Date().toISOString().split('T')[0]}.xlsx`);
+    const date = new Date().toISOString().split('T')[0];
+
+    if (target === 'all') {
+      let any = false;
+      for (const dept of departments) {
+        const ws = buildDeptMatrixSheet(dept);
+        if (!ws) continue;
+        XLSX.utils.book_append_sheet(wb, ws, dept.slice(0, 31));
+        any = true;
+      }
+      if (!any) {
+        setApplyMsg({ kind: 'err', text: 'No assigned SOPs to export.' });
+        return;
+      }
+      XLSX.writeFile(wb, `Training Matrix_All Departments_${date}.xlsx`);
+    } else {
+      const ws = buildDeptMatrixSheet(target);
+      if (!ws) {
+        setApplyMsg({ kind: 'err', text: `No assigned SOPs for ${target}.` });
+        return;
+      }
+      XLSX.utils.book_append_sheet(wb, ws, target.slice(0, 31));
+      XLSX.writeFile(wb, `Training Matrix_${target}_${date}.xlsx`);
+    }
   };
 
   // Single horizontal scroll bar pinned to the viewport bottom. The bar is a
@@ -1469,8 +1794,17 @@ export default function ManageSOPDashboard() {
               <Filter className="w-4 h-4" />
             </button>
             <button
-              onClick={applyChanges}
-              disabled={applying}
+              onClick={autoAssign}
+              disabled={autoAssigning || applying}
+              className="px-3 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700 disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-2 text-sm font-medium"
+              title="Automatically schedule every unassigned SOP across the year, balanced per month and grouped by department"
+            >
+              <Wand2 className="w-4 h-4" />
+              {autoAssigning ? 'Assigning…' : 'Auto-Assign'}
+            </button>
+            <button
+              onClick={() => applyChanges()}
+              disabled={applying || autoAssigning}
               className="px-3 py-2 bg-green-600 text-white rounded hover:bg-green-700 disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-2 text-sm font-medium"
               title="Persist checked designation × month selections into the training matrix"
             >
@@ -1492,13 +1826,43 @@ export default function ManageSOPDashboard() {
               <ScrollText className="w-4 h-4" />
               Logs
             </button>
-            <button
-              onClick={handleExport}
-              className="px-3 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 flex items-center gap-2 text-sm font-medium"
-            >
-              <Download className="w-4 h-4" />
-              Export
-            </button>
+            <div className="relative" ref={exportMenuRef}>
+              <button
+                onClick={() => setExportMenuOpen(o => !o)}
+                className="px-3 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 flex items-center gap-2 text-sm font-medium"
+                title="Export the assigned SOPs as a training matrix (same format as the reference Excel files)"
+              >
+                <Download className="w-4 h-4" />
+                Export to Excel
+              </button>
+              {exportMenuOpen && (
+                <div className="absolute right-0 mt-1 w-64 bg-white border border-gray-200 rounded-lg shadow-lg z-[60] py-1 max-h-96 overflow-auto">
+                  <button
+                    onClick={() => handleExport('all')}
+                    className="w-full text-left px-3 py-2 text-sm font-medium text-gray-900 hover:bg-gray-100"
+                  >
+                    All Departments (one sheet each)
+                  </button>
+                  <div className="my-1 border-t border-gray-100" />
+                  <div className="px-3 py-1 text-[11px] uppercase tracking-wide text-gray-400">
+                    Department-wise
+                  </div>
+                  {departments.map(dept => (
+                    <button
+                      key={dept}
+                      onClick={() => handleExport(dept)}
+                      className="w-full text-left px-3 py-2 text-sm text-gray-700 hover:bg-gray-100 flex items-center gap-2"
+                    >
+                      <span
+                        className="inline-block w-2 h-2 rounded-full"
+                        style={{ background: DEPT_COLORS[dept] || '#9ca3af' }}
+                      />
+                      {dept}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
             <div className="text-sm text-gray-600">
               {filteredSops.length} SOPs
             </div>
@@ -2349,13 +2713,13 @@ const VirtualizedSopRows = memo(function VirtualizedSopRows({
       )}
       {windowedSops.map((sop, localIdx) => {
         const idx = windowedRange.start + localIdx;
-        const sopCodeUpper = String(sop.sopCode || '').toUpperCase();
+        const sopCodeKey = sopCacheKey(sop.sopCode);
         return (
           <SopRow
             key={`sop-${sop.sopCode}`}
             sop={sop}
             idx={idx}
-            isUnassigned={unassignedSet.has(sopCodeUpper)}
+            isUnassigned={unassignedSet.has(sopCodeKey)}
             departments={departments}
             designationsByDept={designationsByDept}
             allDesignations={allDesignations}
@@ -2363,8 +2727,8 @@ const VirtualizedSopRows = memo(function VirtualizedSopRows({
             sopOverrides={overrides[sop.sopCode] || emptyInner}
             sopInductionOverrides={inductionOverrides[sop.sopCode] || emptyInner}
             sopMonthCells={monthCells[sop.sopCode] || emptyInner}
-            sopManualAllocations={manualAllocations?.[sopCodeUpper] || emptyManual}
-            sopManualDesignations={manualDesignations?.[sopCodeUpper] || emptyManualDesig}
+            sopManualAllocations={manualAllocations?.[sopCodeKey] || emptyManual}
+            sopManualDesignations={manualDesignations?.[sopCodeKey] || emptyManualDesig}
             viewMode={viewMode}
             employeesByDept={employeesByDept}
             onEmployeeClick={onEmployeeClick}

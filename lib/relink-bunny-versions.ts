@@ -10,6 +10,9 @@ import {
 import { sopIdentifierMatchFilter } from "@/lib/sopIdentifierNormalize";
 import { reconcileSopVersions } from "@/lib/reconcile-sop-versions";
 import {
+  backfillPriorHeaderDateFlags,
+} from "@/lib/prior-header-dates";
+import {
   buildBunnyVersionFileIndex,
   invalidateBunnyVersionIndexCache,
   lookupBunnyVersionFile,
@@ -19,8 +22,11 @@ import {
   type MissingVersionFile,
   type VersionLang,
 } from "@/lib/version-diagnostics";
-
-const LINKED_CONTENT = "[Linked from Bunny storage]";
+import {
+  isUnextractedDocxContent,
+  LINKED_CONTENT_PLACEHOLDER,
+  reextractDocxContentFromUrl,
+} from "@/lib/prior-header-dates";
 const LOOKUP_CONCURRENCY = 24;
 
 type MissingSlot = MissingVersionFile & { department: string };
@@ -65,7 +71,7 @@ async function upsertBunnyFile(bf: {
 
   if (existing) {
     if (existing.fileUrl === bf.fileUrl) return "skipped";
-    await existing.updateOne({
+    const update: Record<string, unknown> = {
       identifier: bf.identifier,
       fileUrl: bf.fileUrl,
       sopBaseId,
@@ -73,18 +79,33 @@ async function upsertBunnyFile(bf: {
       version,
       sopDocuments: [docEntry],
       uploadedAt: new Date(),
-    });
+    };
+    if (
+      bf.fileType === "docx" &&
+      isUnextractedDocxContent(existing.content)
+    ) {
+      const content = await reextractDocxContentFromUrl(bf.fileUrl);
+      if (content) {
+        update.content = content;
+        update.linkedFromBunny = false;
+      }
+    }
+    await existing.updateOne(update);
     return "linked";
   }
 
   const dept = bf.department || departmentFromIdentifier(bf.identifier) || "General";
+  const docxContent =
+    bf.fileType === "docx"
+      ? (await reextractDocxContentFromUrl(bf.fileUrl)) ?? LINKED_CONTENT_PLACEHOLDER
+      : LINKED_CONTENT_PLACEHOLDER;
   await SOP.create({
     name: bf.identifier,
     identifier: bf.identifier,
     department: dept,
     fileUrl: bf.fileUrl,
     fileType: bf.fileType,
-    content: LINKED_CONTENT,
+    content: docxContent,
     language: bf.language,
     version,
     sopBaseId,
@@ -94,10 +115,7 @@ async function upsertBunnyFile(bf: {
     expiryDate: new Date(Date.now() + 24 * 30 * 86400000),
     status: "uploaded",
     pipelineStatus: "idle",
-    // Mark as a relink-created stub (not an explicit upload). The version-completeness
-    // logic excludes these. This flag survives the dashboard's `-content` projection,
-    // unlike the LINKED_CONTENT content marker.
-    linkedFromBunny: true,
+    linkedFromBunny: docxContent === LINKED_CONTENT_PLACEHOLDER,
   });
   return "created";
 }
@@ -181,6 +199,13 @@ export async function relinkBunnyVersionFiles(opts?: { department?: string; refr
 
   const reconcile =
     linked + created > 0 ? await reconcileSopVersions() : { updated: 0, cleaned: 0, total: 0 };
+  if (linked + created > 0) {
+    try {
+      await backfillPriorHeaderDateFlags();
+    } catch (e) {
+      console.error("[relink-bunny] prior header date backfill error:", e);
+    }
+  }
   invalidateDashboardSopsCache();
 
   console.log(
