@@ -89,7 +89,7 @@ const MCQBankSchema = new Schema<IMCQBank>(
       medium: { type: Number, default: 0 },
       hard: { type: Number, default: 0 },
     },
-    aiModel: { type: String, default: "gemini-2.0-flash" },
+    aiModel: { type: String, default: "gemini-2.5-flash" },
     language: { type: String, enum: ["English", "Gujarati"], default: "English" },
     isObsolete: { type: Boolean, default: false },
     obsoleteAt: { type: Date },

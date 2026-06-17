@@ -17,17 +17,21 @@ import {
   X,
   Zap,
 } from "lucide-react";
+import { displaySopCode, displaySopTitle } from "@/lib/sop-display";
 
 interface DeptSopEntry {
   sopId: string;
   sopCode: string;
   sopName: string;
+  sopNameGujarati: string | null;
+  language: string;
   department: string;
   trainerName: string;
   totalQuestions: number;
   checkedCount: number;
   reviewedCount: number;
   similarCount: number;
+  hasMcq: boolean;
   mcqBanks: { id: string; language: string }[];
   lastUpdated: string | null;
 }
@@ -73,6 +77,7 @@ function StatusDot({ total, checked }: { total: number; checked: number }) {
 export function DeptDetailModal({ dept, deptColor, onClose, onViewMcqs }: DeptDetailModalProps) {
   const [sops, setSops] = useState<DeptSopEntry[]>([]);
   const [stats, setStats] = useState<DeptStats | null>(null);
+  const [counts, setCounts] = useState<{ withMcqs: number; withoutMcqs: number }>({ withMcqs: 0, withoutMcqs: 0 });
   const [trainer, setTrainer] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -109,7 +114,12 @@ export function DeptDetailModal({ dept, deptColor, onClose, onViewMcqs }: DeptDe
         const res = await fetch(`/api/mcq-bank/dept-sops?dept=${encodeURIComponent(dept)}`);
         const data = await res.json();
         if (!res.ok) throw new Error(data.error ?? "Failed");
-        if (!cancelled) { setSops(data.sops ?? []); setStats(data.stats ?? null); setTrainer(data.trainer ?? null); }
+        if (!cancelled) {
+          setSops(data.sops ?? []);
+          setStats(data.stats ?? null);
+          setCounts({ withMcqs: data.withMcqs ?? 0, withoutMcqs: data.withoutMcqs ?? 0 });
+          setTrainer(data.trainer ?? null);
+        }
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : "Failed");
       } finally {
@@ -212,6 +222,20 @@ export function DeptDetailModal({ dept, deptColor, onClose, onViewMcqs }: DeptDe
                           <div className="h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_10px_#10b981]" />
                           <span className="text-[11px] font-bold uppercase tracking-widest text-white/60">
                             <strong className="mr-1.5 text-white">{sops.length}</strong>Active SOPs
+                          </span>
+                        </div>
+                        <div className="h-1.5 w-1.5 rounded-full bg-white/10" />
+                        <div className="flex items-center gap-2">
+                          <div className="h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_10px_#10b981]" />
+                          <span className="text-[11px] font-bold uppercase tracking-widest text-white/60">
+                            <strong className="mr-1.5 text-white">{counts.withMcqs}</strong>With MCQs
+                          </span>
+                        </div>
+                        <div className="h-1.5 w-1.5 rounded-full bg-white/10" />
+                        <div className="flex items-center gap-2">
+                          <div className={`h-1.5 w-1.5 rounded-full ${counts.withoutMcqs > 0 ? "bg-rose-400 shadow-[0_0_10px_#f43f5e]" : "bg-white/30"}`} />
+                          <span className="text-[11px] font-bold uppercase tracking-widest text-white/60">
+                            <strong className="mr-1.5 text-white">{counts.withoutMcqs}</strong>Without MCQs
                           </span>
                         </div>
                       </>
@@ -346,7 +370,7 @@ export function DeptDetailModal({ dept, deptColor, onClose, onViewMcqs }: DeptDe
                     </tr>
                   ) : (
                     sorted.map((entry, idx) => {
-                      const hasBanks = entry.mcqBanks.length > 0;
+                      const hasBanks = entry.hasMcq && entry.mcqBanks.length > 0;
                       const defaultBank = entry.mcqBanks.find(
                         (b) => b.language.toLowerCase() !== "gujarati"
                       ) ?? entry.mcqBanks[0];
@@ -360,16 +384,33 @@ export function DeptDetailModal({ dept, deptColor, onClose, onViewMcqs }: DeptDe
                           <td className="px-4 py-3">
                             <StatusDot total={entry.totalQuestions} checked={entry.checkedCount} />
                           </td>
-                          <td className="whitespace-nowrap px-4 py-3">
-                            <span className={`font-mono text-xs font-bold transition-colors ${hasBanks ? "text-indigo-600 group-hover/row:text-indigo-700 group-hover/row:underline underline-offset-2" : "text-gray-400"}`}>
-                              {entry.sopCode}
+                          {/* SOP No. — matches the Dashboard SOP Registry (font-mono, 13px, purple-700) */}
+                          <td className="whitespace-nowrap px-4 py-3 font-mono text-[13px] font-bold tracking-wider text-purple-700">
+                            <span className={`block truncate transition-colors ${hasBanks ? "group-hover/row:underline underline-offset-2" : ""}`} title={displaySopCode(entry.sopCode)}>
+                              {displaySopCode(entry.sopCode)}
                             </span>
                           </td>
+                          {/* SOP Name — matches the Dashboard SOP Registry (12px bold, Gujarati subline) */}
                           <td className="max-w-[260px] px-4 py-3">
-                            <p className="line-clamp-2 text-xs font-medium text-gray-700 group-hover/row:text-gray-900 transition-colors">{entry.sopName}</p>
-                            {entry.trainerName && (
-                              <p className="truncate text-[10px] text-gray-400">{entry.trainerName}</p>
-                            )}
+                            <div className="flex min-w-0 flex-col gap-0 leading-tight">
+                              <span
+                                className="line-clamp-2 text-[12px] font-bold leading-tight text-gray-900 wrap-break-word"
+                                title={displaySopTitle(entry.sopName, entry.sopCode)}
+                              >
+                                {displaySopTitle(entry.sopName, entry.sopCode)}
+                              </span>
+                              {entry.sopNameGujarati && (
+                                <span
+                                  className="line-clamp-2 text-[10px] font-bold leading-tight text-indigo-700 wrap-break-word"
+                                  title={displaySopTitle(entry.sopNameGujarati, entry.sopCode)}
+                                >
+                                  {displaySopTitle(entry.sopNameGujarati, entry.sopCode)}
+                                </span>
+                              )}
+                              {entry.trainerName && (
+                                <span className="truncate text-[10px] text-gray-400">{entry.trainerName}</span>
+                              )}
+                            </div>
                           </td>
                           <td className="whitespace-nowrap px-4 py-3 text-center">
                             <span className={`text-xs font-bold ${entry.totalQuestions > 0 ? "text-gray-800" : "text-gray-300"}`}>
@@ -407,7 +448,13 @@ export function DeptDetailModal({ dept, deptColor, onClose, onViewMcqs }: DeptDe
                                 ))}
                               </div>
                             ) : (
-                              <span className="text-[10px] text-gray-300">—</span>
+                              <span
+                                className="inline-flex items-center gap-1 rounded-md border border-rose-200 bg-rose-50 px-2 py-1 text-[8px] font-black uppercase tracking-widest text-rose-600"
+                                title="No MCQs generated for the current active version"
+                              >
+                                <AlertCircle className="h-3 w-3" />
+                                MCQ Not Found
+                              </span>
                             )}
                           </td>
                         </tr>

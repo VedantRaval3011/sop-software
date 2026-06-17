@@ -1,8 +1,13 @@
 import { generateJson } from "@/lib/gemini";
 import type { ComplianceFinding, ComplianceAnalysisResult } from "@/lib/complianceEngine";
 import { getScoreLabel } from "@/lib/complianceEngine";
-
-// ── Types ──────────────────────────────────────────────────────────────────
+import { calculateCompliancePercentage, formatConfidence, buildImpactAnalysis } from "@/lib/complianceFormatter";
+import {
+  cleanFindingText,
+  buildProposedVerbiage,
+  validateAllFindings,
+} from "@/lib/ComplianceFindingValidator";
+import { parseSopStructure, buildSectionSummary } from "@/lib/sopStructureParser";
 
 export interface GuidelineClauseInput {
   clauseNumber: string;
@@ -38,8 +43,7 @@ function buildContextKeywords(department: string, sopName: string, sopContent: s
     }
   }
 
-  // Always include universal pharma compliance keywords
-  const universal = ["gmp", "gdp", "gcp", "ich", "who", "fda", "eu gmp", "schedule m", "cGMP", "compliance", "regulatory", "quality"];
+  const universal = ["gmp", "gdp", "gcp", "ich", "who", "fda", "eu gmp", "schedule m", "cgmp", "compliance", "regulatory", "quality"];
   for (const kw of universal) {
     if (haystack.includes(kw.toLowerCase())) matched.add(kw.toLowerCase());
   }
@@ -51,48 +55,67 @@ function scoreClauseRelevance(clause: GuidelineClauseInput, keywords: Set<string
   const text = `${clause.clauseTitle} ${clause.clauseText}`.toLowerCase();
   let score = 0;
   for (const kw of keywords) {
-    const occurrences = (text.split(kw).length - 1);
-    if (occurrences > 0) score += Math.min(occurrences, 3); // cap per-keyword boost at 3
+    const occurrences = text.split(kw).length - 1;
+    if (occurrences > 0) score += Math.min(occurrences, 3);
   }
   return score;
 }
 
+function clauseKey(c: { guidelineName?: string; clauseNumber?: string }): string {
+  return `${c.guidelineName ?? ""}::${c.clauseNumber ?? ""}`;
+}
+
+function matchClause(
+  batch: GuidelineClauseInput[],
+  finding: Partial<ComplianceFinding> & { guidelineName?: string },
+): GuidelineClauseInput | undefined {
+  if (finding.guidelineName) {
+    const byBoth = batch.find(
+      (c) => c.clauseNumber === finding.clauseNumber && c.guidelineName === finding.guidelineName,
+    );
+    if (byBoth) return byBoth;
+  }
+  if (finding.clauseTitle) {
+    const byTitle = batch.find(
+      (c) => c.clauseTitle === finding.clauseTitle && (!finding.guidelineName || c.guidelineName === finding.guidelineName),
+    );
+    if (byTitle) return byTitle;
+  }
+  return batch.find((c) => c.clauseNumber === finding.clauseNumber);
+}
+
+function isBatchFailureError(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  return lower.includes("json") || lower.includes("syntax") || lower.includes("truncat") || lower.includes("valid");
+}
+
 // ── Clause Selection ───────────────────────────────────────────────────────
 
-const MAX_CLAUSES_PER_BATCH = 60;
+const MAX_CLAUSES_PER_BATCH = 5;
+const BATCH_DELAY_MS = 2_000;
+const MAX_SOP_CHARS_PER_BATCH = 80_000;
+const MAX_CLAUSE_TEXT_CHARS = 2_000;
 
-function selectAndPrioritizeClauses(
+/** Order clauses by department relevance but include ALL — never skip for coverage. */
+function orderClausesForAnalysis(
   allClauses: GuidelineClauseInput[],
   keywords: Set<string>,
-  maxTotal: number,
+  maxTotal?: number,
 ): GuidelineClauseInput[] {
   const scored = allClauses.map((c) => ({
     clause: c,
     score: scoreClauseRelevance(c, keywords),
   }));
 
-  // Sort by relevance descending; break ties by original order (stable)
   scored.sort((a, b) => b.score - a.score);
 
-  // Take top maxTotal, but ensure we include at least some from each guideline folder
-  const selected: GuidelineClauseInput[] = [];
-  const folderSeen = new Map<string, number>();
+  const limit = maxTotal && maxTotal > 0 ? Math.min(maxTotal, allClauses.length) : allClauses.length;
+  const selected = scored.slice(0, limit).map((s) => s.clause);
 
-  // First pass: take top clauses ensuring max 15 per folder for diversity
-  for (const { clause } of scored) {
-    if (selected.length >= maxTotal) break;
-    const count = folderSeen.get(clause.folderName) ?? 0;
-    if (count < 15) {
-      selected.push(clause);
-      folderSeen.set(clause.folderName, count + 1);
-    }
-  }
-
-  // If still under quota, fill from any remaining
-  if (selected.length < maxTotal) {
-    for (const { clause } of scored) {
-      if (selected.length >= maxTotal) break;
-      if (!selected.includes(clause)) selected.push(clause);
+  if (selected.length < allClauses.length && limit >= allClauses.length) {
+    const seen = new Set(selected.map(clauseKey));
+    for (const c of allClauses) {
+      if (!seen.has(clauseKey(c))) selected.push(c);
     }
   }
 
@@ -103,107 +126,270 @@ function selectAndPrioritizeClauses(
 
 const SYSTEM_PROMPT = `You are a senior pharmaceutical regulatory compliance auditor specializing in GMP, GDP, ICH, WHO, FDA, and EU guidelines.
 
-Your task: Analyze the SOP against EACH guideline clause provided and return one finding per clause.
+Perform a rigorous LINE-BY-LINE compliance analysis of the indexed SOP against EACH guideline clause.
+
+METHODOLOGY:
+1. Scan indexed SOP lines (L001, L002, ...) for content that DIRECTLY addresses each clause's specific regulatory topic.
+2. Cite ONLY lines that substantively implement the requirement — never tangential keyword matches.
+3. FORBIDDEN: citing operational steps (valve checks, weighing, mixing, environmental monitoring) as evidence for data governance, ALCOA+, quality system, or framework-level requirements unless those lines explicitly discuss those topics.
+4. FORBIDDEN: marking "partial" or "compliant" because SOP mentions "records", "verify", or "ensure" when the clause requires a specific regulatory concept (e.g. ALCOA+, data governance, change control, risk management).
+5. sopTextSnippet: cite at most 1–2 lines that DIRECTLY address the requirement, or "Not Found".
+6. If the SOP has no substantive coverage → non-compliant (not partial). If clause is outside SOP scope → not-applicable.
+7. Base complianceLevel ONLY on substantive evidence — never assume or infer unstated content.
+8. sopSectionAffected MUST use line references: "L042 [§4.2 Storage Conditions]" format.
 
 CRITICAL OUTPUT RULES:
-1. Return EXACTLY one finding object per clause in the input — do NOT skip any clause.
-2. Use tiered verbosity to stay within token limits:
-   - "compliant": only clauseNumber, clauseTitle, complianceLevel, matchConfidence, issueSeverity:"informational", sopSectionAffected
-   - "not-applicable": clauseNumber, clauseTitle, complianceLevel, matchConfidence, issueSeverity:"informational", mismatchExplanation (≤15 words why N/A)
-   - "partial": all fields, keep each text field ≤ 25 words
-   - "non-compliant": all fields, keep each text field ≤ 40 words
-3. Return ONLY valid, complete JSON — absolutely no markdown fences, no truncation.
-4. For compliant/N/A clauses, omit empty optional fields entirely to save tokens.
+1. Return EXACTLY one finding per clause — same order as input. Do NOT skip clauses.
+2. ALWAYS include "guidelineName" and "clauseNumber" in every finding.
+3. guidelineRequirement MUST quote or paraphrase the actual clause requirement text.
+4. sopTextSnippet MUST be verbatim from 1–2 DIRECTLY relevant SOP lines, or "Not Found" if absent. Never dump unrelated lines.
+5. matchConfidence above 70 ONLY when substantive requirement coverage is demonstrated — not for keyword overlap.
+6. Keep responses compact to avoid truncation:
+   - "compliant": guidelineName, clauseNumber, clauseTitle, complianceLevel, matchConfidence, issueSeverity:"informational", sopSectionAffected, sopTextSnippet (required — must be substantively relevant)
+   - "not-applicable": above + mismatchExplanation (≤15 words)
+   - "partial": MUST include guidelineRequirement, sopTextSnippet, mismatchExplanation, impactAnalysis, suggestedAction, suggestedText
+   - "non-compliant": same as partial with more detailed suggestedText
+7. Return ONLY valid complete JSON — no markdown, no truncation.
 
-JSON structure:
+JSON:
 {
   "findings": [
     {
+      "guidelineName": "string",
       "clauseNumber": "string",
       "clauseTitle": "string",
       "complianceLevel": "compliant" | "partial" | "non-compliant" | "not-applicable",
-      "matchConfidence": number (0-100),
+      "matchConfidence": number (0-100, use whole numbers like 85 not 0.85),
       "issueSeverity": "critical" | "major" | "minor" | "informational",
-      "sopSectionAffected": "string",
-      "mismatchExplanation": "string (partial/non-compliant only)",
-      "guidelineRequirement": "string (partial/non-compliant only)",
-      "suggestedAction": "string (partial/non-compliant only)",
-      "sopTextSnippet": "string (partial/non-compliant only, ≤30 words from SOP)",
-      "suggestedText": "string (non-compliant only, proposed rewrite ≤40 words)",
+      "sopSectionAffected": "string (L### [§section] format)",
+      "mismatchExplanation": "string (gap — what is missing in SOP)",
+      "impactAnalysis": "string (audit/CAPA/regulatory risk if not fixed)",
+      "guidelineRequirement": "string (exact requirement from guideline clause)",
+      "suggestedAction": "string (one-line fix instruction)",
+      "sopTextSnippet": "string (verbatim quoted text from SOP lines, or Not Found)",
+      "suggestedText": "string (exact proposed SOP wording with section number — required for partial/non-compliant, never N/A)",
       "estimatedEffort": "low" | "medium" | "high"
     }
   ],
-  "overallScore": number (0-10),
-  "complianceStatus": "Fully Compliant" | "Partially Compliant" | "Non-Compliant"
+  "overallScore": number
 }`;
+
+function finalizeFinding(
+  raw: Partial<ComplianceFinding> & { guidelineName?: string; impactAnalysis?: string } | undefined,
+  clause: GuidelineClauseInput,
+): ComplianceFinding {
+  const requirement =
+    raw?.guidelineRequirement?.trim() || clause.clauseText?.slice(0, 600) || clause.clauseTitle;
+  const level = raw?.complianceLevel ?? "analysis-failed";
+  const isActionable = level === "partial" || level === "non-compliant";
+
+  const gap =
+    raw?.mismatchExplanation?.trim() ||
+    (isActionable
+      ? `The SOP does not fully address ${clause.clauseTitle} as required by ${clause.guidelineName} Clause ${clause.clauseNumber}.`
+      : "");
+
+  const impact =
+    raw?.impactAnalysis?.trim() ||
+    (isActionable ? buildImpactAnalysis({ ...raw, clauseNumber: clause.clauseNumber, guidelineName: clause.guidelineName, mismatchExplanation: gap, issueSeverity: raw?.issueSeverity }, requirement) : "");
+
+  const sopSection = cleanFindingText(raw?.sopSectionAffected);
+  const sopSnippet = cleanFindingText(raw?.sopTextSnippet);
+  const suggestedAction =
+    cleanFindingText(raw?.suggestedAction) ||
+    (isActionable
+      ? `Add a step to address ${clause.clauseTitle} per ${clause.guidelineName} Clause ${clause.clauseNumber}.`
+      : "");
+
+  let suggestedText = cleanFindingText(raw?.suggestedText);
+  if (isActionable && !suggestedText) {
+    suggestedText = buildProposedVerbiage({
+      suggestedAction,
+      sopTextSnippet: sopSnippet,
+      sopSectionAffected: sopSection,
+      gap,
+      clauseTitle: clause.clauseTitle,
+      clauseNumber: clause.clauseNumber,
+      guidelineName: clause.guidelineName,
+    });
+  }
+
+  return {
+    clauseNumber: raw?.clauseNumber ?? clause.clauseNumber,
+    clauseTitle: raw?.clauseTitle ?? clause.clauseTitle,
+    complianceLevel: level,
+    matchConfidence: formatConfidence(raw?.matchConfidence ?? 0),
+    issueSeverity: raw?.issueSeverity ?? (level === "non-compliant" ? "major" : "informational"),
+    sopSectionAffected: sopSection || (isActionable ? "" : ""),
+    mismatchExplanation: gap,
+    sopTextSnippet: sopSnippet,
+    guidelineRequirement: requirement,
+    suggestedAction,
+    suggestedText,
+    impactAnalysis: impact,
+    highlightedIssue: gap,
+    estimatedEffort: raw?.estimatedEffort ?? "medium",
+    guidelineName: raw?.guidelineName ?? clause.guidelineName,
+    folderName: clause.folderName,
+    guidelineId: clause.guidelineId,
+  };
+}
 
 async function analyzeBatch(
   sopIdentifier: string,
   sopName: string,
   department: string,
-  sopContent: string,
+  indexedSopContent: string,
+  sectionSummary: string,
   batch: GuidelineClauseInput[],
   batchLabel: string,
-): Promise<{
-  findings: ComplianceFinding[];
-  overallScore: number;
-  error?: string;
-}> {
+): Promise<{ findings: ComplianceFinding[]; overallScore: number }> {
   const clausesBlock = batch
     .map(
-      (c) =>
-        `[${c.clauseNumber}] ${c.guidelineName} — ${c.clauseTitle}\n${(c.clauseText ?? "").slice(0, 400)}`,
+      (c, idx) =>
+        `#${idx + 1} [${c.clauseNumber}] GUIDELINE: ${c.guidelineName} | ${c.clauseTitle}\n${(c.clauseText ?? "").slice(0, MAX_CLAUSE_TEXT_CHARS)}`,
     )
     .join("\n\n");
 
+  const sopBlock = indexedSopContent.slice(0, MAX_SOP_CHARS_PER_BATCH);
+
   const userPrompt = `DEPARTMENT: ${department}
 SOP: ${sopIdentifier} — ${sopName}
-BATCH: ${batchLabel} | ${batch.length} clauses to analyze
+BATCH: ${batchLabel} | ${batch.length} clauses
 
-=== GUIDELINE CLAUSES ===
+=== SOP SECTION MAP ===
+${sectionSummary}
+
+=== CLAUSES (analyze each in order — line-by-line against indexed SOP) ===
 ${clausesBlock}
 
-=== SOP CONTENT ===
-${sopContent.slice(0, 35000)}
+=== INDEXED SOP CONTENT (scan every line L001+) ===
+${sopBlock}
 
-Analyze EVERY clause above against the SOP. Return one finding per clause.`;
+Return exactly ${batch.length} findings in the same order. Include guidelineName on every finding.
+Quote verbatim SOP text with line references. Base judgments on evidence only.`;
 
-  console.log(`[complianceV3] batch ${batchLabel}: sending ${batch.length} clauses to Gemini`);
+  console.log(`[complianceV3] batch ${batchLabel}: sending ${batch.length} clauses, SOP ${sopBlock.length} chars`);
 
   const parsed = await generateJson<{
-    findings: ComplianceFinding[];
+    findings: (ComplianceFinding & { guidelineName?: string; impactAnalysis?: string })[];
     overallScore: number;
-    complianceStatus: string;
   }>(SYSTEM_PROMPT, userPrompt);
 
   if (!Array.isArray(parsed.findings)) {
-    throw new Error(`Batch ${batchLabel}: Gemini returned invalid findings (not an array)`);
+    throw new SyntaxError(`Batch ${batchLabel}: invalid findings array`);
   }
 
   console.log(`[complianceV3] batch ${batchLabel}: received ${parsed.findings.length} findings`);
 
-  const enriched: ComplianceFinding[] = parsed.findings.map((f) => {
-    const matched = batch.find((c) => c.clauseNumber === f.clauseNumber);
-    return {
-      clauseNumber: f.clauseNumber ?? "",
-      clauseTitle: f.clauseTitle ?? matched?.clauseTitle ?? "",
-      complianceLevel: f.complianceLevel ?? "analysis-failed",
-      matchConfidence: f.matchConfidence ?? 0,
-      issueSeverity: f.issueSeverity ?? "informational",
-      sopSectionAffected: f.sopSectionAffected ?? "",
-      mismatchExplanation: f.mismatchExplanation ?? "",
-      sopTextSnippet: f.sopTextSnippet ?? "",
-      guidelineRequirement: f.guidelineRequirement ?? "",
-      suggestedAction: f.suggestedAction ?? "",
-      suggestedText: f.suggestedText ?? "",
-      estimatedEffort: f.estimatedEffort ?? "medium",
-      guidelineName: matched?.guidelineName ?? "",
-      folderName: matched?.folderName ?? "",
-      guidelineId: matched?.guidelineId,
-    };
-  });
+  const usedKeys = new Set<string>();
+  const enriched: ComplianceFinding[] = [];
+
+  for (let i = 0; i < batch.length; i++) {
+    const clause = batch[i];
+    const raw = parsed.findings[i] ?? parsed.findings.find((f) => matchClause([clause], f));
+    const matched = raw ? matchClause(batch, raw) ?? clause : clause;
+
+    const key = clauseKey(matched);
+    if (usedKeys.has(key)) continue;
+    usedKeys.add(key);
+
+    enriched.push(finalizeFinding(raw, matched));
+  }
+
+  // Fill any clauses Gemini skipped
+  for (const clause of batch) {
+    if (!usedKeys.has(clauseKey(clause))) {
+      enriched.push(finalizeFinding(undefined, clause));
+      enriched[enriched.length - 1].complianceLevel = "analysis-failed";
+      enriched[enriched.length - 1].mismatchExplanation = "Clause was not returned by AI — retry analysis";
+    }
+  }
 
   return { findings: enriched, overallScore: parsed.overallScore ?? 0 };
+}
+
+/** On JSON/truncation failure, split batch in half and retry recursively. */
+async function analyzeBatchResilient(
+  sopIdentifier: string,
+  sopName: string,
+  department: string,
+  indexedSopContent: string,
+  sectionSummary: string,
+  batch: GuidelineClauseInput[],
+  batchLabel: string,
+): Promise<{ findings: ComplianceFinding[]; overallScore: number }> {
+  if (batch.length === 0) return { findings: [], overallScore: 0 };
+
+  if (batch.length === 1) {
+    try {
+      return await analyzeBatch(
+        sopIdentifier, sopName, department, indexedSopContent, sectionSummary, batch, batchLabel,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        findings: [{
+          clauseNumber: batch[0].clauseNumber,
+          clauseTitle: batch[0].clauseTitle,
+          complianceLevel: "analysis-failed",
+          matchConfidence: 0,
+          issueSeverity: "informational",
+          sopSectionAffected: "",
+          mismatchExplanation: `Analysis failed: ${msg.slice(0, 100)}`,
+          sopTextSnippet: "",
+          guidelineRequirement: batch[0].clauseText?.slice(0, 600) ?? "",
+          suggestedAction: "",
+          suggestedText: "",
+          estimatedEffort: "medium",
+          guidelineName: batch[0].guidelineName,
+          folderName: batch[0].folderName,
+          guidelineId: batch[0].guidelineId,
+        }],
+        overallScore: 0,
+      };
+    }
+  }
+
+  try {
+    return await analyzeBatch(
+      sopIdentifier, sopName, department, indexedSopContent, sectionSummary, batch, batchLabel,
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!isBatchFailureError(msg)) throw err;
+
+    console.warn(`[complianceV3] batch ${batchLabel} split (${batch.length} clauses) due to: ${msg.slice(0, 80)}`);
+    const mid = Math.ceil(batch.length / 2);
+    const left = await analyzeBatchResilient(
+      sopIdentifier, sopName, department, indexedSopContent, sectionSummary,
+      batch.slice(0, mid), `${batchLabel}a`,
+    );
+    await sleep(BATCH_DELAY_MS);
+    const right = await analyzeBatchResilient(
+      sopIdentifier, sopName, department, indexedSopContent, sectionSummary,
+      batch.slice(mid), `${batchLabel}b`,
+    );
+    return {
+      findings: [...left.findings, ...right.findings],
+      overallScore: (left.overallScore + right.overallScore) / 2,
+    };
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function computeScoreFromFindings(findings: ComplianceFinding[]): number {
+  const applicable = findings.filter(
+    (f) => f.complianceLevel !== "not-applicable" && f.complianceLevel !== "analysis-failed",
+  );
+  const compliant = applicable.filter((f) => f.complianceLevel === "compliant").length;
+  const partial = applicable.filter((f) => f.complianceLevel === "partial").length;
+  if (applicable.length === 0) return 0;
+  const pct = calculateCompliancePercentage(compliant, partial, applicable.length);
+  return Math.round(pct) / 10;
 }
 
 // ── Main Export ────────────────────────────────────────────────────────────
@@ -214,14 +400,14 @@ export async function analyzeSOPComplianceV3(request: {
   department: string;
   sopContent: string;
   guidelineClauses: GuidelineClauseInput[];
+  /** Optional cap for testing; omit or 0 to analyze ALL clauses. */
   maxClauses?: number;
 }): Promise<ComplianceAnalysisResult & { cached?: boolean }> {
   const startTime = Date.now();
 
-  console.log(`[complianceV3] starting analysis — SOP: ${request.sopIdentifier}, total clauses available: ${request.guidelineClauses.length}`);
+  console.log(`[complianceV3] starting — SOP: ${request.sopIdentifier}, clauses available: ${request.guidelineClauses.length}`);
 
   if (!request.sopContent || request.sopContent.trim().length < 50) {
-    console.warn("[complianceV3] SOP content too short, returning empty result");
     return {
       findings: [],
       overallScore: 0,
@@ -234,103 +420,69 @@ export async function analyzeSOPComplianceV3(request: {
     };
   }
 
-  // ── Step 1: Build context keywords from department + SOP ──────────────────
-  const contextKeywords = buildContextKeywords(
-    request.department,
-    request.sopName,
-    request.sopContent,
-  );
-  console.log(`[complianceV3] department intelligence: ${contextKeywords.size} context keywords identified`);
+  const parsedSop = parseSopStructure(request.sopContent);
+  const sectionSummary = buildSectionSummary(parsedSop);
+  const indexedSopContent = parsedSop.indexedContent || request.sopContent;
 
-  // ── Step 2: Select & prioritize most relevant clauses ─────────────────────
-  const maxTotal = request.maxClauses ?? 120;
-  const selectedClauses = selectAndPrioritizeClauses(
+  console.log(
+    `[complianceV3] parsed SOP — ${parsedSop.totalLines} lines, ${parsedSop.sections.length} sections`,
+  );
+
+  const contextKeywords = buildContextKeywords(request.department, request.sopName, request.sopContent);
+  const selectedClauses = orderClausesForAnalysis(
     request.guidelineClauses,
     contextKeywords,
-    maxTotal,
+    request.maxClauses,
   );
-  console.log(`[complianceV3] selected ${selectedClauses.length} most relevant clauses from ${request.guidelineClauses.length} total`);
+  console.log(`[complianceV3] analyzing ${selectedClauses.length} of ${request.guidelineClauses.length} clauses (full coverage)`);
 
-  // ── Step 3: Split into batches ────────────────────────────────────────────
   const batches: GuidelineClauseInput[][] = [];
   for (let i = 0; i < selectedClauses.length; i += MAX_CLAUSES_PER_BATCH) {
     batches.push(selectedClauses.slice(i, i + MAX_CLAUSES_PER_BATCH));
   }
-  console.log(`[complianceV3] split into ${batches.length} batch(es) of ≤${MAX_CLAUSES_PER_BATCH} clauses`);
 
-  // ── Step 4: Analyze each batch — fail loudly on errors ────────────────────
   const allFindings: ComplianceFinding[] = [];
-  let batchScoreSum = 0;
 
   for (let i = 0; i < batches.length; i++) {
+    if (i > 0) await sleep(BATCH_DELAY_MS);
     const label = `${i + 1}/${batches.length}`;
-    try {
-      const batchResult = await analyzeBatch(
-        request.sopIdentifier,
-        request.sopName,
-        request.department,
-        request.sopContent,
-        batches[i],
-        label,
-      );
-      allFindings.push(...batchResult.findings);
-      batchScoreSum += batchResult.overallScore;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[complianceV3] batch ${label} FAILED: ${msg}`);
-      // Mark unanalyzed clauses as analysis-failed instead of silently skipping
-      for (const clause of batches[i]) {
-        allFindings.push({
-          clauseNumber: clause.clauseNumber,
-          clauseTitle: clause.clauseTitle,
-          complianceLevel: "analysis-failed",
-          matchConfidence: 0,
-          issueSeverity: "informational",
-          sopSectionAffected: "",
-          mismatchExplanation: `Analysis batch failed: ${msg.slice(0, 100)}`,
-          sopTextSnippet: "",
-          guidelineRequirement: "",
-          suggestedAction: "",
-          suggestedText: "",
-          estimatedEffort: "medium",
-          guidelineName: clause.guidelineName,
-          folderName: clause.folderName,
-          guidelineId: clause.guidelineId,
-        });
-      }
-      // Rethrow if FIRST batch fails (indicates API/config problem)
-      if (i === 0) throw new Error(`Compliance analysis failed: ${msg}`);
-    }
+    const batchResult = await analyzeBatchResilient(
+      request.sopIdentifier,
+      request.sopName,
+      request.department,
+      indexedSopContent,
+      sectionSummary,
+      batches[i],
+      label,
+    );
+    allFindings.push(...batchResult.findings);
   }
 
-  // ── Step 5: Compute final scores ──────────────────────────────────────────
-  const compliantCount = allFindings.filter((f) => f.complianceLevel === "compliant").length;
-  const partialCount = allFindings.filter((f) => f.complianceLevel === "partial").length;
-  const nonCompliantCount = allFindings.filter((f) => f.complianceLevel === "non-compliant").length;
-  const failedCount = allFindings.filter((f) => f.complianceLevel === "analysis-failed").length;
-  const checkedCount = allFindings.length - failedCount;
+  const validatedFindings = validateAllFindings(
+    allFindings,
+    selectedClauses,
+    request.sopContent,
+    parsedSop,
+  );
 
-  // Average the per-batch scores (weighted equally)
-  const avgBatchScore = batches.length > 0 ? batchScoreSum / batches.length : 0;
+  const compliantCount = validatedFindings.filter((f) => f.complianceLevel === "compliant").length;
+  const partialCount = validatedFindings.filter((f) => f.complianceLevel === "partial").length;
+  const nonCompliantCount = validatedFindings.filter((f) => f.complianceLevel === "non-compliant").length;
+  const failedCount = validatedFindings.filter((f) => f.complianceLevel === "analysis-failed").length;
+  const checkedCount = validatedFindings.length - failedCount;
 
-  // Cross-validate: recalculate from finding counts as a sanity check
-  const calcScore =
-    checkedCount > 0
-      ? Math.max(0, 10 - ((nonCompliantCount + partialCount * 0.4) / checkedCount) * 10)
-      : 0;
+  if (checkedCount === 0 && validatedFindings.length > 0) {
+    throw new Error("Compliance analysis failed: all clauses failed to analyze. Please retry.");
+  }
 
-  // Blend AI score with calculated score for reliability
-  const finalScore = batches.length > 0
-    ? Math.round(((avgBatchScore * 0.6 + calcScore * 0.4)) * 10) / 10
-    : 0;
-  const score = Math.min(10, Math.max(0, finalScore));
+  const score = computeScoreFromFindings(validatedFindings);
 
   console.log(
-    `[complianceV3] complete — findings: ${allFindings.length} (✓${compliantCount} ~${partialCount} ✗${nonCompliantCount} ⚠${failedCount}), score: ${score}/10, time: ${Date.now() - startTime}ms`,
+    `[complianceV3] complete — ✓${compliantCount} ~${partialCount} ✗${nonCompliantCount} ⚠${failedCount} | score: ${score}/10 | validated ${validatedFindings.length} findings`,
   );
 
   return {
-    findings: allFindings,
+    findings: validatedFindings,
     overallScore: score,
     complianceStatus: getScoreLabel(score),
     compliantCount,

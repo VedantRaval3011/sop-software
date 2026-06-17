@@ -234,11 +234,31 @@ interface SiblingBank {
   bankId: string;
 }
 
+// Current active version of this SOP family, resolved from the Dashboard registry.
+// The bank doc may store an older version's identifier/name; this is the truth.
+interface CurrentVersion {
+  identifier: string;
+  version: string;
+  name: string;
+  nameGujarati: string | null;
+}
+
+// Per-language version status: is a newer version of THIS bank's language live
+// without regenerated MCQs? (English & Gujarati are compared independently.)
+interface VersionStatus {
+  language: "EN" | "GU";
+  bankVersion: number;
+  currentVersion: number;
+  isOutdated: boolean;
+}
+
 export function MCQViewerModal({ bankId, onClose, onBack }: MCQViewerModalProps) {
   // The bank currently being viewed. Starts at the opened bank, but the EN/GU
   // toggle swaps it to the sibling-language bank of the same SOP family.
   const [activeBankId, setActiveBankId] = useState(bankId);
   const [siblings, setSiblings] = useState<SiblingBank[]>([]);
+  const [current, setCurrent] = useState<CurrentVersion | null>(null);
+  const [versionStatus, setVersionStatus] = useState<VersionStatus | null>(null);
   const [bank, setBank] = useState<MCQBank | null>(null);
   const [mcqs, setMcqs] = useState<MCQ[]>([]);
   const [loading, setLoading] = useState(true);
@@ -277,6 +297,8 @@ export function MCQViewerModal({ bankId, onClose, onBack }: MCQViewerModalProps)
           setBank(data.bank);
           setMcqs(data.bank?.mcqs ?? []);
           setSiblings(data.siblings ?? []);
+          setCurrent(data.current ?? null);
+          setVersionStatus(data.versionStatus ?? null);
           // Reset the scrolled-through window when the viewed bank changes.
           setVisibleCount(BATCH);
           setSelectedQuestion(null);
@@ -339,7 +361,18 @@ export function MCQViewerModal({ bankId, onClose, onBack }: MCQViewerModalProps)
     reviewed: mcqs.filter((q) => q.isReviewed).length,
   };
 
-  const langCode = (bank?.language ?? "").toLowerCase() === "gujarati" ? "GU" : "EN";
+  const isGuj = (bank?.language ?? "").toLowerCase() === "gujarati";
+  const langCode = isGuj ? "GU" : "EN";
+
+  // Prefer the SOP family's CURRENT version (from the Dashboard) over whatever
+  // version the bank was generated from, so the header stays in sync with the
+  // Dashboard's current SOP No. / version.
+  const displayIdentifier = current?.identifier ?? bank?.sopIdentifier ?? "";
+  const displayName = current
+    ? (isGuj ? (current.nameGujarati ?? current.name) : current.name)
+    : (bank?.sopName ?? "");
+  // A newer version of this language is live but its MCQs were never generated.
+  const isOutdated = Boolean(versionStatus?.isOutdated);
 
   // Sibling-language banks for the EN/GU flip. A language is only switchable when
   // this SOP family actually has a bank in that language.
@@ -383,16 +416,25 @@ export function MCQViewerModal({ bankId, onClose, onBack }: MCQViewerModalProps)
                     </span>
                     <span className="h-1 w-1 rounded-full bg-gray-300" />
                     <span className="text-[10px] font-medium uppercase tracking-wider text-gray-400">
-                      {bank.language ?? "English"} Version
+                      {bank.language ?? "English"} Version{current ? ` · v${current.version}` : ""}
                     </span>
                   </div>
                   <div className="flex items-center gap-3">
                     <h2 className="shrink-0 text-xl font-bold text-gray-800">
-                      {bank.sopName}
+                      {displayName}
                     </h2>
                     <span className="rounded-lg border border-purple-200 bg-purple-50 px-2 py-0.5 font-mono text-xs font-bold text-purple-700">
-                      {bank.sopIdentifier}
+                      {displayIdentifier}
                     </span>
+                    {isOutdated && (
+                      <span
+                        className="flex items-center gap-1 rounded-md border border-rose-200 bg-rose-50 px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider text-rose-600"
+                        title={`A newer version (v${versionStatus?.currentVersion}) of this SOP is live — its MCQs have not been generated yet. These questions are from v${versionStatus?.bankVersion}.`}
+                      >
+                        <RefreshCw className="h-3 w-3" />
+                        v{versionStatus?.currentVersion} not generated
+                      </span>
+                    )}
                   </div>
                 </div>
               )}
@@ -598,7 +640,7 @@ export function MCQViewerModal({ bankId, onClose, onBack }: MCQViewerModalProps)
           mcq={selectedQuestion.mcq}
           index={selectedQuestion.index}
           bankId={activeBankId}
-          sopIdentifier={bank?.sopIdentifier ?? ""}
+          sopIdentifier={displayIdentifier}
           onClose={() => setSelectedQuestion(null)}
           onUpdated={(idx, patch) => {
             handleUpdated(idx, patch);

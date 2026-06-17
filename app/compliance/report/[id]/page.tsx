@@ -3,6 +3,7 @@
 import { useState, useEffect, useMemo } from 'react';
 import { useRouter, useParams } from 'next/navigation';
 import FindingCard from '../../components/FindingCard';
+import { getScoreColorClass } from '@/lib/complianceFormatter';
 
 interface ComplianceFinding {
   _id?: string;
@@ -15,6 +16,7 @@ interface ComplianceFinding {
   issueSeverity?: 'critical' | 'major' | 'minor' | 'informational';
   sopSectionAffected?: string;
   mismatchExplanation?: string;
+  impactAnalysis?: string;
   sopTextSnippet?: string;
   guidelineRequirement?: string;
   suggestedAction?: string;
@@ -48,6 +50,7 @@ export default function ComplianceReportDetailPage() {
   const [filterStatus, setFilterStatus] = useState<'all' | 'compliant' | 'partial' | 'non-compliant' | 'not-applicable'>('all');
   const [filterGuideline, setFilterGuideline] = useState('all');
   const [hideNotApplicable, setHideNotApplicable] = useState(true);
+  const [hideFailedFindings, setHideFailedFindings] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
 
   useEffect(() => {
@@ -74,6 +77,7 @@ export default function ComplianceReportDetailPage() {
       if (filterStatus !== 'all' && f.complianceLevel !== filterStatus) return false;
       if (filterGuideline !== 'all' && f.folderName !== filterGuideline) return false;
       if (hideNotApplicable && f.complianceLevel === 'not-applicable') return false;
+      if (hideFailedFindings && f.complianceLevel === 'analysis-failed') return false;
       if (searchQuery) {
         const q = searchQuery.toLowerCase();
         return f.clauseTitle?.toLowerCase().includes(q)
@@ -83,7 +87,7 @@ export default function ComplianceReportDetailPage() {
       }
       return true;
     });
-  }, [report, filterStatus, filterGuideline, hideNotApplicable, searchQuery]);
+  }, [report, filterStatus, filterGuideline, hideNotApplicable, hideFailedFindings, searchQuery]);
 
   const getStatusColor = (status: string) => {
     switch (status) {
@@ -161,10 +165,18 @@ export default function ComplianceReportDetailPage() {
               <p className="text-xs text-gray-400 mt-1">Analyzed {new Date(report.analyzedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })}</p>
             </div>
             <div className="text-center">
-              <p className={`text-5xl font-black ${report.overallScore >= 8 ? 'text-emerald-600' : report.overallScore >= 5 ? 'text-amber-600' : 'text-rose-600'}`}>
-                {report.overallScore?.toFixed(1)}
-              </p>
-              <p className="text-sm text-gray-400 font-semibold">/ 10</p>
+              <div className={`inline-flex flex-col items-center justify-center w-24 h-24 rounded-full border-4 ${
+                report.overallScore >= 8
+                  ? 'border-emerald-200 bg-emerald-50'
+                  : report.overallScore >= 5
+                    ? 'border-amber-200 bg-amber-50'
+                    : 'border-rose-200 bg-rose-50'
+              }`}>
+                <p className={`text-3xl font-black leading-none ${getScoreColorClass(report.overallScore)}`}>
+                  {report.overallScore?.toFixed(1)}
+                </p>
+                <p className="text-[10px] text-gray-400 font-semibold mt-0.5">/ 10</p>
+              </div>
             </div>
           </div>
 
@@ -227,11 +239,28 @@ export default function ComplianceReportDetailPage() {
               <input type="checkbox" checked={hideNotApplicable} onChange={e => setHideNotApplicable(e.target.checked)} className="rounded" />
               <span className="text-sm text-gray-600">Hide N/A</span>
             </label>
+            <label className="flex items-center gap-2 cursor-pointer select-none">
+              <input type="checkbox" checked={hideFailedFindings} onChange={e => setHideFailedFindings(e.target.checked)} className="rounded" />
+              <span className="text-sm text-gray-600">Hide Failed</span>
+            </label>
           </div>
 
           <div className="space-y-3">
             {visibleFindings.map((f, i) => (
-              <FindingCard key={i} finding={f} index={i} showCheckbox={false} />
+              <FindingCard
+                key={i}
+                finding={f}
+                reportContext={{
+                  sopIdentifier: report.sopIdentifier,
+                  sopName: report.sopName,
+                  department: report.department,
+                  overallScore: report.overallScore,
+                  complianceStatus: report.complianceStatus,
+                }}
+                index={i}
+                defaultExpanded={f.complianceLevel === 'partial' || f.complianceLevel === 'non-compliant'}
+                showCheckbox={false}
+              />
             ))}
             {visibleFindings.length === 0 && (
               <div className="text-center py-12 bg-gray-50 rounded-xl border border-dashed border-gray-200">

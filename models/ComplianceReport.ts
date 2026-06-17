@@ -15,6 +15,7 @@ export interface IComplianceFindingDetail {
   guidelineRequirement: string;
   suggestedAction: string;
   suggestedText: string;
+  impactAnalysis?: string;
   estimatedEffort: "low" | "medium" | "high";
   reviewStatus?: "pending" | "accepted" | "disputed" | "implemented";
 }
@@ -111,6 +112,7 @@ const ComplianceReportSchema = new Schema<IComplianceReport>(
         guidelineRequirement: { type: String },
         suggestedAction: { type: String },
         suggestedText: { type: String },
+        impactAnalysis: { type: String },
         estimatedEffort: { type: String, enum: ["low", "medium", "high"], default: "medium" },
         reviewStatus: {
           type: String,

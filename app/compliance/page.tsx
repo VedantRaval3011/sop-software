@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import FindingCard from './components/FindingCard';
+import { getScoreColorClass } from '@/lib/complianceFormatter';
 import { BookOpen, FileText, Layers, CheckCircle, Copy, X, Upload } from 'lucide-react';
 
 interface Guideline {
@@ -40,6 +41,7 @@ interface ComplianceFinding {
   issueSeverity?: 'critical' | 'major' | 'minor' | 'informational';
   sopSectionAffected?: string;
   mismatchExplanation?: string;
+  impactAnalysis?: string;
   highlightedIssue?: string;
   sopTextSnippet?: string;
   guidelineRequirement?: string;
@@ -186,6 +188,7 @@ export default function ComplianceEnginePage() {
     totalFindings: number; compliantCount: number; partialCount: number; nonCompliantCount: number; sopCount: number
   }>>({});
   const [sops, setSops] = useState<SOP[]>([]);
+  const [sopTotal, setSopTotal] = useState(0);
   const [departments, setDepartments] = useState<string[]>([]);
   const [reports, setReports] = useState<ComplianceReport[]>([]);
 
@@ -211,6 +214,7 @@ export default function ComplianceEnginePage() {
   const [filterDepartment, setFilterDepartment] = useState('all');
   const [filterStatus, setFilterStatus] = useState<'all' | 'compliant' | 'partial' | 'non-compliant' | 'not-applicable'>('all');
   const [hideNotApplicable, setHideNotApplicable] = useState(true);
+  const [hideFailedFindings, setHideFailedFindings] = useState(true);
   const [filterGuideline, setFilterGuideline] = useState('all');
   const [selectedSopId, setSelectedSopId] = useState<string>('all');
 
@@ -233,10 +237,11 @@ export default function ComplianceEnginePage() {
   const fetchSops = async () => {
     setLoadingSops(true);
     try {
-      const res = await fetch('/api/compliance/sops?limit=500');
+      const res = await fetch('/api/compliance/sops');
       const data = await res.json();
       if (data.success) {
         setSops(data.sops ?? []);
+        setSopTotal(data.total ?? data.sops?.length ?? 0);
         setDepartments(data.departments ?? []);
       }
     } catch { /* silent */ } finally { setLoadingSops(false); }
@@ -322,19 +327,28 @@ export default function ComplianceEnginePage() {
     setSopLists({ completed: [], cached: [], failed: [] });
     setActiveChip(null);
 
+    let lastAnalyzedSopId: string | null = null;
+
     for (const sop of candidates) {
       await waitIfPaused();
       setAnalysisStats(prev => ({ ...prev, currentSopName: sop.name, currentSopIdentifier: sop.identifier }));
       try {
-        const res = await fetch('/api/compliance/analyze-v3', {
+        const res = await fetch('/api/compliance/analyze-v4', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sopId: sop._id, config: { maxClausesToAnalyze: 500 } }),
+          body: JSON.stringify({ sopId: sop._id, forceRefresh: true }),
         });
         const data = await res.json().catch(() => ({ success: false, error: 'Parse error' }));
         if (data.success) {
-          setAnalysisStats(prev => ({ ...prev, completed: prev.completed + 1 }));
-          setSopLists(prev => ({ ...prev, completed: [...prev.completed, { identifier: sop.identifier, name: sop.name, score: data.overallScore ?? null, status: data.complianceStatus ?? '' }] }));
+          const entry = { identifier: sop.identifier, name: sop.name, score: data.overallScore ?? null, status: data.complianceStatus ?? '' };
+          if (data.cached) {
+            setAnalysisStats(prev => ({ ...prev, cached: prev.cached + 1 }));
+            setSopLists(prev => ({ ...prev, cached: [...prev.cached, entry] }));
+          } else {
+            setAnalysisStats(prev => ({ ...prev, completed: prev.completed + 1 }));
+            setSopLists(prev => ({ ...prev, completed: [...prev.completed, entry] }));
+          }
+          lastAnalyzedSopId = sop._id;
         } else {
           setAnalysisStats(prev => ({ ...prev, failed: prev.failed + 1 }));
           setSopLists(prev => ({ ...prev, failed: [...prev.failed, { identifier: sop.identifier, name: sop.name, error: data.error }] }));
@@ -343,15 +357,30 @@ export default function ComplianceEnginePage() {
         setAnalysisStats(prev => ({ ...prev, failed: prev.failed + 1 }));
         setSopLists(prev => ({ ...prev, failed: [...prev.failed, { identifier: sop.identifier, name: sop.name, error: err instanceof Error ? err.message : 'Network error' }] }));
       }
-      await new Promise(r => setTimeout(r, 800));
+      await new Promise(r => setTimeout(r, 2000));
     }
 
     setIsAnalyzing(false);
     setIsPaused(false);
     pauseRef.current = false;
     setAnalysisComplete(true);
-    fetchReports();
+    await fetchReports();
     fetch('/api/compliance/guideline-stats').then(r => r.json()).then(d => { if (d.success) setGuidelineStats(d.stats ?? {}); }).catch(() => {});
+
+    // Auto-open the freshly analyzed report when a single SOP was run
+    if (lastAnalyzedSopId && candidates.length === 1) {
+      try {
+        const listRes = await fetch('/api/compliance/analyze');
+        const listData = await listRes.json();
+        const report = (listData.reports ?? []).find(
+          (r: ComplianceReport) => r.sopIdentifier === candidates[0].identifier,
+        );
+        if (report) {
+          setCurrentStep('results');
+          await handleSelectReport(report);
+        }
+      } catch { /* silent */ }
+    }
   };
 
   const handleGuidelineUpload = async () => {
@@ -443,15 +472,37 @@ export default function ComplianceEnginePage() {
     fetchReports();
   };
 
+  const guidelineFolders = useMemo(() => {
+    const fromReport = selectedReport?.findings
+      ?.map((f) => f.folderName)
+      .filter(Boolean) as string[] | undefined;
+    if (fromReport?.length) return [...new Set(fromReport)];
+    return [...new Set(guidelines.map((g) => g.folder))];
+  }, [selectedReport, guidelines]);
+
   const visibleFindings = useMemo(() => {
     if (!selectedReport?.findings) return [];
-    return selectedReport.findings.map((f, i) => ({ f, i })).filter(({ f }) => {
-      if (filterStatus !== 'all' && f.complianceLevel !== filterStatus) return false;
-      if (filterGuideline !== 'all' && f.folderName !== filterGuideline) return false;
-      if (hideNotApplicable && f.complianceLevel === 'not-applicable') return false;
-      return true;
-    });
-  }, [selectedReport, filterStatus, filterGuideline, hideNotApplicable]);
+    const levelOrder: Record<string, number> = {
+      'non-compliant': 0,
+      partial: 1,
+      compliant: 2,
+      'not-applicable': 3,
+      'analysis-failed': 4,
+    };
+    return selectedReport.findings
+      .map((f, i) => ({ f, i }))
+      .filter(({ f }) => {
+        if (filterStatus !== 'all' && f.complianceLevel !== filterStatus) return false;
+        if (filterGuideline !== 'all' && f.folderName !== filterGuideline) return false;
+        if (hideNotApplicable && f.complianceLevel === 'not-applicable') return false;
+        if (hideFailedFindings && f.complianceLevel === 'analysis-failed') return false;
+        return true;
+      })
+      .sort(
+        (a, b) =>
+          (levelOrder[a.f.complianceLevel] ?? 5) - (levelOrder[b.f.complianceLevel] ?? 5),
+      );
+  }, [selectedReport, filterStatus, filterGuideline, hideNotApplicable, hideFailedFindings]);
 
   const normaliseSectionKey = (f: ComplianceFinding) => {
     const raw = f.sopSectionAffected || 'General';
@@ -493,8 +544,6 @@ export default function ComplianceEnginePage() {
     } catch { /* silent */ } finally { setSubmittingApplicable(false); }
   };
 
-  const guidelineFolders = [...new Set(guidelines.map(g => g.folder))];
-
   const progressPct = analysisStats.total > 0 ? Math.round(((analysisStats.completed + analysisStats.cached + analysisStats.failed) / analysisStats.total) * 100) : 0;
 
   return (
@@ -521,7 +570,7 @@ export default function ComplianceEnginePage() {
         {/* Step tabs */}
         <div className="flex flex-wrap items-center gap-3 mb-10">
           {([
-            { id: 'fetch-sops',       label: '1. SOPs',       icon: '📄', count: sops.length },
+            { id: 'fetch-sops',       label: '1. SOPs',       icon: '📄', count: sopTotal || sops.length },
             { id: 'fetch-guidelines', label: '2. Guidelines', icon: '📚', count: guidelines.length },
             { id: 'review',           label: '3. Review',     icon: '👁️', count: null },
             { id: 'analyze',          label: '4. Analyze',    icon: '🤖', count: null },
@@ -733,7 +782,7 @@ export default function ComplianceEnginePage() {
             <div className="flex items-center justify-between mb-8">
               <div>
                 <h2 className="text-2xl font-bold text-gray-800">SOP Repository</h2>
-                <p className="text-gray-500 mt-1">{sops.length} SOPs across {departments.length} departments available for analysis.</p>
+                <p className="text-gray-500 mt-1">{sopTotal || sops.length} SOPs across {departments.length} departments available for analysis.</p>
               </div>
               <button onClick={fetchSops} disabled={loadingSops} className="px-5 py-2.5 bg-purple-50 hover:bg-purple-100 text-purple-700 rounded-xl transition-all disabled:opacity-50 font-medium text-sm flex items-center gap-2 border border-purple-200">
                 {loadingSops ? <><span className="w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin" />Fetching...</> : '🔄 Refresh Data'}
@@ -748,7 +797,7 @@ export default function ComplianceEnginePage() {
                   onChange={e => setFilterDepartment(e.target.value)}
                   className="pl-4 pr-10 py-2.5 bg-white border border-gray-200 rounded-lg text-gray-700 focus:outline-none focus:ring-2 focus:ring-purple-500/20 text-sm appearance-none cursor-pointer hover:border-purple-300 transition-all font-medium min-w-[240px]"
                 >
-                  <option value="all">All Departments ({sops.length})</option>
+                  <option value="all">All Departments ({sopTotal || sops.length})</option>
                   {departments.map(dept => (
                     <option key={dept} value={dept}>{dept} ({sops.filter(s => s.department === dept).length})</option>
                   ))}
@@ -929,7 +978,7 @@ export default function ComplianceEnginePage() {
                     onChange={e => { setSelectedSopId(e.target.value); setPreflightData({ checked: false, existingCount: 0, newCount: 0 }); }}
                     className="w-full pl-4 pr-10 py-3 bg-white border border-gray-300 rounded-xl text-gray-700 focus:outline-none focus:ring-2 focus:ring-purple-500/20 text-sm appearance-none"
                   >
-                    <option value="all">Analyze All Available SOPs ({sops.length})</option>
+                    <option value="all">Analyze All Available SOPs ({sopTotal || sops.length})</option>
                     {sops.map(s => <option key={s._id} value={s._id}>{s.identifier} - {s.name}</option>)}
                   </select>
                   <div className="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-gray-500">▼</div>
@@ -959,7 +1008,7 @@ export default function ComplianceEnginePage() {
 
               <div className="grid grid-cols-3 gap-4 mb-8">
                 {[
-                  { label: 'TARGET SOPS', value: selectedSopId === 'all' ? sops.length : 1, sub: `across ${departments.length} departments`, color: 'border-purple-200 bg-purple-50' },
+                  { label: 'TARGET SOPS', value: selectedSopId === 'all' ? (sopTotal || sops.length) : 1, sub: `across ${departments.length} departments`, color: 'border-purple-200 bg-purple-50' },
                   { label: 'REFERENCE GUIDELINES', value: guidelines.length, sub: `from ${folders.length} categories`, color: 'border-pink-200 bg-pink-50' },
                   { label: 'TOTAL VALIDATION POINTS', value: totalClauses, sub: 'clauses to verify', color: 'border-amber-200 bg-amber-50' },
                 ].map(card => (
@@ -974,7 +1023,7 @@ export default function ComplianceEnginePage() {
               <div className="bg-gray-50 rounded-xl border border-gray-200 p-6">
                 <h3 className="font-bold text-gray-800 mb-4">Process Overview</h3>
                 <div className="space-y-3">
-                  {['Cross-referencing each SOP against all active guidelines', 'AI-driven compliance scoring (Compliant, Partial, Non-Compliant)', 'Section-level gap identification with suggested fixes', 'Consolidated report with implementation guidance'].map((step, i) => (
+                  {['Line-by-line scan of every SOP section against all guideline clauses', 'Evidence-based scoring (Compliant, Partial, Non-Compliant) with exact line references', 'Gap detection with verbatim SOP excerpts and suggested fixes', 'Validated coverage audit before final compliance score'].map((step, i) => (
                     <div key={i} className="flex items-start gap-3">
                       <span className="w-6 h-6 rounded-full bg-purple-100 text-purple-700 flex items-center justify-center text-xs font-black flex-shrink-0">{i + 1}</span>
                       <p className="text-sm text-gray-600">{step}</p>
@@ -1149,10 +1198,13 @@ export default function ComplianceEnginePage() {
                 ) : (
                   <div className="space-y-3">
                     {reports.map(r => (
-                      <button
+                      <div
                         key={r._id}
+                        role="button"
+                        tabIndex={0}
                         onClick={() => handleSelectReport(r)}
-                        className="w-full text-left p-5 bg-gray-50 border border-gray-100 rounded-xl hover:border-purple-200 hover:bg-purple-50/30 transition-all group"
+                        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handleSelectReport(r); } }}
+                        className="w-full text-left p-5 bg-gray-50 border border-gray-100 rounded-xl hover:border-purple-200 hover:bg-purple-50/30 transition-all group cursor-pointer"
                       >
                         <div className="flex items-center justify-between">
                           <div className="flex-1 min-w-0 pr-4">
@@ -1173,12 +1225,12 @@ export default function ComplianceEnginePage() {
                               <span className="text-amber-600 font-bold">{r.partialCount}~</span>
                               <span className="text-rose-600 font-bold">{r.nonCompliantCount}✗</span>
                             </div>
-                            <button onClick={(e) => handleDeleteReport(r._id, e)} className="p-1.5 text-gray-300 hover:text-rose-500 transition-colors rounded opacity-0 group-hover:opacity-100">
+                            <button type="button" onClick={(e) => handleDeleteReport(r._id, e)} className="p-1.5 text-gray-300 hover:text-rose-500 transition-colors rounded opacity-0 group-hover:opacity-100">
                               <X className="h-4 w-4" />
                             </button>
                           </div>
                         </div>
-                      </button>
+                      </div>
                     ))}
                   </div>
                 )}
@@ -1208,10 +1260,18 @@ export default function ComplianceEnginePage() {
                       <p className="text-sm text-gray-500">{selectedReport.department}</p>
                     </div>
                     <div className="text-center">
-                      <p className={`text-4xl font-black ${selectedReport.overallScore >= 8 ? 'text-emerald-600' : selectedReport.overallScore >= 5 ? 'text-amber-600' : 'text-rose-600'}`}>
-                        {selectedReport.overallScore?.toFixed(1)}
-                      </p>
-                      <p className="text-xs text-gray-400 font-semibold">/ 10</p>
+                      <div className={`inline-flex flex-col items-center justify-center w-20 h-20 rounded-full border-4 ${
+                        selectedReport.overallScore >= 8
+                          ? 'border-emerald-200 bg-emerald-50'
+                          : selectedReport.overallScore >= 5
+                            ? 'border-amber-200 bg-amber-50'
+                            : 'border-rose-200 bg-rose-50'
+                      }`}>
+                        <p className={`text-2xl font-black leading-none ${getScoreColorClass(selectedReport.overallScore)}`}>
+                          {selectedReport.overallScore?.toFixed(1)}
+                        </p>
+                        <p className="text-[10px] text-gray-400 font-semibold mt-0.5">/ 10</p>
+                      </div>
                     </div>
                   </div>
 
@@ -1245,6 +1305,10 @@ export default function ComplianceEnginePage() {
                     <label className="flex items-center gap-2 cursor-pointer select-none">
                       <input type="checkbox" checked={hideNotApplicable} onChange={e => setHideNotApplicable(e.target.checked)} className="rounded" />
                       <span className="text-sm text-gray-600">Hide N/A</span>
+                    </label>
+                    <label className="flex items-center gap-2 cursor-pointer select-none">
+                      <input type="checkbox" checked={hideFailedFindings} onChange={e => setHideFailedFindings(e.target.checked)} className="rounded" />
+                      <span className="text-sm text-gray-600">Hide Failed</span>
                     </label>
                     {visibleFindings.length > 0 && (
                       <button
@@ -1304,7 +1368,15 @@ export default function ComplianceEnginePage() {
                         <FindingCard
                           key={i}
                           finding={f}
+                          reportContext={selectedReport ? {
+                            sopIdentifier: selectedReport.sopIdentifier,
+                            sopName: selectedReport.sopName,
+                            department: selectedReport.department,
+                            overallScore: selectedReport.overallScore,
+                            complianceStatus: selectedReport.complianceStatus,
+                          } : undefined}
                           index={i}
+                          defaultExpanded={f.complianceLevel === 'partial' || f.complianceLevel === 'non-compliant'}
                           isSelected={selectedFindingIds.has(i)}
                           onToggleSelect={(idx) => {
                             const next = new Set(selectedFindingIds);
@@ -1314,7 +1386,7 @@ export default function ComplianceEnginePage() {
                           onToggleApplicable={(id, checked) => {
                             setApplicableFindings(prev => { const s = new Set(prev); if (checked) s.add(id); else s.delete(id); return s; });
                           }}
-                          isApplicable={f._id ? applicableFindings.has(f._id) : false}
+                          isApplicable={applicableFindings.has(f._id ?? `finding-${i}`)}
                           showCheckbox
                         />
                       ))}

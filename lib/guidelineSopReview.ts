@@ -9,7 +9,6 @@ import { saveComplianceReport } from "@/lib/complianceReportStorage";
 export interface GuidelineSopReviewOptions {
   sopId: string;
   guidelineIds?: string[];
-  maxClauses?: number;
 }
 
 export async function runGuidelineSopReview(options: GuidelineSopReviewOptions) {
@@ -45,7 +44,6 @@ export async function runGuidelineSopReview(options: GuidelineSopReviewOptions) 
     department: sop.department,
     sopContent: sop.content,
     guidelineClauses,
-    maxClauses: options.maxClauses ?? 500,
   });
 
   const report = await saveComplianceReport({
