@@ -1,5 +1,6 @@
 import ComplianceReport from "@/models/ComplianceReport";
 import type { ComplianceFinding } from "@/lib/complianceEngine";
+import { calculateCompliancePercentage } from "@/lib/complianceFormatter";
 import mongoose from "mongoose";
 
 export async function saveComplianceReport(data: {
@@ -20,7 +21,13 @@ export async function saveComplianceReport(data: {
   const partialCount = data.findings.filter((f) => f.complianceLevel === "partial").length;
   const nonCompliantCount = data.findings.filter((f) => f.complianceLevel === "non-compliant").length;
   const notApplicableCount = data.findings.filter((f) => f.complianceLevel === "not-applicable").length;
-  const total = data.findings.length;
+  const applicable = data.findings.filter(
+    (f) => f.complianceLevel !== "not-applicable" && f.complianceLevel !== "analysis-failed",
+  );
+  const scoreFromFindings =
+    applicable.length > 0
+      ? Math.round(calculateCompliancePercentage(compliantCount, partialCount, applicable.length)) / 10
+      : data.overallScore;
 
   const reportData = {
     sopId: new mongoose.Types.ObjectId(data.sopId),
@@ -30,9 +37,9 @@ export async function saveComplianceReport(data: {
     department: data.department,
     analysisStatus: "completed" as const,
     analysisCompletedAt: new Date(),
-    overallScore: data.overallScore,
+    overallScore: scoreFromFindings,
     complianceStatus: data.complianceStatus as never,
-    totalGuidelinesChecked: total,
+    totalGuidelinesChecked: data.findings.length,
     compliantCount,
     partialCount,
     nonCompliantCount,
@@ -52,6 +59,7 @@ export async function saveComplianceReport(data: {
       guidelineRequirement: f.guidelineRequirement,
       suggestedAction: f.suggestedAction,
       suggestedText: f.suggestedText,
+      impactAnalysis: f.impactAnalysis ?? "",
       estimatedEffort: f.estimatedEffort,
     })),
     analyzedAt: new Date(),

@@ -19,6 +19,7 @@
 
 # typescript
 *.tsbuildinfo
+tsconfig.tsbuildinfo
 
 # production
 /build

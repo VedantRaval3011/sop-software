@@ -13,6 +13,8 @@ export interface ComplianceFinding {
   guidelineRequirement: string;
   suggestedAction: string;
   suggestedText: string;
+  impactAnalysis?: string;
+  highlightedIssue?: string;
   estimatedEffort: "low" | "medium" | "high";
   guidelineName?: string;
   folderName?: string;

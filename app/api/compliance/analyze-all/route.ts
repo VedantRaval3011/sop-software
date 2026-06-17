@@ -5,6 +5,7 @@ import SOPGuideline from "@/models/SOPGuideline";
 import ComplianceReport from "@/models/ComplianceReport";
 import { analyzeSOPComplianceV3 } from "@/lib/complianceEngineV3";
 import { saveComplianceReport } from "@/lib/complianceReportStorage";
+import { getGroupedRegistryRows } from "@/lib/dashboardRegistrySource";
 import { requireAuth } from "@/lib/withAuth";
 
 export const maxDuration = 300;
@@ -18,13 +19,12 @@ export async function POST(request: NextRequest) {
     const body = await request.json();
     const { department, limit = 50, forceRefresh = false } = body;
 
-    const sopQuery: Record<string, unknown> = { isObsolete: { $ne: true } };
-    if (department) sopQuery.department = department;
+    const grouped = await getGroupedRegistryRows();
+    let activeFamilies = grouped.filter((s) => !s.isObsolete);
+    if (department) activeFamilies = activeFamilies.filter((s) => s.department === department);
+    const targetFamilies = activeFamilies.slice(0, limit);
 
-    const allSops = await SOP.find(sopQuery)
-      .sort({ identifier: 1 })
-      .limit(limit)
-      .lean();
+    const allSops = await SOP.find({ _id: { $in: targetFamilies.map((s) => s.id) } }).lean();
 
     const guidelines = await SOPGuideline.find({ ocrStatus: "completed" })
       .select("name folderName pdfName clauses.clauseNumber clauses.clauseTitle clauses.clauseText")
@@ -81,7 +81,6 @@ export async function POST(request: NextRequest) {
           department: sop.department,
           sopContent: sop.content,
           guidelineClauses,
-          maxClauses: 200,
         });
 
         await saveComplianceReport({

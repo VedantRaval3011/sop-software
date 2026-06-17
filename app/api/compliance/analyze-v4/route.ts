@@ -17,7 +17,7 @@ export async function POST(request: NextRequest) {
   try {
     await connectDB();
     const body = await request.json();
-    const { sopId, forceRefresh = false, maxClauses = 500 } = body;
+    const { sopId, forceRefresh = false } = body;
 
     if (!sopId) {
       return NextResponse.json({ success: false, error: "sopId is required" }, { status: 400 });
@@ -25,6 +25,13 @@ export async function POST(request: NextRequest) {
 
     const sop = await SOP.findById(sopId).lean();
     if (!sop) return NextResponse.json({ success: false, error: "SOP not found" }, { status: 404 });
+
+    if (!sop.content || sop.content.trim().length < 50) {
+      return NextResponse.json(
+        { success: false, error: `SOP "${sop.identifier}" has no parseable content. Re-upload the PDF.` },
+        { status: 422 },
+      );
+    }
 
     if (!forceRefresh) {
       const existing = await ComplianceReport.findOne({
@@ -79,7 +86,6 @@ export async function POST(request: NextRequest) {
       department: sop.department,
       sopContent: sop.content,
       guidelineClauses,
-      maxClauses,
     });
 
     await saveComplianceReport({
@@ -92,6 +98,18 @@ export async function POST(request: NextRequest) {
       overallScore: result.overallScore,
       complianceStatus: result.complianceStatus,
     });
+
+    await SOP.updateMany(
+      { identifier: sop.identifier },
+      {
+        complianceStatus:
+          result.overallScore >= 8
+            ? "compliant"
+            : result.overallScore >= 5
+              ? "partial"
+              : "non-compliant",
+      },
+    );
 
     return NextResponse.json({
       success: true,

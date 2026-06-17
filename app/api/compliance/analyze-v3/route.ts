@@ -18,7 +18,7 @@ export async function POST(request: NextRequest) {
     // ── 1. Database connection ─────────────────────────────────────────────
     await connectDB();
     const body = await request.json();
-    const { sopId, config } = body;
+    const { sopId } = body;
 
     if (!sopId) {
       return NextResponse.json({ success: false, error: "sopId is required" }, { status: 400 });
@@ -80,8 +80,7 @@ export async function POST(request: NextRequest) {
     console.log(`[analyze-v3] prerequisite validation passed — ${allClauses.length} valid clauses across ${guidelines.length} guidelines`);
 
     // ── 5. AI Compliance Analysis (with dept intelligence) ─────────────────
-    const maxClauses = config?.maxClausesToAnalyze ?? 120;
-    console.log(`[analyze-v3] launching V3 analysis — maxClauses: ${maxClauses}`);
+    console.log(`[analyze-v3] launching V3 analysis — full clause coverage (${allClauses.length} clauses)`);
 
     const result = await analyzeSOPComplianceV3({
       sopIdentifier: sop.identifier,
@@ -89,7 +88,6 @@ export async function POST(request: NextRequest) {
       department: sop.department,
       sopContent: sop.content,
       guidelineClauses: allClauses,
-      maxClauses,
     });
 
     console.log(`[analyze-v3] analysis done — score: ${result.overallScore}/10 | status: ${result.complianceStatus} | findings: ${result.findings.length} (✓${result.compliantCount} ~${result.partialCount} ✗${result.nonCompliantCount}) | ${result.processingTimeMs}ms`);

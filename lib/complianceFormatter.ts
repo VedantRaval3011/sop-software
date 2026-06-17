@@ -43,6 +43,60 @@ export function getSeverityBadge(severity: string): { label: string; className: 
   }
 }
 
+export function formatConfidence(value: number): number {
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  if (value <= 1) return Math.round(value * 100);
+  return Math.round(Math.min(100, value));
+}
+
+export function getComplianceLevelBorder(level: string): string {
+  switch (level) {
+    case "compliant":
+      return "border-l-emerald-500";
+    case "partial":
+      return "border-l-amber-500";
+    case "non-compliant":
+      return "border-l-rose-500";
+    case "not-applicable":
+      return "border-l-slate-400";
+    default:
+      return "border-l-blue-400";
+  }
+}
+
+export function getScoreColorClass(score: number): string {
+  if (score >= 8) return "text-emerald-600";
+  if (score >= 5) return "text-amber-600";
+  return "text-rose-600";
+}
+
+export function buildImpactAnalysis(
+  finding: {
+    mismatchExplanation?: string;
+    issueSeverity?: string;
+    clauseNumber?: string;
+    guidelineName?: string;
+  },
+  requirement: string,
+): string {
+  const clauseRef = finding.guidelineName
+    ? `Clause ${finding.clauseNumber} of ${finding.guidelineName}`
+    : `Clause ${finding.clauseNumber ?? "requirement"}`;
+
+  const risk =
+    finding.issueSeverity === "critical"
+      ? "critical audit findings, product quality risk, or regulatory action"
+      : finding.issueSeverity === "major"
+        ? "audit findings, batch failure, or a mandatory Corrective and Preventive Action (CAPA)"
+        : "documentation gaps during internal or regulatory inspection";
+
+  const reqPart = requirement
+    ? ` The guideline requires: '${requirement.length > 220 ? `${requirement.slice(0, 220)}...` : requirement}' — this must be explicitly demonstrated in the SOP text.`
+    : "";
+
+  return `This may result in ${risk} by not fully addressing ${clauseRef}.${reqPart}`;
+}
+
 export function calculateCompliancePercentage(
   compliant: number,
   partial: number,
