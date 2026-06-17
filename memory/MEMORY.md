@@ -1,0 +1,1 @@
+- [SOP cache instant sync](sop-cache-instant-sync.md) — SOP edits must propagate to matrices + LMS via invalidateSopDerivedCaches
