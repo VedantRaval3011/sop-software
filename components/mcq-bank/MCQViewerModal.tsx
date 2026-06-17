@@ -229,11 +229,23 @@ interface MCQViewerModalProps {
   onBack?: () => void;
 }
 
+interface SiblingBank {
+  langCode: "EN" | "GU";
+  bankId: string;
+}
+
 export function MCQViewerModal({ bankId, onClose, onBack }: MCQViewerModalProps) {
+  // The bank currently being viewed. Starts at the opened bank, but the EN/GU
+  // toggle swaps it to the sibling-language bank of the same SOP family.
+  const [activeBankId, setActiveBankId] = useState(bankId);
+  const [siblings, setSiblings] = useState<SiblingBank[]>([]);
   const [bank, setBank] = useState<MCQBank | null>(null);
   const [mcqs, setMcqs] = useState<MCQ[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // Re-sync when a different SOP/bank is opened from outside.
+  useEffect(() => { setActiveBankId(bankId); }, [bankId]);
 
   const [activeTab, setActiveTab] = useState<TabType>("active");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
@@ -258,12 +270,16 @@ export function MCQViewerModal({ bankId, onClose, onBack }: MCQViewerModalProps)
       setLoading(true);
       setError(null);
       try {
-        const res = await fetch(`/api/mcq-bank/bank?id=${bankId}`);
+        const res = await fetch(`/api/mcq-bank/bank?id=${activeBankId}`);
         const data = await res.json();
         if (!res.ok) throw new Error(data.error ?? "Failed");
         if (!cancelled) {
           setBank(data.bank);
           setMcqs(data.bank?.mcqs ?? []);
+          setSiblings(data.siblings ?? []);
+          // Reset the scrolled-through window when the viewed bank changes.
+          setVisibleCount(BATCH);
+          setSelectedQuestion(null);
         }
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : "Failed");
@@ -273,7 +289,7 @@ export function MCQViewerModal({ bankId, onClose, onBack }: MCQViewerModalProps)
     }
     load();
     return () => { cancelled = true; };
-  }, [bankId]);
+  }, [activeBankId]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") (onBack ?? onClose)(); };
@@ -324,6 +340,14 @@ export function MCQViewerModal({ bankId, onClose, onBack }: MCQViewerModalProps)
   };
 
   const langCode = (bank?.language ?? "").toLowerCase() === "gujarati" ? "GU" : "EN";
+
+  // Sibling-language banks for the EN/GU flip. A language is only switchable when
+  // this SOP family actually has a bank in that language.
+  const enSibling = siblings.find((s) => s.langCode === "EN");
+  const guSibling = siblings.find((s) => s.langCode === "GU");
+  const switchLang = (target: SiblingBank | undefined) => {
+    if (target && target.bankId !== activeBankId) setActiveBankId(target.bankId);
+  };
 
   const filterPills = [
     { id: "all" as const,      label: "All",      icon: <Grid className="h-3.5 w-3.5" />,        activeClass: "text-indigo-400" },
@@ -409,15 +433,29 @@ export function MCQViewerModal({ bankId, onClose, onBack }: MCQViewerModalProps)
                   <span className="hidden sm:inline">Smart Regenerate</span>
                 </button>
 
-                {/* EN/GU toggle */}
+                {/* EN/GU toggle — flips between the English & Gujarati banks of this SOP */}
                 <div className="flex overflow-hidden rounded-xl border border-gray-200">
                   <button type="button"
+                    onClick={() => switchLang(enSibling)}
+                    disabled={!enSibling || langCode === "EN"}
+                    title={enSibling ? "View English version" : "No English version for this SOP"}
                     className={`px-3 py-2 text-[10px] font-bold uppercase tracking-wider transition-all ${
-                      langCode === "EN" ? "bg-purple-100 text-purple-700" : "bg-white text-gray-500 hover:bg-gray-100"
+                      langCode === "EN"
+                        ? "bg-purple-100 text-purple-700"
+                        : enSibling
+                        ? "bg-white text-gray-500 hover:bg-gray-100 cursor-pointer"
+                        : "bg-white text-gray-300 cursor-not-allowed"
                     }`}>EN</button>
                   <button type="button"
+                    onClick={() => switchLang(guSibling)}
+                    disabled={!guSibling || langCode === "GU"}
+                    title={guSibling ? "View Gujarati version" : "No Gujarati version for this SOP"}
                     className={`px-3 py-2 text-[10px] font-bold uppercase tracking-wider transition-all ${
-                      langCode === "GU" ? "bg-purple-100 text-purple-700" : "bg-white text-gray-500 hover:bg-gray-100"
+                      langCode === "GU"
+                        ? "bg-purple-100 text-purple-700"
+                        : guSibling
+                        ? "bg-white text-gray-500 hover:bg-gray-100 cursor-pointer"
+                        : "bg-white text-gray-300 cursor-not-allowed"
                     }`}>GU</button>
                 </div>
 
@@ -542,7 +580,7 @@ export function MCQViewerModal({ bankId, onClose, onBack }: MCQViewerModalProps)
                     key={originalIndex}
                     mcq={mcq}
                     originalIndex={originalIndex}
-                    bankId={bankId}
+                    bankId={activeBankId}
                     searchTerm={searchTerm}
                     onUpdated={handleUpdated}
                     onOpen={() => setSelectedQuestion({ mcq, index: originalIndex })}
@@ -559,7 +597,7 @@ export function MCQViewerModal({ bankId, onClose, onBack }: MCQViewerModalProps)
         <QuestionAnalyticsModal
           mcq={selectedQuestion.mcq}
           index={selectedQuestion.index}
-          bankId={bankId}
+          bankId={activeBankId}
           sopIdentifier={bank?.sopIdentifier ?? ""}
           onClose={() => setSelectedQuestion(null)}
           onUpdated={(idx, patch) => {
