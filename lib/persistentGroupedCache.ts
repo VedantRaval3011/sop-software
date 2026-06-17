@@ -17,8 +17,8 @@ import type { RegistrySOP } from "@/lib/types";
  * treat the cache as stale. No mutation handler needs to know this exists. */
 
 // Bump when grouped-registry computation logic changes (e.g. version-date rules).
-const CACHE_KEY = "grouped-registry-v3";
-const LEGACY_CACHE_KEYS = ["grouped-registry-v2", "grouped-registry-v1"] as const;
+const CACHE_KEY = "grouped-registry-v5";
+const LEGACY_CACHE_KEYS = ["grouped-registry-v4", "grouped-registry-v3", "grouped-registry-v2", "grouped-registry-v1"] as const;
 
 interface Signature {
   count: number;

@@ -44,6 +44,7 @@ import { DocPreviewModal } from "@/components/shared/DocPreviewModal";
    Registry and the MCQ Bank Registry render SOP No. / SOP Name identically. */
 
 const registryTdBase = "px-1 py-1 align-middle overflow-hidden max-w-0";
+const registrySopNoTd = "px-1 py-1 align-middle whitespace-nowrap";
 
 /* ─── Media (video / slide) preview modal ────────────────────────────── */
 function isVideoUrl(url: string): boolean {
@@ -473,9 +474,9 @@ export function SOPRegistryTable({
             <colgroup>
               <col style={{ width: "1.5%" }} />
               <col style={{ width: "2%" }} />
-              <col style={{ width: "5.5%" }} />
+              <col style={{ width: "7.5%" }} />
               <col style={{ width: "2.5%" }} />
-              <col style={{ width: canMutate ? "15%" : "17%" }} />
+              <col style={{ width: canMutate ? "13%" : "15%" }} />
               <col style={{ width: "3.5%" }} />
               <col style={{ width: "5%" }} />
               <col style={{ width: canMutate ? "15.5%" : "16.5%" }} />
@@ -776,10 +777,8 @@ const SOPRow = memo(function SOPRow({
         </td>
 
         {/* SOP No */}
-        <td className={`${registryTdBase} font-mono text-[13px] font-bold tracking-wider text-purple-700 group-hover:underline`}>
-          <span className="block truncate" title={displaySopCode(sop.identifier)}>
-            {displaySopCode(sop.identifier)}
-          </span>
+        <td className={`${registrySopNoTd} font-mono text-[13px] font-bold tracking-wider text-purple-700 group-hover:underline`}>
+          {displaySopCode(sop.identifier)}
         </td>
 
         {/* Ver */}
@@ -1015,8 +1014,18 @@ function SOPDetailPanel({
     : null;
 
   const fileGroups = [
-    { lang: "ENG", docx: sop.files.docx.en, pdf: sop.files.pdf.en },
-    { lang: "GUJ", docx: sop.files.docx.gu, pdf: sop.files.pdf.gu },
+    {
+      lang: "ENG",
+      docx: sop.files.docx.en,
+      pdf: sop.files.pdf.en,
+      docxDateError: sop.files.docxDateError?.en,
+    },
+    {
+      lang: "GUJ",
+      docx: sop.files.docx.gu,
+      pdf: sop.files.pdf.gu,
+      docxDateError: sop.files.docxDateError?.gu,
+    },
   ].filter((g) => g.docx || g.pdf);
 
   // In the archive view the panel shows the superseded (archived) revisions instead of
@@ -1037,8 +1046,12 @@ function SOPDetailPanel({
               </span>
             ) : (
               <span key={`${pv.version}-${pv.language}`} className="flex items-center gap-0.5 text-[8px] font-bold">
-                <span className="text-green-700">V{pv.version}</span>
-                {pv.docx ? <FileLink filePath={pv.docx} label="DOCX" /> : <span className="text-red-500">DOCX</span>}
+                <span className={pv.docxDateError ? "text-red-700" : "text-green-700"}>V{pv.version}</span>
+                {pv.docx ? (
+                  <FileLink filePath={pv.docx} label="DOCX" hasError={pv.docxDateError} />
+                ) : (
+                  <span className="text-red-500">DOCX</span>
+                )}
                 <span className="select-none text-gray-300">/</span>
                 {pv.pdf ? <FileLink filePath={pv.pdf} label="PDF" isPdf /> : <span className="text-red-500">PDF</span>}
               </span>
@@ -1080,7 +1093,11 @@ function SOPDetailPanel({
                   <div key={g.lang} className="flex items-center gap-1.5">
                     <span className="w-7 shrink-0 text-[8px] font-bold text-gray-400">{g.lang}</span>
                     <div className="flex items-center gap-2 text-[8px] font-bold">
-                      {g.docx ? <FileLink filePath={g.docx} label="DOCX" /> : <span className="text-red-500">DOCX&nbsp;✗</span>}
+                      {g.docx ? (
+                        <FileLink filePath={g.docx} label="DOCX" hasError={g.docxDateError} />
+                      ) : (
+                        <span className="text-red-500">DOCX&nbsp;✗</span>
+                      )}
                       {g.pdf ? <FileLink filePath={g.pdf} label="PDF" isPdf /> : <span className="text-red-500">PDF&nbsp;✗</span>}
                     </div>
                   </div>
@@ -1218,11 +1235,12 @@ function FilesCell({ sop }: { sop: RegistrySOP }) {
     langLabel: string,
     docxPath: string | undefined,
     pdfPath: string | undefined,
+    docxHasError?: boolean,
   ) => (
     <div className="flex min-w-0 items-center gap-1.5 text-left leading-none">
       <span className="w-4.5 shrink-0 text-[8px] font-bold text-gray-500">{langLabel}</span>
       {docxPath ? (
-        <FileLink filePath={docxPath} label="DOCX" />
+        <FileLink filePath={docxPath} label="DOCX" hasError={docxHasError} />
       ) : (
         <span className="truncate text-[8px] font-bold leading-none text-red-600" title="DOCX missing">DOCX&nbsp;✗</span>
       )}
@@ -1237,15 +1255,15 @@ function FilesCell({ sop }: { sop: RegistrySOP }) {
   if (!hasGu) {
     return (
       <div className="mx-auto flex w-full min-w-0 flex-col gap-1 text-left leading-none">
-        {renderLangRow("ENG", sop.files.docx.en, sop.files.pdf.en)}
+        {renderLangRow("ENG", sop.files.docx.en, sop.files.pdf.en, sop.files.docxDateError?.en)}
       </div>
     );
   }
 
   return (
     <div className="mx-auto flex w-full min-w-0 flex-col gap-1 text-left leading-none">
-      {renderLangRow("ENG", sop.files.docx.en, sop.files.pdf.en)}
-      {renderLangRow("GUJ", sop.files.docx.gu, sop.files.pdf.gu)}
+      {renderLangRow("ENG", sop.files.docx.en, sop.files.pdf.en, sop.files.docxDateError?.en)}
+      {renderLangRow("GUJ", sop.files.docx.gu, sop.files.pdf.gu, sop.files.docxDateError?.gu)}
     </div>
   );
 }
@@ -1254,10 +1272,12 @@ function FileLink({
   filePath,
   label,
   isPdf,
+  hasError,
 }: {
   filePath: string;
   label: string;
   isPdf?: boolean;
+  hasError?: boolean;
 }) {
   const [previewOpen, setPreviewOpen] = useState(false);
   const openPreview = useCallback((e: React.MouseEvent) => {
@@ -1271,9 +1291,11 @@ function FileLink({
       <div className="flex min-w-0 items-center gap-px overflow-hidden">
         <button
           type="button"
-          className="min-w-0 truncate font-bold text-[9px] text-green-600 hover:underline cursor-pointer"
+          className={`min-w-0 truncate font-bold text-[9px] hover:underline cursor-pointer ${
+            hasError ? "text-red-600" : "text-green-600"
+          }`}
           onClick={openPreview}
-          title={`Preview ${label}`}
+          title={hasError ? `${label} — header dates invalid or missing` : `Preview ${label}`}
         >
           {label}
         </button>
@@ -1316,9 +1338,15 @@ function PriorVersionEntry({ pv }: { pv: PriorVersion }) {
   }
   return (
     <span className="inline-flex items-center gap-px leading-none whitespace-nowrap">
-      <span className="shrink-0 text-[9px] font-bold text-green-700">V{pv.version}</span>
+      <span className={`shrink-0 text-[9px] font-bold ${pv.docxDateError ? "text-red-700" : "text-green-700"}`}>
+        V{pv.version}
+      </span>
       <span className="mx-0.5 shrink-0 text-[8px] font-bold">
-        {pv.docx ? <FileLink filePath={pv.docx} label="DOCX" /> : <span className="text-red-500">DOCX</span>}
+        {pv.docx ? (
+          <FileLink filePath={pv.docx} label="DOCX" hasError={pv.docxDateError} />
+        ) : (
+          <span className="text-red-500">DOCX</span>
+        )}
       </span>
       <span className="select-none text-[8px] text-gray-400">/</span>
       <span className="mx-0.5 shrink-0 text-[8px] font-bold">

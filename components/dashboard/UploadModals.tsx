@@ -5,7 +5,7 @@ import { useDropzone } from "react-dropzone";
 import { Upload } from "lucide-react";
 import { useDashboardStore } from "@/lib/store/dashboard-store";
 import { appendFilesWithPaths } from "@/lib/upload-form";
-import { BulkUploadProgressBar, type UploadProgress } from "./BulkUploadShell";
+import { BulkUploadProgressBar, BulkUploadResults, sopUploadToastMessage, summarizeSopUploadResults, type SopUploadResult, type UploadProgress } from "./BulkUploadShell";
 import { Btn, Modal } from "./ui";
 
 const UPLOAD_BATCH_SIZE = 8;
@@ -42,9 +42,7 @@ export function UploadSOPModal({
   const [generateMcq, setGenerateMcq] = useState(true);
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
-  const [results, setResults] = useState<
-    Array<{ file: string; success: boolean; error?: string }>
-  >([]);
+  const [results, setResults] = useState<SopUploadResult[]>([]);
   const { addPipelineJob, showToast } = useDashboardStore();
 
   const allDepts = [...new Set([...DEPARTMENTS, ...departmentList])];
@@ -57,7 +55,7 @@ export function UploadSOPModal({
       setResults([]);
 
       try {
-        const allResults: Array<{ file: string; success: boolean; error?: string; identifier?: string }> = [];
+        const allResults: SopUploadResult[] = [];
 
         for (let start = 0; start < acceptedFiles.length; start += UPLOAD_BATCH_SIZE) {
           const batch = acceptedFiles.slice(start, start + UPLOAD_BATCH_SIZE);
@@ -97,10 +95,12 @@ export function UploadSOPModal({
           }
         }
 
-        const successCount = allResults.filter((r) => r.success).length;
-        if (successCount > 0) {
-          showToast(`Uploaded ${successCount} file(s) successfully`);
+        const summary = summarizeSopUploadResults(allResults);
+        if (summary.success > 0) {
+          showToast(sopUploadToastMessage(summary));
           onSuccess();
+        } else if (allResults.length > 0) {
+          showToast(sopUploadToastMessage(summary));
         }
       } catch (err) {
         setResults([
@@ -237,20 +237,7 @@ export function UploadSOPModal({
         </div>
       ) : null}
 
-      {results.length > 0 && (
-        <div className="mt-3 space-y-1">
-          {results.map((r) => (
-            <div
-              key={r.file}
-              className={`rounded px-2 py-1 text-xs ${
-                r.success ? "bg-emerald-50 text-emerald-800" : "bg-red-50 text-red-800"
-              }`}
-            >
-              {r.file}: {r.success ? "Success" : r.error}
-            </div>
-          ))}
-        </div>
-      )}
+      {results.length > 0 ? <BulkUploadResults results={results} /> : null}
 
       <div className="mt-4 flex justify-end">
         <Btn onClick={onClose}>Close</Btn>

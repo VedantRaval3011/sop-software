@@ -7,6 +7,7 @@ import { useRouter } from 'next/navigation';
 import {
   ArrowLeft, Loader2, Settings, RefreshCw, Trophy,
   UserX, UserCheck, ChevronDown, Search, CheckCircle2, Clock, Circle, X,
+  LayoutDashboard,
 } from 'lucide-react';
 import {
   lmsClientFields,
@@ -109,6 +110,12 @@ export default function LmsAdminPage() {
             <h1 className="text-sm font-bold tracking-tight">LMS Training Status</h1>
           </div>
           <div className="flex items-center gap-2">
+            <Link
+              href="/lms/admin/employee-training"
+              className="flex items-center gap-1.5 rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50"
+            >
+              <LayoutDashboard className="h-3.5 w-3.5" /> Training Dashboard
+            </Link>
             <Link
               href="/lms/admin/exam-settings"
               className="flex items-center gap-1.5 rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50"

@@ -34,6 +34,7 @@ export interface RegistrySOP {
   files: {
     docx: FileLinks;
     pdf: FileLinks;
+    docxDateError?: FileLinks;
   };
   media: {
     videos: { en: number; gu: number };
@@ -50,6 +51,7 @@ export interface RegistrySOP {
    *  never deleted. Files and metadata are preserved on these records. */
   archivedVersions: PriorVersion[];
   hasVersion: boolean;
+  /** All required prior-version DOCX header dates in the registry window are valid. */
   hasVersionDate: boolean;
   hasVersionDateEn: boolean;
   hasVersionDateGu: boolean;
@@ -64,6 +66,8 @@ export interface PriorVersion {
   pdf?: string;
   /** True when this version is expected (below the current version) but was never uploaded. */
   missing?: boolean;
+  /** DOCX header dates (EFF. DATE / REVIEW DT.) are missing, empty, invalid, or illogical. */
+  docxDateError?: boolean;
 }
 
 export interface EditSOPFormData {

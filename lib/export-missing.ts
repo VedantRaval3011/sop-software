@@ -56,8 +56,8 @@ function missingItems(sop: RegistrySOP): string {
   if (need.en && !sop.files.pdf.en) missing.push("PDF (ENG)");
   if (need.gu && !sop.files.pdf.gu) missing.push("PDF (GUJ)");
   if (!sop.hasVersion) missing.push("Version No.");
-  if (need.en && !sop.hasVersionDateEn) missing.push("Version Date (ENG)");
-  if (need.gu && !sop.hasVersionDateGu) missing.push("Version Date (GUJ)");
+  if (need.en && !sop.hasVersionDateEn) missing.push("Prior Header Dates (ENG)");
+  if (need.gu && !sop.hasVersionDateGu) missing.push("Prior Header Dates (GUJ)");
   if (sop.media.videos.en + sop.media.videos.gu === 0) missing.push("Training Video");
   if (sop.media.slides.en + sop.media.slides.gu === 0) missing.push("Slides");
   if (!sop.expiryDate) missing.push("Expiry Date");

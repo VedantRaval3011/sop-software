@@ -134,6 +134,150 @@ function extractValidityMonths(content: string): number | undefined {
   return months > 0 && months <= 120 ? months : undefined;
 }
 
+export type SopHeaderDateValidationError =
+  | "missing_effective_label"
+  | "missing_review_label"
+  | "empty_effective"
+  | "empty_review"
+  | "invalid_effective"
+  | "invalid_review"
+  | "review_before_effective";
+
+export type SopHeaderDateValidation = {
+  valid: boolean;
+  errors: SopHeaderDateValidationError[];
+  effectiveDate?: Date;
+  reviewDate?: Date;
+};
+
+const HEADER_STOP_LABEL =
+  /\b(?:EFF\.?\s*DATE|REVIEW\s*DT\.?|SUPERSEDES|PAGE\s*NO\.?|SOP\s*NO\.?|DEPARTMENT|SUBJECT|PREPARED\s*BY|લાગુ\s*પડેલ|ફેર\s*ચકાસણી|રદ\s*કરેલ|વિષય)\b/i;
+
+const NON_DATE_VALUES = /^(?:nil|na|n\/a|-|—|--|\.|none)$/i;
+
+const HEADER_LABEL_PAIRS: Array<{
+  effective: RegExp;
+  review: RegExp;
+}> = [
+  { effective: /\bEFF\.?\s*DATE\b/i, review: /\bREVIEW\s*DT\.?\b/i },
+  {
+    effective: /લાગુ\s*પડેલ\s*તારીખ/i,
+    review: /ફેર\s*ચકાસણી\s*તારીખ/i,
+  },
+];
+
+function peelHeaderValue(header: string, label: RegExp): { found: boolean; raw: string } {
+  const idx = header.search(label);
+  if (idx < 0) return { found: false, raw: "" };
+
+  const after = header.slice(idx).replace(label, "").replace(/^[\s:.]+/, "");
+  let raw = after.slice(0, 80);
+  const stop = raw.search(HEADER_STOP_LABEL);
+  if (stop >= 0) raw = raw.slice(0, stop);
+  return { found: true, raw: raw.trim() };
+}
+
+function parseHeaderDateValue(raw: string): Date | null {
+  if (!raw || NON_DATE_VALUES.test(raw.trim())) return null;
+  const token = raw.match(DATE_TOKEN)?.[0];
+  if (!token) return null;
+  return parseFlexibleSopDate(token);
+}
+
+function headerLabelPairsForLanguage(language: "English" | "Gujarati") {
+  if (language === "English") return [HEADER_LABEL_PAIRS[0]];
+  return HEADER_LABEL_PAIRS;
+}
+
+/**
+ * Strict validation of the page-header EFF. DATE / REVIEW DT. pair (or Gujarati
+ * equivalents). Used to flag prior-version DOCX files with missing, empty, or
+ * illogical dates.
+ */
+export function validateSopHeaderDates(
+  content: string,
+  language: "English" | "Gujarati" = "English",
+): SopHeaderDateValidation {
+  if (!content || content.startsWith("[")) {
+    return {
+      valid: false,
+      errors: ["missing_effective_label", "missing_review_label"],
+    };
+  }
+
+  const header = content.slice(0, 4000);
+  const errors: SopHeaderDateValidationError[] = [];
+
+  let effectiveRaw: string | undefined;
+  let reviewRaw: string | undefined;
+  let pairFound = false;
+
+  for (const pair of headerLabelPairsForLanguage(language)) {
+    const eff = peelHeaderValue(header, pair.effective);
+    const rev = peelHeaderValue(header, pair.review);
+    if (!eff.found || !rev.found) continue;
+    pairFound = true;
+    effectiveRaw = eff.raw;
+    reviewRaw = rev.raw;
+    break;
+  }
+
+  if (!pairFound) {
+    const primary = headerLabelPairsForLanguage(language)[0];
+    if (!peelHeaderValue(header, primary.effective).found) {
+      errors.push("missing_effective_label");
+    }
+    if (!peelHeaderValue(header, primary.review).found) {
+      errors.push("missing_review_label");
+    }
+    return { valid: false, errors };
+  }
+
+  if (!effectiveRaw) errors.push("empty_effective");
+  if (!reviewRaw) errors.push("empty_review");
+
+  const effectiveDate = effectiveRaw ? parseHeaderDateValue(effectiveRaw) : null;
+  const reviewDate = reviewRaw ? parseHeaderDateValue(reviewRaw) : null;
+
+  if (effectiveRaw && !effectiveDate) errors.push("invalid_effective");
+  if (reviewRaw && !reviewDate) errors.push("invalid_review");
+
+  if (effectiveDate && reviewDate && reviewDate < effectiveDate) {
+    errors.push("review_before_effective");
+  }
+
+  return {
+    valid: errors.length === 0,
+    errors,
+    effectiveDate: effectiveDate ?? undefined,
+    reviewDate: reviewDate ?? undefined,
+  };
+}
+
+export function sopHeaderDatesValid(
+  content: string,
+  language: "English" | "Gujarati" = "English",
+): boolean {
+  return validateSopHeaderDates(content, language).valid;
+}
+
+const HEADER_DATE_ERROR_MESSAGES: Record<SopHeaderDateValidationError, string> = {
+  missing_effective_label:
+    "EFF. DATE (or Gujarati લાગુ પડેલ તારીખ) not found in the page header",
+  missing_review_label:
+    "REVIEW DT. (or Gujarati ફેર ચકાસણી તારીખ) not found in the page header",
+  empty_effective: "EFF. DATE is empty",
+  empty_review: "REVIEW DT. is empty",
+  invalid_effective: "EFF. DATE is not a valid date",
+  invalid_review: "REVIEW DT. is not a valid date",
+  review_before_effective: "REVIEW DT. must be on or after EFF. DATE",
+};
+
+/** Human-readable upload / UI message for header date validation failures. */
+export function formatSopHeaderDateErrors(errors: SopHeaderDateValidationError[]): string {
+  return errors.map((e) => HEADER_DATE_ERROR_MESSAGES[e]).join("; ");
+}
+
 /** Page-header table dates (EFF. DATE / REVIEW DT.) — authoritative for version vs review. */
 function extractHeaderTableDates(content: string): Pick<ExtractedSopDates, "effectiveDate" | "reviewDate"> {
   const header = content.slice(0, 3000);

@@ -4,6 +4,8 @@ import SOP from "@/models/SOP";
 import {
   resolveSopDatesFromContent,
   sopDatesToDbFields,
+  formatSopHeaderDateErrors,
+  validateSopHeaderDates,
 } from "@/lib/sop-dates";
 import {
   defaultExpiryDate,
@@ -29,6 +31,7 @@ import {
 import { extractTextFromBuffer } from "@/lib/extractContent";
 import { triggerMcqGenerationAsync } from "@/lib/mcq-generation";
 import { invalidateDashboardSopsCache } from "@/lib/server-cache";
+import { refreshFamilyPriorHeaderDateFlags } from "@/lib/prior-header-dates";
 import { requireAuth } from "@/lib/withAuth";
 
 export async function processSopUpload(formData: FormData) {
@@ -59,8 +62,17 @@ export async function processSopUpload(formData: FormData) {
       `${deferReconcile ? ", reconcile=deferred" : ""}`,
   );
 
-  const results: Array<{ file: string; success: boolean; error?: string; id?: string; identifier?: string }> = [];
+  const results: Array<{
+    file: string;
+    success: boolean;
+    error?: string;
+    id?: string;
+    identifier?: string;
+    headerDateError?: boolean;
+    headerDateErrors?: string[];
+  }> = [];
   const mcqIdentifiers = new Set<string>();
+  const touchedFamilies = new Set<string>();
 
   for (const [index, file] of files.entries()) {
     try {
@@ -103,6 +115,25 @@ export async function processSopUpload(formData: FormData) {
       // Filename hints first, then correct against the document's actual script
       // (a Gujarati doc with an English-looking filename must not stay "English").
       const lang = languageFromContentScript(content, resolveUploadLanguage(relativePath, language));
+
+      if (fileType === "docx") {
+        const headerDateValidation = validateSopHeaderDates(content, lang);
+        if (!headerDateValidation.valid) {
+          const message = formatSopHeaderDateErrors(headerDateValidation.errors);
+          console.warn(
+            `[sop-upload] rejected ${identifier} v${resolvedVersion} ${lang}: ${message}`,
+          );
+          results.push({
+            file: file.name,
+            success: false,
+            error: message,
+            identifier,
+            headerDateError: true,
+            headerDateErrors: headerDateValidation.errors,
+          });
+          continue;
+        }
+      }
 
       // Language-aware name: English docs → English title, Gujarati docs → Gujarati title.
       const name = deriveSopRecordName({
@@ -181,6 +212,7 @@ export async function processSopUpload(formData: FormData) {
         metadata: { fileSize },
         sopDocuments: [docEntry],
         ...dateFields,
+        ...(fileType === "docx" ? { headerDatesValid: true } : {}),
       };
 
       let sop = existing;
@@ -216,6 +248,7 @@ export async function processSopUpload(formData: FormData) {
       }
 
       if (generateMcq) mcqIdentifiers.add(identifier);
+      touchedFamilies.add(sopBaseId);
       console.log(
         `[sop-upload] ✓ (${index + 1}/${files.length}) ${identifier} v${resolvedVersion} ${lang} ${fileType} → ${department}`,
       );
@@ -257,6 +290,15 @@ export async function processSopUpload(formData: FormData) {
       await reconcileSopVersions();
     } catch (e) {
       console.error("[sop-upload] post-upload reconcile error:", e);
+    }
+  }
+
+  for (const sopBaseId of touchedFamilies) {
+    try {
+      const family = await SOP.find({ sopBaseId, isObsolete: { $ne: true } });
+      if (family.length) await refreshFamilyPriorHeaderDateFlags(family);
+    } catch (e) {
+      console.error(`[sop-upload] prior header date refresh error for ${sopBaseId}:`, e);
     }
   }
 
