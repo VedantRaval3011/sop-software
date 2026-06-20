@@ -9,6 +9,7 @@ import {
   aggregateMcqBanksByFamily,
   buildActiveSopFamilyMap,
   findObsoleteMcqFamilies,
+  mcqFamilyComplete,
 } from "@/lib/mcq-bank-utils";
 import { reconcileMcqBankObsoleteFlags } from "@/lib/mcq-bank-sync";
 
@@ -150,7 +151,18 @@ export async function GET() {
       if (!deptMap.has(dept)) deptMap.set(dept, initAcc());
       const d = deptMap.get(dept)!;
 
-      d.sopWithMcqs++;
+      // A dual-language SOP only counts as "with MCQ" when BOTH its English and
+      // Gujarati banks carry questions; a single-language SOP needs only its one
+      // language. Partial coverage falls through to "without MCQ".
+      const sop = sopFamilyMap.get(famKey);
+      const complete = mcqFamilyComplete(
+        {
+          needsEn: sop?.languages.has("English") ?? false,
+          needsGu: sop?.languages.has("Gujarati") ?? false,
+        },
+        bank,
+      );
+      if (complete) d.sopWithMcqs++;
       d.totalQ += bank.totalQ;
       d.checkedQ += bank.checkedQ;
       d.reviewedQ += bank.reviewedQ;
@@ -167,8 +179,6 @@ export async function GET() {
       } else if (bank.totalQ > 0) {
         d.pendingSops++;
       }
-
-      void famKey; // family key used for matching only
     }
 
     for (const [, d] of deptMap) {

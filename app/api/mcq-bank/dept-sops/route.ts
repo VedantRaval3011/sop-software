@@ -10,6 +10,7 @@ import {
   aggregateMcqBanksByFamily,
   buildActiveSopFamilyMap,
   findObsoleteMcqFamilies,
+  mcqFamilyComplete,
   mcqResolveDept,
 } from "@/lib/mcq-bank-utils";
 
@@ -26,6 +27,9 @@ interface FamilyBank {
   checkedQ: number;
   reviewedQ: number;
   similarQ: number;
+  /** Per-language question totals — drive the dual-language completeness check. */
+  enQ: number;
+  guQ: number;
   lastUpdated: Date | null;
   banks: { id: string; language: string }[];
 }
@@ -92,7 +96,7 @@ export async function GET(request: NextRequest) {
       if (orphanFamKeys.has(fam)) continue;
       if (!banksByFamily.has(fam)) {
         banksByFamily.set(fam, {
-          totalQ: 0, checkedQ: 0, reviewedQ: 0, similarQ: 0, lastUpdated: null, banks: [],
+          totalQ: 0, checkedQ: 0, reviewedQ: 0, similarQ: 0, enQ: 0, guQ: 0, lastUpdated: null, banks: [],
         });
       }
       const e = banksByFamily.get(fam)!;
@@ -100,6 +104,8 @@ export async function GET(request: NextRequest) {
       e.checkedQ += b.checkedCount;
       e.reviewedQ += b.reviewedCount;
       e.similarQ += b.similarCount;
+      if ((b.language ?? "").toLowerCase() === "gujarati") e.guQ += b.totalQuestions;
+      else e.enQ += b.totalQuestions;
       if (b._id) e.banks.push({ id: String(b._id), language: b.language ?? "English" });
       const ts = b.updatedAt ? new Date(b.updatedAt) : null;
       if (ts && (!e.lastUpdated || ts > e.lastUpdated)) e.lastUpdated = ts;
@@ -137,7 +143,15 @@ export async function GET(request: NextRequest) {
     const sopList = deptRows.map((row) => {
       const fam = sopFamilyGroupKey(row);
       const bank = banksByFamily.get(fam);
-      const hasMcq = Boolean(bank && bank.totalQ > 0);
+      // Dual-language (ENG-GUJ) SOPs need MCQs in BOTH languages to count as
+      // "with MCQ"; single-language SOPs need only their one language.
+      const hasMcq = mcqFamilyComplete(
+        {
+          needsEn: row.language === "ENG" || row.language === "ENG-GUJ",
+          needsGu: row.language === "GUJ" || row.language === "ENG-GUJ",
+        },
+        bank,
+      );
 
       const names = new Set<string>();
       for (const rid of row.recordIds ?? []) {

@@ -26,7 +26,7 @@ const COMPLIANCE_MODEL_CHAIN = [
 /** Serialize compliance API calls — parallel bursts cause 503/timeout storms. */
 let complianceQueueTail: Promise<void> = Promise.resolve();
 let lastComplianceCallAt = 0;
-const COMPLIANCE_MIN_GAP_MS = 800;
+const COMPLIANCE_MIN_GAP_MS = 400;
 
 function is503Error(error: unknown): boolean {
   const msg = errorMessage(error).toLowerCase();
@@ -118,7 +118,26 @@ function isConnectionError(error: unknown): boolean {
   return msg.includes("Error fetching from") && !/\[\d{3}\b/.test(msg);
 }
 
+/**
+ * A 429 can mean two very different things:
+ *  - transient rate limit  → worth retrying / switching models
+ *  - account out of credit  → permanent until billing is topped up, so retrying
+ *    (and trying other models on the same key) only wastes minutes.
+ * Detect the billing variant so we can fail fast with an actionable message.
+ */
+function isCreditsDepletedError(error: unknown): boolean {
+  const msg = errorMessage(error).toLowerCase();
+  return (
+    msg.includes("credits are depleted") ||
+    msg.includes("prepayment credits") ||
+    msg.includes("billing account") ||
+    msg.includes("insufficient credit") ||
+    msg.includes("payment required")
+  );
+}
+
 function isRetryableGeminiError(error: unknown): boolean {
+  if (isCreditsDepletedError(error)) return false;
   const msg = errorMessage(error).toLowerCase();
   return (
     isJsonParseError(error) ||
@@ -257,6 +276,16 @@ async function generateWithModel(
       return text;
     } catch (error) {
       lastError = error;
+
+      // Billing/credit exhaustion is permanent until topped up — fail fast instead
+      // of burning a 35s backoff per batch on an error that cannot recover.
+      if (isCreditsDepletedError(error)) {
+        throw new Error(
+          `Gemini API billing exhausted: your prepayment credits are depleted. ` +
+            `Add credits / enable billing for the project that owns GEMINI_API_KEY, then retry. ` +
+            `Details: ${errorMessage(error).slice(0, 200)}`,
+        );
+      }
 
       // 503 high demand: one quick retry, then let the model chain switch.
       if (complianceMode && is503Error(error)) {

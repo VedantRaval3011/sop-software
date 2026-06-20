@@ -66,34 +66,61 @@ export interface SopLibraryEntry {
   expiryDate?: Date | string | null;
 }
 
-// ── Tuning (target: full-library audit in ~10–20 min per SOP) ───────────────
+// ── Tuning (target: full-library audit in ~5–10 min per SOP) ────────────────
 //
-// ~6,750 clauses → ~68 screening batches @ 100 clauses, serialized API queue.
+// Two levers keep this both THOROUGH and FAST:
+//  1. SMALL screening batches (40 clauses) so the model genuinely scrutinises every
+//     clause instead of rubber-stamping 100-at-a-time as "compliant" — small batches
+//     are what made the earlier per-clause engine surface rich, meaningful findings.
+//  2. PIPELINED concurrency. The global Gemini queue (lib/gemini.ts) already throttles
+//     SENDS to one per 400ms, but lets responses overlap. With concurrency=1 the engine
+//     idly waits ~6-10s for each response before sending the next, so a big library took
+//     20+ min. At concurrency 4 the engine was still leaving send capacity idle (8s ÷ 4 ≈
+//     2s/batch vs the 0.4s send floor), so workers were raised to keep the pipeline full
+//     without exceeding the send rate (so no 503 burst), cutting wall-clock time further.
 // Minimal JSON for compliant/N/A keeps each call fast; full detail only on gaps.
 
-const MAX_CLAUSES_PER_BATCH = 100;
-const MAX_CLAUSES_DEEP_BATCH = 10;
-/** Global Gemini queue serializes calls — parallel workers only add 503 risk. */
-const BATCH_CONCURRENCY = 1;
-const DEEP_BATCH_CONCURRENCY = 1;
+const MAX_CLAUSES_PER_BATCH = 40;
+const MAX_CLAUSES_DEEP_BATCH = 8;
+/**
+ * Safety cap on phase-2 deep enrichment. A thorough screening pass legitimately
+ * surfaces many gaps; deep-enrich the most material ones (sorted by severity) and
+ * let the remainder keep their screening-level detail so runtime stays bounded.
+ */
+const MAX_DEEP_GAP_CLAUSES = 120;
+/**
+ * Pipelined workers. The 400ms send-gap in lib/gemini.ts is the true rate limit and is
+ * preserved regardless of worker count — these workers only overlap response latency so
+ * the pipeline stays full. Keep moderate (not 20+) to avoid a 503 pile-up if the API slows.
+ */
+const BATCH_CONCURRENCY = 8;
+const DEEP_BATCH_CONCURRENCY = 6;
 const BATCH_DELAY_MS = 300;
 const MAX_SOP_CHARS_PER_BATCH = 55_000;
 const MAX_CLAUSE_TEXT_CHARS = 350;
 const MAX_CLAUSE_TEXT_DEEP = 1_500;
 
-/** Fast screening prompt — minimal JSON so 100-clause batches finish in seconds not minutes. */
-const SCREENING_PROMPT = `You are an experienced GMP/QA regulatory auditor (EU GMP, WHO, FDA, PIC/S, ICH).
-Screen EVERY clause against the indexed SOP. Return EXACTLY one finding per clause, same order.
+/** Fast screening prompt — compact JSON, but tuned to surface every genuine gap, not rubber-stamp "compliant". */
+const SCREENING_PROMPT = `You are an experienced GMP/QA regulatory auditor (EU GMP, WHO, FDA, PIC/S, ICH) performing a defensible clause-by-clause gap assessment.
+Screen EVERY clause against the indexed SOP. Return EXACTLY one finding per clause, in the same order. If the batch has N clauses, return N findings.
 
-RULES:
-1. Search the ENTIRE SOP before marking non-compliant.
-2. Outside SOP scope → "not-applicable". Do NOT raise gaps for out-of-scope clauses.
-3. Non-compliant ONLY when requirement is applicable AND genuinely missing with NO evidence anywhere.
-4. No speculation ("may", "appears", "could").
+HOW REAL SOP-vs-GUIDELINE ASSESSMENT WORKS — be honest, not optimistic:
+A single SOP rarely FULLY satisfies the specific requirement of an external regulatory clause. Most APPLICABLE clauses are "partial" (the SOP touches the topic but does not fully evidence the specific requirement) or "non-compliant" (applicable but absent). "compliant" is the EXCEPTION — reserve it for clauses the SOP explicitly and completely satisfies with cited text. Do NOT mark a clause "compliant" just because the topic is mentioned in passing.
 
-SCREENING OUTPUT (minimal JSON — speed is critical):
+CLASSIFY EACH CLAUSE (decide applicability FIRST, then compliance):
+1. "not-applicable" — the clause's requirement is genuinely outside this SOP's purpose/scope (e.g. a sterile-manufacturing clause for a documentation SOP). Give a ≤12-word reason. Do NOT over-use this to dodge real gaps — if the topic is within scope, it is applicable.
+2. "non-compliant" — requirement is applicable but the SOP provides NO substantive supporting evidence anywhere.
+3. "partial" — the SOP addresses the topic but does NOT fully meet the clause's SPECIFIC requirement (missing element, vague wording, no responsibility/record/trigger/acceptance-criterion, generic mention only). This is the MOST COMMON outcome for applicable clauses — capture it whenever coverage is incomplete.
+4. "compliant" — the SOP explicitly and fully satisfies the specific requirement, with a real cited SOP line as proof.
+
+DISCIPLINE (defensible findings only):
+- Search the ENTIRE indexed SOP before concluding. Cite the SOP line you relied on.
+- A generic mention of "records / verify / ensure / as per procedure" is NOT evidence for a specific regulatory concept (ALCOA+, change control, risk assessment, data integrity, validation lifecycle). Treat such clauses as "partial" or "non-compliant".
+- No speculation ("may", "appears", "could", "seems"). Every gap must name the specific missing element in evidenceMissing.
+
+SCREENING OUTPUT (compact JSON):
 - "compliant" / "not-applicable": guidelineName, clauseNumber, clauseTitle, guidelineReference, applicability, scopeOwner, complianceLevel, matchConfidence, requirementCriticality, issueSeverity, sopSectionAffected, sopTextSnippet (≤1 line or "Not Found"), evidenceFound, evidenceMissing ("None" if compliant). For not-applicable add mismatchExplanation ≤12 words. OMIT all other fields.
-- "partial" / "non-compliant": above PLUS guidelineRequirement (≤1 line), mismatchExplanation (≤1 line), evidenceMissing (specific gap).
+- "partial" / "non-compliant": above PLUS guidelineRequirement (≤1 line — the specific requirement), mismatchExplanation (≤1 line — the concrete gap), evidenceMissing (the specific missing element). Set issueSeverity and requirementCriticality honestly (critical/major/minor).
 
 Return ONLY valid JSON: {"findings":[...]} with exactly N findings.`;
 
@@ -717,10 +744,21 @@ export async function analyzeSOPComplianceV5(request: {
   }
 
   // Phase 2 — deep enrichment only for confirmed gaps (partial / non-compliant / failed).
-  const gapClauses = request.guidelineClauses.filter((c) => {
-    const f = findingByKey.get(clauseKey(c));
-    return f && needsDeepEnrichment(f.complianceLevel);
-  });
+  // Prioritise the most material gaps (non-compliant + critical/major first) and cap the
+  // number deep-enriched so a thorough screening pass can't blow the runtime budget. Gaps
+  // beyond the cap keep their screening-level detail (still a complete, actionable finding).
+  const severityRank: Record<string, number> = { critical: 0, major: 1, minor: 2, informational: 3 };
+  const gapClauses = request.guidelineClauses
+    .map((c) => ({ c, f: findingByKey.get(clauseKey(c)) }))
+    .filter((x): x is { c: GuidelineClauseInput; f: ComplianceFinding } => !!x.f && needsDeepEnrichment(x.f.complianceLevel))
+    .sort((a, b) => {
+      const levelA = a.f.complianceLevel === "non-compliant" ? 0 : a.f.complianceLevel === "partial" ? 1 : 2;
+      const levelB = b.f.complianceLevel === "non-compliant" ? 0 : b.f.complianceLevel === "partial" ? 1 : 2;
+      if (levelA !== levelB) return levelA - levelB;
+      return (severityRank[a.f.issueSeverity ?? "minor"] ?? 2) - (severityRank[b.f.issueSeverity ?? "minor"] ?? 2);
+    })
+    .slice(0, MAX_DEEP_GAP_CLAUSES)
+    .map((x) => x.c);
 
   if (gapClauses.length > 0) {
     const deepBatches: GuidelineClauseInput[][] = [];

@@ -43,8 +43,10 @@ function resolveClauses(g: {
   return stored;
 }
 
-// Full-library audits (~6,750 clauses) need up to ~20 min with serialized flash calls.
-export const maxDuration = 1200;
+// Engine targets 5–10 min per SOP (small batches + pipelined concurrency). This is only
+// the platform abort ceiling — a safety buffer so a run never aborts mid-way and loses
+// results; normal audits finish well inside it.
+export const maxDuration = 900;
 
 /**
  * V5 — Structured regulatory compliance audit.

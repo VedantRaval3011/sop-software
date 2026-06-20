@@ -92,6 +92,10 @@ export interface AggregatedMcqFamily {
   checkedQ: number;
   reviewedQ: number;
   similarQ: number;
+  /** Questions present in the English bank (used for per-language completeness). */
+  enQ: number;
+  /** Questions present in the Gujarati bank (used for per-language completeness). */
+  guQ: number;
   hasEn: boolean;
   hasGu: boolean;
   lastUpdated: Date | null;
@@ -129,6 +133,8 @@ export function aggregateMcqBanksByFamily(rawBanks: RawMcqBankAgg[]): Map<string
         checkedQ: 0,
         reviewedQ: 0,
         similarQ: 0,
+        enQ: 0,
+        guQ: 0,
         hasEn: false,
         hasGu: false,
         lastUpdated: null,
@@ -140,8 +146,13 @@ export function aggregateMcqBanksByFamily(rawBanks: RawMcqBankAgg[]): Map<string
     e.checkedQ += b.checkedCount;
     e.reviewedQ += b.reviewedCount;
     e.similarQ += b.similarCount;
-    if ((b.language ?? "").toLowerCase() === "gujarati") e.hasGu = true;
-    else e.hasEn = true;
+    if ((b.language ?? "").toLowerCase() === "gujarati") {
+      e.hasGu = true;
+      e.guQ += b.totalQuestions;
+    } else {
+      e.hasEn = true;
+      e.enQ += b.totalQuestions;
+    }
     if (b._id) e.banks.push({
       id: String(b._id),
       langCode: (b.language ?? "").toLowerCase() === "gujarati" ? "GUJ" : "ENG",
@@ -151,6 +162,26 @@ export function aggregateMcqBanksByFamily(rawBanks: RawMcqBankAgg[]): Map<string
     if (b.sopName) e.sopName = b.sopName;
   }
   return map;
+}
+
+/**
+ * Whether an MCQ family fully covers the language requirements of its SOP family.
+ *
+ * A dual-language SOP (ENG-GUJ) is only "with MCQ" when BOTH the English and the
+ * Gujarati bank carry questions — if either language is missing its MCQs the SOP
+ * counts as "without MCQ". A single-language SOP needs only its one language.
+ * Families with no recognised language requirement fall back to "has any question".
+ */
+export function mcqFamilyComplete(
+  required: { needsEn: boolean; needsGu: boolean },
+  bank: { enQ: number; guQ: number } | undefined | null,
+): boolean {
+  if (!bank) return false;
+  const { needsEn, needsGu } = required;
+  if (!needsEn && !needsGu) return bank.enQ + bank.guQ > 0;
+  if (needsEn && bank.enQ <= 0) return false;
+  if (needsGu && bank.guQ <= 0) return false;
+  return true;
 }
 
 /** MCQ families with no matching active SOP in the Dashboard registry. */
