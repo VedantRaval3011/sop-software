@@ -463,6 +463,7 @@ export async function analyzeSOPComplianceV3(request: {
     selectedClauses,
     request.sopContent,
     parsedSop,
+    { identifier: request.sopIdentifier, name: request.sopName },
   );
 
   const compliantCount = validatedFindings.filter((f) => f.complianceLevel === "compliant").length;

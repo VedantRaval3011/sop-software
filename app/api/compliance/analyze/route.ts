@@ -12,7 +12,52 @@ import {
 import { invalidateDashboardSopsCache } from "@/lib/server-cache";
 import { requireAuth } from "@/lib/withAuth";
 import type { IComplianceFinding } from "@/models/ComplianceAnalysis";
+import type { IComplianceReport } from "@/models/ComplianceReport";
+import { enrichFindingSopContent } from "@/lib/ComplianceFindingValidator";
+import { parseSopStructure } from "@/lib/sopStructureParser";
 import mongoose from "mongoose";
+
+async function enrichReportFindings<T extends { sopId: unknown; findings?: IComplianceReport["findings"] }>(
+  report: T,
+): Promise<T> {
+  if (!report.findings?.length) return report;
+
+  const sop = await SOP.findById(report.sopId).select("content identifier name").lean();
+  if (!sop?.content?.trim()) return report;
+
+  const parsedSop = parseSopStructure(sop.content);
+  const enrichedFindings = report.findings.map((finding) => {
+    const enriched = enrichFindingSopContent(
+      {
+        clauseNumber: finding.clauseNumber,
+        clauseTitle: finding.clauseTitle,
+        complianceLevel: finding.complianceLevel,
+        matchConfidence: finding.matchConfidence,
+        issueSeverity: finding.issueSeverity,
+        sopSectionAffected: finding.sopSectionAffected,
+        mismatchExplanation: finding.mismatchExplanation,
+        sopTextSnippet: finding.sopTextSnippet,
+        guidelineRequirement: finding.guidelineRequirement,
+        suggestedAction: finding.suggestedAction,
+        suggestedText: finding.suggestedText,
+        impactAnalysis: finding.impactAnalysis,
+        estimatedEffort: finding.estimatedEffort,
+        guidelineName: finding.guidelineName,
+        folderName: finding.folderName,
+      },
+      parsedSop,
+      sop.identifier,
+      sop.name,
+    );
+    return {
+      ...finding,
+      sopTextSnippet: enriched.sopTextSnippet,
+      sopSectionAffected: enriched.sopSectionAffected,
+    };
+  });
+
+  return { ...report, findings: enrichedFindings };
+}
 
 export async function GET(request: NextRequest) {
   const auth = await requireAuth(["admin", "trainer", "viewer"]);
@@ -25,13 +70,14 @@ export async function GET(request: NextRequest) {
     if (reportId) {
       const report = await ComplianceReport.findById(reportId).lean();
       if (!report) return NextResponse.json({ success: false, error: "Report not found" }, { status: 404 });
-      return NextResponse.json({ success: true, report });
+      const enriched = await enrichReportFindings(report);
+      return NextResponse.json({ success: true, report: enriched });
     }
 
     const reports = await ComplianceReport.find({})
       .sort({ analyzedAt: -1 })
       .limit(200)
-      .select("-findings")
+      .select("-findings -traceabilityMatrix -crossSopDependencies")
       .lean();
 
     return NextResponse.json({ success: true, reports });

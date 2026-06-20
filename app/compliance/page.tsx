@@ -48,6 +48,81 @@ interface ComplianceFinding {
   suggestedAction?: string;
   suggestedText?: string;
   reviewStatus?: 'pending' | 'accepted' | 'disputed' | 'implemented';
+  findingCategory?: string;
+  riskLevel?: string;
+  guidelineReference?: string;
+  evidenceFound?: string;
+  evidenceMissing?: string;
+  evidenceStrength?: string;
+  pageNumber?: string;
+  paragraphNumber?: string;
+  requiresManualReview?: boolean;
+  findingType?: string;
+  mergedClauseRefs?: string[];
+  applicability?: string;
+  requirementCriticality?: string;
+  scopeOwner?: string;
+  whyApplies?: string;
+  whyEvidenceInsufficient?: string;
+  whyScoreReduced?: string;
+}
+
+interface TraceabilityMatrixEntry {
+  clauseNumber: string;
+  clauseTitle: string;
+  clauseText: string;
+  guidelineName: string;
+  folderName: string;
+  applicable: boolean;
+  complianceStatus: string;
+  supportingSopSection: string;
+  confidenceScore: number;
+}
+
+interface CrossSopDependency {
+  referencedType: string;
+  referenceText: string;
+  found: boolean;
+  status: string;
+  matchedSopIdentifier?: string;
+  matchedSopName?: string;
+  riskLevel: string;
+  note: string;
+}
+
+interface ScoreBreakdown {
+  totalApplicableRequirements: number;
+  compliantCount: number;
+  partialCount: number;
+  nonCompliantCount: number;
+  improvementCount: number;
+  notApplicableCount: number;
+  formula: string;
+  score: number;
+  scoringMethod?: string;
+  weightedAchieved?: number;
+  weightedTotal?: number;
+  criticalRequirementCount?: number;
+  majorRequirementCount?: number;
+  minorRequirementCount?: number;
+}
+
+interface AuditCompleteness {
+  totalGuidelinesReviewed: number;
+  totalChaptersReviewed: number;
+  totalClausesReviewed: number;
+  applicableClauses: number;
+  notApplicableClauses: number;
+  compliantCount: number;
+  partialCount: number;
+  nonCompliantCount: number;
+  criticalFindings: number;
+  majorFindings: number;
+  minorFindings: number;
+  improvementOpportunities: number;
+  clauseCoveragePct: number;
+  sopCoveragePct: number;
+  overallScore: number;
 }
 
 interface ComplianceReport {
@@ -61,6 +136,16 @@ interface ComplianceReport {
   compliantCount: number;
   partialCount: number;
   nonCompliantCount: number;
+  criticalCount?: number;
+  majorCount?: number;
+  minorCount?: number;
+  improvementCount?: number;
+  bestPracticeCount?: number;
+  clauseCoveragePct?: number;
+  scoreBreakdown?: ScoreBreakdown;
+  auditCompleteness?: AuditCompleteness;
+  traceabilityMatrix?: TraceabilityMatrixEntry[];
+  crossSopDependencies?: CrossSopDependency[];
   findings: ComplianceFinding[];
   analyzedAt: string;
 }
@@ -176,6 +261,276 @@ function ChevronDownIcon() {
 }
 function ChevronUpIcon() {
   return <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 15l7-7 7 7" /></svg>;
+}
+
+// ── Audit completeness report — verifies the entire guideline library was reviewed ──
+function AuditCompletenessReport({ report }: { report: ComplianceReport }) {
+  const ac = report.auditCompleteness;
+  if (!ac) return null;
+
+  const coverage = [
+    { label: 'Guidelines Reviewed', value: ac.totalGuidelinesReviewed, tone: 'text-indigo-700' },
+    { label: 'Chapters Reviewed', value: ac.totalChaptersReviewed, tone: 'text-indigo-700' },
+    { label: 'Clauses Reviewed', value: ac.totalClausesReviewed, tone: 'text-indigo-700' },
+    { label: 'Applicable Clauses', value: ac.applicableClauses, tone: 'text-blue-700' },
+    { label: 'Not Applicable', value: ac.notApplicableClauses, tone: 'text-slate-500' },
+  ];
+  const outcomes = [
+    { label: 'Compliant', value: ac.compliantCount, tone: 'text-emerald-600' },
+    { label: 'Partially Compliant', value: ac.partialCount, tone: 'text-amber-600' },
+    { label: 'Non-Compliant', value: ac.nonCompliantCount, tone: 'text-rose-600' },
+    { label: 'Critical Findings', value: ac.criticalFindings, tone: 'text-red-600' },
+    { label: 'Major Findings', value: ac.majorFindings, tone: 'text-orange-600' },
+    { label: 'Minor Findings', value: ac.minorFindings, tone: 'text-yellow-600' },
+    { label: 'Improvements', value: ac.improvementOpportunities, tone: 'text-sky-600' },
+  ];
+
+  return (
+    <div className="mb-6 rounded-2xl border border-indigo-200 bg-gradient-to-br from-indigo-50 to-white overflow-hidden">
+      <div className="px-5 py-3 bg-indigo-100/60 border-b border-indigo-200 flex items-center justify-between flex-wrap gap-2">
+        <span className="text-sm font-black text-indigo-800 flex items-center gap-2">
+          🛡️ Audit Completeness Report
+        </span>
+        <span className="text-[11px] font-bold text-indigo-600">
+          Full clause-by-clause regulatory audit · {ac.totalClausesReviewed} clauses across {ac.totalGuidelinesReviewed} guidelines
+        </span>
+      </div>
+      <div className="p-5 space-y-5">
+        <div>
+          <p className="text-[10px] font-black text-indigo-500 uppercase tracking-widest mb-2">Guideline Coverage</p>
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
+            {coverage.map(m => (
+              <div key={m.label} className="p-3 rounded-xl border border-indigo-100 bg-white text-center">
+                <p className={`text-xl font-black leading-none ${m.tone}`}>{m.value}</p>
+                <p className="text-[9px] font-bold text-gray-500 uppercase tracking-wider mt-1.5 leading-tight">{m.label}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div>
+          <p className="text-[10px] font-black text-indigo-500 uppercase tracking-widest mb-2">Compliance Outcomes</p>
+          <div className="grid grid-cols-3 md:grid-cols-7 gap-2">
+            {outcomes.map(m => (
+              <div key={m.label} className="p-3 rounded-xl border border-gray-200 bg-white text-center">
+                <p className={`text-xl font-black leading-none ${m.tone}`}>{m.value}</p>
+                <p className="text-[9px] font-bold text-gray-500 uppercase tracking-wider mt-1.5 leading-tight">{m.label}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+          <div className="p-4 rounded-xl border border-purple-200 bg-purple-50 text-center">
+            <p className="text-2xl font-black text-purple-700 leading-none">{ac.clauseCoveragePct}%</p>
+            <p className="text-[10px] font-bold text-gray-500 uppercase tracking-wider mt-1.5">Clause Coverage</p>
+          </div>
+          <div className="p-4 rounded-xl border border-fuchsia-200 bg-fuchsia-50 text-center">
+            <p className="text-2xl font-black text-fuchsia-700 leading-none">{ac.sopCoveragePct}%</p>
+            <p className="text-[10px] font-bold text-gray-500 uppercase tracking-wider mt-1.5">SOP Coverage</p>
+          </div>
+          <div className={`p-4 rounded-xl border text-center ${
+            ac.overallScore >= 8 ? 'border-emerald-200 bg-emerald-50'
+              : ac.overallScore >= 5 ? 'border-amber-200 bg-amber-50'
+              : 'border-rose-200 bg-rose-50'
+          }`}>
+            <p className={`text-2xl font-black leading-none ${getScoreColorClass(ac.overallScore)}`}>{ac.overallScore.toFixed(1)}/10</p>
+            <p className="text-[10px] font-bold text-gray-500 uppercase tracking-wider mt-1.5">Overall Compliance Score</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Regulatory dashboard metrics for a single report ──
+function ReportMetrics({ report }: { report: ComplianceReport }) {
+  const sb = report.scoreBreakdown;
+  const applicable = sb?.totalApplicableRequirements ??
+    (report.compliantCount + report.partialCount + report.nonCompliantCount);
+  const pct = (n: number) => (applicable > 0 ? Math.round((n / applicable) * 100) : 0);
+  const metrics = [
+    { label: 'Requirements Evaluated', value: report.totalGuidelinesChecked, tone: 'text-gray-800' },
+    { label: 'Clause Coverage', value: `${report.clauseCoveragePct ?? 0}%`, tone: 'text-purple-700' },
+    { label: 'Compliance', value: `${pct(report.compliantCount)}%`, tone: 'text-emerald-600' },
+    { label: 'Partial', value: `${pct(report.partialCount)}%`, tone: 'text-amber-600' },
+    { label: 'Gap', value: `${pct(report.nonCompliantCount)}%`, tone: 'text-rose-600' },
+    { label: 'Critical', value: report.criticalCount ?? 0, tone: 'text-red-600' },
+    { label: 'Major', value: report.majorCount ?? 0, tone: 'text-orange-600' },
+    { label: 'Minor', value: report.minorCount ?? 0, tone: 'text-yellow-600' },
+    { label: 'Improvements', value: report.improvementCount ?? report.bestPracticeCount ?? 0, tone: 'text-sky-600' },
+  ];
+  return (
+    <div className="grid grid-cols-3 md:grid-cols-5 lg:grid-cols-9 gap-2 mb-6">
+      {metrics.map(m => (
+        <div key={m.label} className="p-3 rounded-xl border border-gray-200 bg-gray-50 text-center">
+          <p className={`text-lg font-black leading-none ${m.tone}`}>{m.value}</p>
+          <p className="text-[9px] font-bold text-gray-500 uppercase tracking-wider mt-1.5 leading-tight">{m.label}</p>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── Score transparency panel ──
+function ScoreTransparency({ report }: { report: ComplianceReport }) {
+  const [open, setOpen] = useState(false);
+  const sb = report.scoreBreakdown;
+  if (!sb) return null;
+  return (
+    <div className="mb-6 rounded-xl border border-indigo-200 bg-indigo-50/50 overflow-hidden">
+      <button
+        onClick={() => setOpen(v => !v)}
+        className="w-full px-5 py-3 flex items-center justify-between text-left"
+      >
+        <span className="text-sm font-bold text-indigo-800 flex items-center gap-2">
+          🧮 Score Transparency — how {sb.score.toFixed(1)}/10 was calculated
+          {sb.scoringMethod === 'weighted' && (
+            <span className="px-2 py-0.5 bg-indigo-200 text-indigo-800 rounded text-[10px] font-bold uppercase tracking-wider">Weighted</span>
+          )}
+        </span>
+        {open ? <ChevronUpIcon /> : <ChevronDownIcon />}
+      </button>
+      {open && (
+        <div className="px-5 pb-5 space-y-4">
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+            {[
+              { label: 'Total Applicable', value: sb.totalApplicableRequirements },
+              { label: 'Compliant', value: sb.compliantCount },
+              { label: 'Partial', value: sb.partialCount },
+              { label: 'Non-Compliant', value: sb.nonCompliantCount },
+              { label: 'Improvements', value: sb.improvementCount },
+            ].map(s => (
+              <div key={s.label} className="bg-white rounded-lg border border-indigo-100 p-3 text-center">
+                <p className="text-xl font-black text-indigo-700">{s.value}</p>
+                <p className="text-[10px] font-bold text-gray-500 uppercase tracking-wider mt-1">{s.label}</p>
+              </div>
+            ))}
+          </div>
+          {sb.scoringMethod === 'weighted' && (
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+              {[
+                { label: 'Critical Reqs (×5)', value: sb.criticalRequirementCount ?? 0 },
+                { label: 'Major Reqs (×3)', value: sb.majorRequirementCount ?? 0 },
+                { label: 'Minor Reqs (×1)', value: sb.minorRequirementCount ?? 0 },
+                { label: 'Weight Achieved', value: sb.weightedAchieved ?? 0 },
+                { label: 'Weight Total', value: sb.weightedTotal ?? 0 },
+              ].map(s => (
+                <div key={s.label} className="bg-indigo-50 rounded-lg border border-indigo-100 p-3 text-center">
+                  <p className="text-lg font-black text-indigo-700">{s.value}</p>
+                  <p className="text-[10px] font-bold text-gray-500 uppercase tracking-wider mt-1 leading-tight">{s.label}</p>
+                </div>
+              ))}
+            </div>
+          )}
+          <pre className="bg-white rounded-lg border border-indigo-100 p-4 text-xs text-gray-700 font-mono whitespace-pre-wrap leading-relaxed">{sb.formula}</pre>
+          <p className="text-[11px] text-indigo-600">
+            Requirements are weighted by criticality (Critical=5, Major=3, Minor=1). Improvement opportunities
+            and best-practice recommendations carry weight 0 — a recommendation never reduces the score, and a
+            single minor gap cannot collapse the score of an otherwise compliant SOP.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Clause-by-clause traceability matrix ──
+function TraceabilityMatrix({ matrix }: { matrix: TraceabilityMatrixEntry[] }) {
+  const [open, setOpen] = useState(false);
+  const [statusFilter, setStatusFilter] = useState('all');
+  if (!matrix?.length) return null;
+  const statusStyle = (s: string) =>
+    s === 'Compliant' ? 'bg-emerald-100 text-emerald-700'
+      : s === 'Partial' ? 'bg-amber-100 text-amber-700'
+      : s === 'Non-Compliant' ? 'bg-rose-100 text-rose-700'
+      : s === 'Not Applicable' ? 'bg-slate-100 text-slate-600'
+      : 'bg-gray-100 text-gray-500';
+  const filtered = matrix.filter(m => statusFilter === 'all' || m.complianceStatus === statusFilter);
+  return (
+    <div className="mb-6 rounded-xl border border-gray-200 bg-white overflow-hidden">
+      <button onClick={() => setOpen(v => !v)} className="w-full px-5 py-3 flex items-center justify-between text-left bg-gray-50 border-b border-gray-100">
+        <span className="text-sm font-bold text-gray-800 flex items-center gap-2">
+          🔗 Compliance Traceability Matrix — {matrix.length} clauses reviewed
+        </span>
+        {open ? <ChevronUpIcon /> : <ChevronDownIcon />}
+      </button>
+      {open && (
+        <div className="p-4">
+          <div className="flex flex-wrap gap-2 mb-3">
+            {['all', 'Compliant', 'Partial', 'Non-Compliant', 'Not Applicable', 'Not Analyzed'].map(s => (
+              <button
+                key={s}
+                onClick={() => setStatusFilter(s)}
+                className={`px-2.5 py-1 rounded-lg text-[11px] font-bold border transition-all ${statusFilter === s ? 'bg-purple-600 text-white border-purple-500' : 'bg-white text-gray-500 border-gray-200 hover:border-purple-300'}`}
+              >
+                {s === 'all' ? 'All' : s}
+              </button>
+            ))}
+          </div>
+          <div className="max-h-[420px] overflow-y-auto">
+            <table className="w-full text-left border-collapse">
+              <thead className="sticky top-0 bg-white">
+                <tr className="text-[10px] font-black text-gray-400 uppercase tracking-wider border-b border-gray-200">
+                  <th className="py-2 pr-3">Clause</th>
+                  <th className="py-2 pr-3">Title / Guideline</th>
+                  <th className="py-2 pr-3">Applicable</th>
+                  <th className="py-2 pr-3">Status</th>
+                  <th className="py-2 pr-3">SOP Section</th>
+                  <th className="py-2">Confidence</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filtered.map((m, i) => (
+                  <tr key={i} className="border-b border-gray-50 hover:bg-gray-50 align-top">
+                    <td className="py-2 pr-3 font-mono font-bold text-purple-700 text-xs whitespace-nowrap">{m.clauseNumber}</td>
+                    <td className="py-2 pr-3 text-xs text-gray-700 max-w-[280px]">
+                      <span className="font-semibold">{m.clauseTitle}</span>
+                      <span className="block text-[10px] text-gray-400">{m.folderName || m.guidelineName}</span>
+                    </td>
+                    <td className="py-2 pr-3 text-xs">{m.applicable ? 'Yes' : 'No'}</td>
+                    <td className="py-2 pr-3"><span className={`px-2 py-0.5 rounded text-[10px] font-bold ${statusStyle(m.complianceStatus)}`}>{m.complianceStatus}</span></td>
+                    <td className="py-2 pr-3 text-[11px] text-gray-500 font-mono max-w-[160px] truncate" title={m.supportingSopSection}>{m.supportingSopSection || '—'}</td>
+                    <td className="py-2 text-xs font-bold text-gray-600">{m.confidenceScore}%</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Cross-SOP dependency validation ──
+function CrossSopPanel({ deps }: { deps: CrossSopDependency[] }) {
+  if (!deps?.length) return null;
+  const statusStyle = (s: string) =>
+    s === 'available' ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+      : s === 'missing' ? 'bg-rose-50 text-rose-700 border-rose-200'
+      : 'bg-amber-50 text-amber-700 border-amber-200';
+  return (
+    <div className="mb-6 rounded-xl border border-fuchsia-200 bg-fuchsia-50/40 overflow-hidden">
+      <div className="px-5 py-3 bg-fuchsia-100/50 border-b border-fuchsia-200">
+        <span className="text-sm font-bold text-fuchsia-800">🧩 Cross-SOP Dependencies — {deps.length} referenced</span>
+      </div>
+      <div className="p-4 space-y-2">
+        {deps.map((d, i) => (
+          <div key={i} className="flex items-start justify-between gap-3 bg-white rounded-lg border border-fuchsia-100 px-4 py-3">
+            <div className="min-w-0">
+              <p className="text-sm font-bold text-gray-800">{d.referencedType}</p>
+              <p className="text-xs text-gray-500 mt-0.5 leading-relaxed">{d.note}</p>
+              {d.matchedSopIdentifier && (
+                <p className="text-[10px] text-fuchsia-600 font-mono mt-1">→ {d.matchedSopIdentifier}</p>
+              )}
+            </div>
+            <span className={`flex-shrink-0 px-2.5 py-1 rounded-lg border text-[10px] font-bold capitalize ${statusStyle(d.status)}`}>{d.status}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 export default function ComplianceEnginePage() {
@@ -333,7 +688,7 @@ export default function ComplianceEnginePage() {
       await waitIfPaused();
       setAnalysisStats(prev => ({ ...prev, currentSopName: sop.name, currentSopIdentifier: sop.identifier }));
       try {
-        const res = await fetch('/api/compliance/analyze-v4', {
+        const res = await fetch('/api/compliance/analyze-v5', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ sopId: sop._id, forceRefresh: true }),
@@ -482,6 +837,7 @@ export default function ComplianceEnginePage() {
 
   const visibleFindings = useMemo(() => {
     if (!selectedReport?.findings) return [];
+    const riskOrder: Record<string, number> = { Critical: 0, Major: 1, Minor: 2, Improvement: 3 };
     const levelOrder: Record<string, number> = {
       'non-compliant': 0,
       partial: 1,
@@ -489,6 +845,8 @@ export default function ComplianceEnginePage() {
       'not-applicable': 3,
       'analysis-failed': 4,
     };
+    const rank = (f: ComplianceFinding) =>
+      f.riskLevel ? (riskOrder[f.riskLevel] ?? 4) : (levelOrder[f.complianceLevel] ?? 5);
     return selectedReport.findings
       .map((f, i) => ({ f, i }))
       .filter(({ f }) => {
@@ -498,10 +856,11 @@ export default function ComplianceEnginePage() {
         if (hideFailedFindings && f.complianceLevel === 'analysis-failed') return false;
         return true;
       })
-      .sort(
-        (a, b) =>
-          (levelOrder[a.f.complianceLevel] ?? 5) - (levelOrder[b.f.complianceLevel] ?? 5),
-      );
+      .sort((a, b) => {
+        const r = rank(a.f) - rank(b.f);
+        if (r !== 0) return r;
+        return (b.f.matchConfidence ?? 0) - (a.f.matchConfidence ?? 0);
+      });
   }, [selectedReport, filterStatus, filterGuideline, hideNotApplicable, hideFailedFindings]);
 
   const normaliseSectionKey = (f: ComplianceFinding) => {
@@ -1289,6 +1648,25 @@ export default function ComplianceEnginePage() {
                     ))}
                   </div>
 
+                  {/* Audit completeness report — proves the full guideline library was reviewed */}
+                  <AuditCompletenessReport report={selectedReport} />
+
+                  {/* Regulatory dashboard metrics */}
+                  <ReportMetrics report={selectedReport} />
+
+                  {/* Score transparency */}
+                  <ScoreTransparency report={selectedReport} />
+
+                  {/* Cross-SOP dependency validation */}
+                  {selectedReport.crossSopDependencies && (
+                    <CrossSopPanel deps={selectedReport.crossSopDependencies} />
+                  )}
+
+                  {/* Clause-by-clause traceability matrix */}
+                  {selectedReport.traceabilityMatrix && (
+                    <TraceabilityMatrix matrix={selectedReport.traceabilityMatrix} />
+                  )}
+
                   {/* Filters */}
                   <div className="flex flex-wrap gap-3 mb-6">
                     <select value={filterStatus} onChange={e => setFilterStatus(e.target.value as never)} className="px-3 py-2 border border-gray-200 rounded-lg text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-purple-500/20">
@@ -1376,7 +1754,11 @@ export default function ComplianceEnginePage() {
                             complianceStatus: selectedReport.complianceStatus,
                           } : undefined}
                           index={i}
-                          defaultExpanded={f.complianceLevel === 'partial' || f.complianceLevel === 'non-compliant'}
+                          defaultExpanded={
+                            f.complianceLevel === 'partial' ||
+                            f.complianceLevel === 'non-compliant' ||
+                            f.complianceLevel === 'not-applicable'
+                          }
                           isSelected={selectedFindingIds.has(i)}
                           onToggleSelect={(idx) => {
                             const next = new Set(selectedFindingIds);

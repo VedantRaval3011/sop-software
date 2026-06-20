@@ -12,6 +12,10 @@ import {
   Target,
   CheckCircle2,
   ExternalLink,
+  ShieldAlert,
+  Search,
+  XCircle,
+  MapPin,
 } from 'lucide-react';
 import {
   formatConfidence,
@@ -48,6 +52,23 @@ export interface FindingCardProps {
     estimatedEffort?: 'low' | 'medium' | 'high';
     priority?: number;
     reviewStatus?: 'pending' | 'accepted' | 'disputed' | 'implemented';
+    findingCategory?: string;
+    riskLevel?: string;
+    guidelineReference?: string;
+    evidenceFound?: string;
+    evidenceMissing?: string;
+    evidenceStrength?: string;
+    pageNumber?: string;
+    paragraphNumber?: string;
+    requiresManualReview?: boolean;
+    findingType?: string;
+    mergedClauseRefs?: string[];
+    applicability?: string;
+    requirementCriticality?: string;
+    scopeOwner?: string;
+    whyApplies?: string;
+    whyEvidenceInsufficient?: string;
+    whyScoreReduced?: string;
   };
   reportContext?: {
     sopIdentifier: string;
@@ -76,6 +97,81 @@ function extractSectionNumber(section?: string): string {
   return m ? m[1] : section.trim();
 }
 
+function categoryBadge(category?: string): { label: string; className: string } | null {
+  switch (category) {
+    case 'Critical Non-Compliance':
+      return { label: 'Critical Non-Compliance', className: 'bg-red-100 text-red-800 border-red-300' };
+    case 'Major Gap':
+      return { label: 'Major Gap', className: 'bg-orange-100 text-orange-800 border-orange-300' };
+    case 'Minor Gap':
+      return { label: 'Minor Gap', className: 'bg-yellow-100 text-yellow-800 border-yellow-300' };
+    case 'Improvement Opportunity':
+      return { label: 'Improvement Opportunity', className: 'bg-sky-100 text-sky-800 border-sky-300' };
+    case 'Best Practice Recommendation':
+      return { label: 'Best Practice', className: 'bg-slate-100 text-slate-700 border-slate-300' };
+    default:
+      return null;
+  }
+}
+
+function riskBadge(risk?: string): { label: string; className: string } | null {
+  switch (risk) {
+    case 'Critical':
+      return { label: 'Critical Risk', className: 'bg-red-600 text-white border-red-700' };
+    case 'Major':
+      return { label: 'Major Risk', className: 'bg-orange-500 text-white border-orange-600' };
+    case 'Minor':
+      return { label: 'Minor Risk', className: 'bg-yellow-500 text-white border-yellow-600' };
+    case 'Improvement':
+      return { label: 'Advisory', className: 'bg-sky-500 text-white border-sky-600' };
+    default:
+      return null;
+  }
+}
+
+function evidenceStrengthBadge(strength?: string): { label: string; className: string } | null {
+  switch (strength) {
+    case 'strong':
+      return { label: 'Strong evidence', className: 'bg-emerald-50 text-emerald-700 border-emerald-200' };
+    case 'moderate':
+      return { label: 'Moderate evidence', className: 'bg-amber-50 text-amber-700 border-amber-200' };
+    case 'weak':
+      return { label: 'Weak evidence', className: 'bg-orange-50 text-orange-700 border-orange-200' };
+    case 'none':
+      return { label: 'No evidence', className: 'bg-rose-50 text-rose-700 border-rose-200' };
+    default:
+      return null;
+  }
+}
+
+function isMeaningful(text?: string): boolean {
+  if (!text?.trim()) return false;
+  return !/^(none|n\/a|na|not\s+found|not\s+applicable|-)$/i.test(text.trim());
+}
+
+function applicabilityBadge(applicability?: string): { label: string; className: string } | null {
+  switch (applicability) {
+    case 'applicable':
+      return { label: 'Applicable', className: 'bg-blue-50 text-blue-700 border-blue-200' };
+    case 'partially-applicable':
+      return { label: 'Partially Applicable', className: 'bg-amber-50 text-amber-700 border-amber-200' };
+    case 'not-applicable':
+      return { label: 'N/A', className: 'bg-slate-100 text-slate-600 border-slate-200' };
+    default:
+      return null;
+  }
+}
+
+function scopeOwnerLabel(owner?: string): string {
+  switch (owner) {
+    case 'referenced-sop': return 'Owned by a referenced SOP';
+    case 'department-procedure': return 'Owned by a department procedure';
+    case 'quality-system': return 'Owned by a quality-system procedure';
+    case 'current-sop': return 'Owned by this SOP';
+    default: return '';
+  }
+}
+
 export default function FindingCard({
   finding,
   reportContext,
@@ -100,6 +196,23 @@ export default function FindingCard({
   const confidence = formatConfidence(finding.matchConfidence);
   const id = findingId(finding, index);
 
+  const catBadge = categoryBadge(finding.findingCategory);
+  const rBadge = riskBadge(finding.riskLevel);
+  const evBadge = evidenceStrengthBadge(finding.evidenceStrength);
+  const evidenceFound = finding.evidenceFound?.trim();
+  const evidenceMissing = finding.evidenceMissing?.trim();
+  const guidelineRef = finding.guidelineReference?.trim();
+  const pageRef = finding.pageNumber?.trim();
+  const paraRef = finding.paragraphNumber?.trim();
+  const isGmp = finding.findingType === 'gmp-expectation';
+  const isCrossSop = finding.findingType === 'cross-sop-dependency';
+  const appBadge = applicabilityBadge(finding.applicability);
+  const scopeLabel = scopeOwnerLabel(finding.scopeOwner);
+  const whyApplies = finding.whyApplies?.trim();
+  const whyEvidence = finding.whyEvidenceInsufficient?.trim();
+  const whyScore = finding.whyScoreReduced?.trim();
+  const hasReasoning = !!(whyApplies || whyEvidence || whyScore);
+
   const guidelineTag = finding.folderName || finding.guidelineName;
   const requirement =
     finding.guidelineRequirement?.trim() ||
@@ -116,7 +229,10 @@ export default function FindingCard({
       : '');
   const sectionRaw = finding.sopSectionAffected?.trim() || '';
   const sectionNum = extractSectionNumber(sectionRaw);
-  const sopSnippet = cleanFindingText(finding.sopTextSnippet);
+  const sopSnippet =
+    cleanFindingText(finding.sopTextSnippet) ||
+    (reportContext ? `${reportContext.sopIdentifier}_${reportContext.sopName}` : '');
+  const displaySectionNum = sectionNum || (reportContext ? '1' : '');
   const proposedVerbiage =
     cleanFindingText(finding.suggestedText) ||
     (isActionable
@@ -161,20 +277,55 @@ export default function FindingCard({
 
         <div className="flex-1 min-w-0">
           <div className="flex flex-wrap items-center gap-2 mb-1.5">
-            <span className={`px-2 py-0.5 text-[10px] font-bold rounded border ${levelBadge.className}`}>
-              {levelBadge.label}
-            </span>
-            <span className={`px-2 py-0.5 text-[10px] font-bold rounded border ${severityBadge.className}`}>
-              {severityBadge.label}
-            </span>
-            {guidelineTag && (
+            {catBadge ? (
+              <span className={`px-2 py-0.5 text-[10px] font-bold rounded border ${catBadge.className}`}>
+                {catBadge.label}
+              </span>
+            ) : (
+              <span className={`px-2 py-0.5 text-[10px] font-bold rounded border ${levelBadge.className}`}>
+                {levelBadge.label}
+              </span>
+            )}
+            {rBadge ? (
+              <span className={`px-2 py-0.5 text-[10px] font-bold rounded border ${rBadge.className}`}>
+                {rBadge.label}
+              </span>
+            ) : (
+              <span className={`px-2 py-0.5 text-[10px] font-bold rounded border ${severityBadge.className}`}>
+                {severityBadge.label}
+              </span>
+            )}
+            {isGmp && (
+              <span className="flex items-center gap-1 px-2 py-0.5 bg-indigo-50 border border-indigo-200 rounded text-[10px] font-bold text-indigo-700">
+                <ShieldAlert className="h-2.5 w-2.5" />
+                GMP Intelligence
+              </span>
+            )}
+            {isCrossSop && (
+              <span className="flex items-center gap-1 px-2 py-0.5 bg-fuchsia-50 border border-fuchsia-200 rounded text-[10px] font-bold text-fuchsia-700">
+                <ExternalLink className="h-2.5 w-2.5" />
+                Cross-SOP
+              </span>
+            )}
+            {guidelineTag && !isGmp && !isCrossSop && (
               <span className="flex items-center gap-1 px-2 py-0.5 bg-blue-50 border border-blue-200 rounded text-[10px] font-bold text-blue-700">
                 <BookOpen className="h-2.5 w-2.5" />
                 {guidelineTag}
               </span>
             )}
+            {appBadge && (
+              <span className={`px-2 py-0.5 text-[10px] font-bold rounded border ${appBadge.className}`}>
+                {appBadge.label}
+              </span>
+            )}
+            {finding.requiresManualReview && (
+              <span className="flex items-center gap-1 px-2 py-0.5 bg-rose-50 border border-rose-300 rounded text-[10px] font-bold text-rose-700">
+                <Search className="h-2.5 w-2.5" />
+                Manual review
+              </span>
+            )}
             <span className="text-[10px] text-gray-400 font-medium">
-              Clause {finding.clauseNumber}
+              {guidelineRef || `Clause ${finding.clauseNumber}`}
               {confidence > 0 && ` · ${confidence}% confidence`}
             </span>
           </div>
@@ -263,11 +414,116 @@ export default function FindingCard({
                   <BookOpen className="h-3.5 w-3.5" />
                   Guideline Requirement
                 </h4>
+                {guidelineRef && (
+                  <p className="text-[11px] font-bold text-blue-700 mb-1">{guidelineRef}</p>
+                )}
                 <p className="text-sm text-gray-700 leading-relaxed">{requirement}</p>
               </section>
             )}
 
-            {(sopSnippet || sectionRaw) && (
+            {/* Evidence-based assessment */}
+            {(isMeaningful(evidenceFound) || isMeaningful(evidenceMissing)) && (
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                <section className="rounded-xl border border-emerald-200 bg-emerald-50/70 p-4">
+                  <h4 className="text-[10px] font-black text-emerald-700 uppercase tracking-widest mb-2 flex items-center gap-1.5">
+                    <CheckCircle2 className="h-3.5 w-3.5" />
+                    Evidence Found
+                  </h4>
+                  <p className="text-sm text-gray-800 leading-relaxed">
+                    {isMeaningful(evidenceFound) ? evidenceFound : 'No supporting evidence located in the SOP.'}
+                  </p>
+                </section>
+                <section className="rounded-xl border border-rose-200 bg-rose-50/70 p-4">
+                  <h4 className="text-[10px] font-black text-rose-700 uppercase tracking-widest mb-2 flex items-center gap-1.5">
+                    <XCircle className="h-3.5 w-3.5" />
+                    Evidence Missing
+                  </h4>
+                  <p className="text-sm text-gray-800 leading-relaxed">
+                    {isMeaningful(evidenceMissing) ? evidenceMissing : 'None — requirement fully evidenced.'}
+                  </p>
+                </section>
+              </div>
+            )}
+
+            {/* Confidence + evidence strength + source traceability */}
+            <div className="flex flex-wrap items-center gap-2">
+              {confidence > 0 && (
+                <span className="px-2.5 py-1 rounded-lg border border-gray-200 bg-gray-50 text-[11px] font-bold text-gray-600">
+                  AI Confidence: {confidence}%
+                </span>
+              )}
+              {evBadge && (
+                <span className={`px-2.5 py-1 rounded-lg border text-[11px] font-bold ${evBadge.className}`}>
+                  {evBadge.label}
+                </span>
+              )}
+              {(displaySectionNum || pageRef || paraRef) && (
+                <span className="flex items-center gap-1 px-2.5 py-1 rounded-lg border border-purple-200 bg-purple-50 text-[11px] font-bold text-purple-700">
+                  <MapPin className="h-3 w-3" />
+                  {[
+                    displaySectionNum && `Section ${displaySectionNum}`,
+                    pageRef && `Page ${pageRef}`,
+                    paraRef && `¶ ${paraRef}`,
+                  ]
+                    .filter(Boolean)
+                    .join(' · ')}
+                </span>
+              )}
+              {finding.requiresManualReview && (
+                <span className="flex items-center gap-1 px-2.5 py-1 rounded-lg border border-rose-300 bg-rose-50 text-[11px] font-bold text-rose-700">
+                  <Search className="h-3 w-3" />
+                  Flagged for manual review
+                </span>
+              )}
+            </div>
+
+            {/* Auditor reasoning panel — defensible, challengeable findings */}
+            {hasReasoning && (
+              <section className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                <h4 className="text-[10px] font-black text-slate-600 uppercase tracking-widest mb-3 flex items-center gap-1.5">
+                  <ShieldAlert className="h-3.5 w-3.5" />
+                  Auditor Reasoning
+                </h4>
+                <div className="space-y-2.5">
+                  {whyApplies && (
+                    <div>
+                      <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Why the requirement applies</p>
+                      <p className="text-sm text-gray-700 leading-relaxed">{whyApplies}</p>
+                      {scopeLabel && <p className="text-[11px] text-slate-500 mt-0.5">Scope: {scopeLabel}</p>}
+                    </div>
+                  )}
+                  {whyEvidence && (
+                    <div>
+                      <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Why SOP evidence is insufficient</p>
+                      <p className="text-sm text-gray-700 leading-relaxed">{whyEvidence}</p>
+                    </div>
+                  )}
+                  {whyScore && (
+                    <div>
+                      <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Why the score was affected</p>
+                      <p className="text-sm text-gray-700 leading-relaxed">{whyScore}</p>
+                    </div>
+                  )}
+                </div>
+              </section>
+            )}
+
+            {finding.mergedClauseRefs && finding.mergedClauseRefs.length > 0 && (
+              <section className="rounded-xl border border-purple-200 bg-purple-50/50 p-3">
+                <h4 className="text-[10px] font-black text-purple-700 uppercase tracking-widest mb-1.5">
+                  Same root cause — merged clauses
+                </h4>
+                <div className="flex flex-wrap gap-1.5">
+                  {finding.mergedClauseRefs.map((ref, i) => (
+                    <span key={i} className="px-2 py-0.5 bg-white border border-purple-200 rounded text-[10px] font-semibold text-purple-700">
+                      {ref}
+                    </span>
+                  ))}
+                </div>
+              </section>
+            )}
+
+            {(sopSnippet || displaySectionNum) && (
               <section className="rounded-xl border-2 border-purple-200 bg-purple-50/50 p-4">
                 <h4 className="text-[10px] font-black text-purple-700 uppercase tracking-widest mb-3 flex items-center gap-1.5">
                   <FileText className="h-3.5 w-3.5" />
@@ -280,9 +536,9 @@ export default function FindingCard({
                 ) : (
                   <p className="text-sm text-gray-500 italic">No matching SOP text found for this requirement.</p>
                 )}
-                {sectionNum && (
+                {displaySectionNum && (
                   <p className="text-[10px] font-black text-purple-600 mt-3 uppercase tracking-widest">
-                    Section: {sectionNum}
+                    Section: {displaySectionNum}
                   </p>
                 )}
               </section>

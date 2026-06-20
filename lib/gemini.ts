@@ -2,6 +2,9 @@ import { GoogleGenerativeAI, type GenerativeModel } from "@google/generative-ai"
 
 const DEFAULT_MODEL = "gemini-2.5-flash";
 
+/** Fast model for high-volume compliance batching (screening thousands of clauses). */
+const DEFAULT_COMPLIANCE_MODEL = "gemini-2.5-flash-lite";
+
 /** Models tried in order when the primary is overloaded or rate-limited. */
 const MODEL_FALLBACK_CHAIN = [
   process.env.GEMINI_MODEL,
@@ -11,19 +14,54 @@ const MODEL_FALLBACK_CHAIN = [
   "gemini-2.5-pro",
 ].filter((m, i, arr): m is string => Boolean(m) && arr.indexOf(m) === i);
 
+/** Compliance audits — flash first (more reliable under load than lite). */
+const COMPLIANCE_MODEL_CHAIN = [
+  process.env.COMPLIANCE_GEMINI_MODEL,
+  "gemini-2.5-flash",
+  process.env.GEMINI_MODEL,
+  DEFAULT_COMPLIANCE_MODEL,
+  "gemini-flash-latest",
+].filter((m, i, arr): m is string => Boolean(m) && arr.indexOf(m) === i);
+
+/** Serialize compliance API calls — parallel bursts cause 503/timeout storms. */
+let complianceQueueTail: Promise<void> = Promise.resolve();
+let lastComplianceCallAt = 0;
+const COMPLIANCE_MIN_GAP_MS = 800;
+
+function is503Error(error: unknown): boolean {
+  const msg = errorMessage(error).toLowerCase();
+  return msg.includes("503") || msg.includes("high demand") || msg.includes("unavailable");
+}
+
+async function enqueueComplianceCall<T>(fn: () => Promise<T>): Promise<T> {
+  const ticket = complianceQueueTail.then(async () => {
+    const wait = COMPLIANCE_MIN_GAP_MS - (Date.now() - lastComplianceCallAt);
+    if (wait > 0) await sleep(wait);
+    lastComplianceCallAt = Date.now();
+  });
+  complianceQueueTail = ticket.catch(() => {});
+  await ticket;
+  return fn();
+}
+
 function getApiKey(): string {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error("GEMINI_API_KEY is not configured");
   return apiKey;
 }
 
-function buildModel(system: string, modelName: string, jsonMode = false): GenerativeModel {
+function buildModel(
+  system: string,
+  modelName: string,
+  jsonMode = false,
+  maxOutputTokens = 16384,
+): GenerativeModel {
   const genAI = new GoogleGenerativeAI(getApiKey());
   return genAI.getGenerativeModel({
     model: modelName,
     systemInstruction: system,
     generationConfig: {
-      maxOutputTokens: 16384,
+      maxOutputTokens,
       ...(jsonMode ? { responseMimeType: "application/json" } : {}),
     },
   });
@@ -31,6 +69,19 @@ function buildModel(system: string, modelName: string, jsonMode = false): Genera
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** Surface the underlying network cause (undici hides it in `error.cause`). */
+function errorDetail(error: unknown): string {
+  const parts: string[] = [errorMessage(error)];
+  const cause = (error as { cause?: unknown })?.cause;
+  if (cause) {
+    const c = cause as { code?: string; message?: string; errno?: number };
+    parts.push(`cause=${c.code ?? c.errno ?? ""} ${c.message ?? String(cause)}`.trim());
+  }
+  const status = (error as { status?: number })?.status;
+  if (status) parts.push(`status=${status}`);
+  return parts.join(" | ");
 }
 
 function isJsonParseError(error: unknown): boolean {
@@ -41,6 +92,30 @@ function isJsonParseError(error: unknown): boolean {
     msg.includes("Unexpected token") ||
     msg.includes("Unexpected end")
   );
+}
+
+/**
+ * A pure network/connection failure (no HTTP response). Retrying these 8× across
+ * 5 fallback models is pointless — every model shares the same broken connection —
+ * and it turns one unreachable batch into ~10 minutes of dead waiting. Detect them
+ * so we can fail fast and abort the whole run early.
+ */
+function isConnectionError(error: unknown): boolean {
+  if (typeof (error as { status?: number })?.status === "number") return false;
+  const cause = (error as { cause?: { code?: string; message?: string } })?.cause;
+  const code = cause?.code ?? "";
+  const blob = `${errorMessage(error)} ${cause?.message ?? ""} ${code}`.toLowerCase();
+  if (
+    /econnreset|econnrefused|etimedout|enotfound|eai_again|epipe|und_err|socket hang up|fetch failed|network|terminated|certificate/.test(
+      blob,
+    )
+  ) {
+    return true;
+  }
+  // SDK throws "Error fetching from <url>" with NO "[<status>]" bracket when the
+  // underlying fetch itself threw (connection layer), vs "[503 ...]" for HTTP.
+  const msg = errorMessage(error);
+  return msg.includes("Error fetching from") && !/\[\d{3}\b/.test(msg);
 }
 
 function isRetryableGeminiError(error: unknown): boolean {
@@ -168,10 +243,13 @@ async function generateWithModel(
   user: string,
   modelName: string,
   maxAttempts = 8,
+  /** Compliance mode: fail fast on 503 so we switch models instead of waiting minutes. */
+  complianceMode = false,
 ): Promise<string> {
   let lastError: unknown;
+  const effectiveMax = complianceMode ? Math.min(maxAttempts, 3) : maxAttempts;
 
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+  for (let attempt = 0; attempt < effectiveMax; attempt++) {
     try {
       const result = await model.generateContent(user);
       const text = result.response.text();
@@ -179,12 +257,37 @@ async function generateWithModel(
       return text;
     } catch (error) {
       lastError = error;
-      const retryable = isRetryableGeminiError(error);
-      if (!retryable || attempt === maxAttempts - 1) throw error;
 
-      const delay = parseRetryDelayMs(error, attempt);
+      // 503 high demand: one quick retry, then let the model chain switch.
+      if (complianceMode && is503Error(error)) {
+        if (attempt >= 1) throw error;
+        console.warn(
+          `[gemini] ${modelName} 503 high demand — retry once in 3s, then switch model`,
+        );
+        await sleep(3_000);
+        continue;
+      }
+
+      // Connection failures: retry with backoff, then try the next model in the chain.
+      if (isConnectionError(error)) {
+        const connMax = complianceMode ? 2 : 5;
+        if (attempt >= connMax) throw error;
+        const delay = complianceMode ? 3_000 : 2_000 + attempt * 2_000;
+        console.warn(
+          `[gemini] ${modelName} connection error ${attempt + 1}/${connMax + 1} — ${errorDetail(error).slice(0, 200)} — retry in ${Math.round(delay / 1000)}s`,
+        );
+        await sleep(delay);
+        continue;
+      }
+
+      const retryable = isRetryableGeminiError(error);
+      if (!retryable || attempt === effectiveMax - 1) throw error;
+
+      const delay = complianceMode && is503Error(error)
+        ? 3_000
+        : parseRetryDelayMs(error, attempt);
       console.warn(
-        `[gemini] ${modelName} attempt ${attempt + 1}/${maxAttempts} — ${errorMessage(error).slice(0, 120)} — retry in ${Math.round(delay / 1000)}s`,
+        `[gemini] ${modelName} attempt ${attempt + 1}/${effectiveMax} — ${errorDetail(error).slice(0, 200)} — retry in ${Math.round(delay / 1000)}s`,
       );
       await sleep(delay);
     }
@@ -193,40 +296,73 @@ async function generateWithModel(
   throw lastError ?? new Error("Gemini request failed");
 }
 
-export async function generateJson<T>(system: string, user: string): Promise<T> {
+async function generateJsonWithChain<T>(
+  system: string,
+  user: string,
+  chain: string[],
+  maxOutputTokens: number,
+  logPrefix: string,
+  complianceMode = false,
+): Promise<T> {
   let lastError: unknown;
 
-  for (const modelName of MODEL_FALLBACK_CHAIN) {
-    for (let parseAttempt = 0; parseAttempt < 3; parseAttempt++) {
+  for (const modelName of chain) {
+    for (let parseAttempt = 0; parseAttempt < (complianceMode ? 2 : 3); parseAttempt++) {
       try {
-        const model = buildModel(system, modelName, true);
-        const text = await generateWithModel(model, user, modelName);
+        const model = buildModel(system, modelName, true, maxOutputTokens);
+        const text = await generateWithModel(model, user, modelName, 8, complianceMode);
         const parsed = parseJsonFromText<T>(text);
-        if (modelName !== (process.env.GEMINI_MODEL ?? DEFAULT_MODEL)) {
-          console.log(`[gemini] succeeded with fallback model: ${modelName}`);
+        if (modelName !== chain[0]) {
+          console.log(`[${logPrefix}] succeeded with fallback model: ${modelName}`);
         }
         return parsed;
       } catch (error) {
         lastError = error;
-        if (isJsonParseError(error) && parseAttempt < 2) {
-          console.warn(`[gemini] JSON parse failed on ${modelName} — retry ${parseAttempt + 2}/3`);
-          await sleep(2_000 + parseAttempt * 1_500);
+        if (isConnectionError(error) || is503Error(error)) {
+          console.warn(
+            `[${logPrefix}] ${is503Error(error) ? "503" : "connection"} on ${modelName} — trying next model`,
+          );
+          break;
+        }
+        if (isJsonParseError(error) && parseAttempt < 1) {
+          console.warn(`[${logPrefix}] JSON parse failed on ${modelName} — retry`);
+          await sleep(2_000);
           continue;
         }
         if (!isRetryableGeminiError(error)) throw error;
-        break; // try next model
+        break;
       }
     }
-    console.warn(`[gemini] model ${modelName} exhausted — trying next model`);
+    console.warn(`[${logPrefix}] model ${modelName} exhausted — trying next model`);
   }
 
   const msg = errorMessage(lastError);
+  if (isConnectionError(lastError)) {
+    throw new Error(
+      `Gemini API connection failed after trying all models (likely too many parallel requests or a brief network outage). Wait 30 seconds and retry the analysis. Details: ${errorDetail(lastError).slice(0, 200)}`,
+    );
+  }
   if (isRetryableGeminiError(lastError)) {
     throw new Error(
       `Gemini API is temporarily unavailable (high demand or rate limit). Wait a minute and retry. Details: ${msg.slice(0, 220)}`,
     );
   }
   throw lastError instanceof Error ? lastError : new Error(msg);
+}
+
+export async function generateJson<T>(system: string, user: string): Promise<T> {
+  return generateJsonWithChain<T>(system, user, MODEL_FALLBACK_CHAIN, 16384, "gemini");
+}
+
+/**
+ * High-throughput JSON generation for compliance clause batching.
+ * Requests are serialized with a minimum gap to avoid 503 storms.
+ * Uses gemini-2.5-flash by default; fails fast on 503 and switches models.
+ */
+export async function generateComplianceJson<T>(system: string, user: string): Promise<T> {
+  return enqueueComplianceCall(() =>
+    generateJsonWithChain<T>(system, user, COMPLIANCE_MODEL_CHAIN, 32768, "compliance-gemini", true),
+  );
 }
 
 export async function* streamComplianceAnalysis(

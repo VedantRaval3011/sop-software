@@ -18,6 +18,84 @@ export interface IComplianceFindingDetail {
   impactAnalysis?: string;
   estimatedEffort: "low" | "medium" | "high";
   reviewStatus?: "pending" | "accepted" | "disputed" | "implemented";
+
+  // ── Structured regulatory audit fields (V5) ──
+  findingCategory?: string;
+  riskLevel?: string;
+  guidelineReference?: string;
+  evidenceFound?: string;
+  evidenceMissing?: string;
+  evidenceStrength?: string;
+  pageNumber?: string;
+  paragraphNumber?: string;
+  requiresManualReview?: boolean;
+  findingType?: string;
+  rootCauseKey?: string;
+  mergedClauseRefs?: string[];
+  applicability?: string;
+  requirementCriticality?: string;
+  scopeOwner?: string;
+  whyApplies?: string;
+  whyEvidenceInsufficient?: string;
+  whyScoreReduced?: string;
+}
+
+export interface ITraceabilityMatrixEntry {
+  clauseNumber: string;
+  clauseTitle: string;
+  clauseText: string;
+  guidelineName: string;
+  folderName: string;
+  applicable: boolean;
+  complianceStatus: string;
+  supportingSopSection: string;
+  confidenceScore: number;
+}
+
+export interface ICrossSopDependency {
+  referencedType: string;
+  referenceText: string;
+  found: boolean;
+  status: string;
+  matchedSopIdentifier?: string;
+  matchedSopName?: string;
+  riskLevel: string;
+  note: string;
+}
+
+export interface IAuditCompleteness {
+  totalGuidelinesReviewed: number;
+  totalChaptersReviewed: number;
+  totalClausesReviewed: number;
+  applicableClauses: number;
+  notApplicableClauses: number;
+  compliantCount: number;
+  partialCount: number;
+  nonCompliantCount: number;
+  criticalFindings: number;
+  majorFindings: number;
+  minorFindings: number;
+  improvementOpportunities: number;
+  clauseCoveragePct: number;
+  sopCoveragePct: number;
+  overallScore: number;
+}
+
+export interface IComplianceScoreBreakdown {
+  totalApplicableRequirements: number;
+  compliantCount: number;
+  partialCount: number;
+  nonCompliantCount: number;
+  improvementCount: number;
+  notApplicableCount: number;
+  formula: string;
+  score: number;
+  scoringMethod?: string;
+  weightedAchieved?: number;
+  weightedTotal?: number;
+  criticalRequirementCount?: number;
+  majorRequirementCount?: number;
+  minorRequirementCount?: number;
 }
 
 export interface IComplianceReport extends Document {
@@ -44,6 +122,19 @@ export interface IComplianceReport extends Document {
   partialCount: number;
   nonCompliantCount: number;
   notApplicableCount: number;
+
+  // ── Structured regulatory audit aggregates (V5) ──
+  criticalCount?: number;
+  majorCount?: number;
+  minorCount?: number;
+  improvementCount?: number;
+  bestPracticeCount?: number;
+  clauseCoveragePct?: number;
+  scoreBreakdown?: IComplianceScoreBreakdown;
+  auditCompleteness?: IAuditCompleteness;
+  traceabilityMatrix?: ITraceabilityMatrixEntry[];
+  crossSopDependencies?: ICrossSopDependency[];
+  analysisEngineVersion?: string;
 
   findings: IComplianceFindingDetail[];
 
@@ -119,6 +210,96 @@ const ComplianceReportSchema = new Schema<IComplianceReport>(
           enum: ["pending", "accepted", "disputed", "implemented"],
           default: "pending",
         },
+
+        // ── Structured regulatory audit fields (V5) ──
+        findingCategory: { type: String },
+        riskLevel: { type: String },
+        guidelineReference: { type: String },
+        evidenceFound: { type: String },
+        evidenceMissing: { type: String },
+        evidenceStrength: { type: String },
+        pageNumber: { type: String },
+        paragraphNumber: { type: String },
+        requiresManualReview: { type: Boolean, default: false },
+        findingType: { type: String },
+        rootCauseKey: { type: String },
+        mergedClauseRefs: { type: [String], default: undefined },
+        applicability: { type: String },
+        requirementCriticality: { type: String },
+        scopeOwner: { type: String },
+        whyApplies: { type: String },
+        whyEvidenceInsufficient: { type: String },
+        whyScoreReduced: { type: String },
+      },
+    ],
+
+    criticalCount: { type: Number, default: 0 },
+    majorCount: { type: Number, default: 0 },
+    minorCount: { type: Number, default: 0 },
+    improvementCount: { type: Number, default: 0 },
+    bestPracticeCount: { type: Number, default: 0 },
+    clauseCoveragePct: { type: Number, default: 0 },
+    analysisEngineVersion: { type: String },
+
+    auditCompleteness: {
+      totalGuidelinesReviewed: { type: Number },
+      totalChaptersReviewed: { type: Number },
+      totalClausesReviewed: { type: Number },
+      applicableClauses: { type: Number },
+      notApplicableClauses: { type: Number },
+      compliantCount: { type: Number },
+      partialCount: { type: Number },
+      nonCompliantCount: { type: Number },
+      criticalFindings: { type: Number },
+      majorFindings: { type: Number },
+      minorFindings: { type: Number },
+      improvementOpportunities: { type: Number },
+      clauseCoveragePct: { type: Number },
+      sopCoveragePct: { type: Number },
+      overallScore: { type: Number },
+    },
+
+    scoreBreakdown: {
+      totalApplicableRequirements: { type: Number },
+      compliantCount: { type: Number },
+      partialCount: { type: Number },
+      nonCompliantCount: { type: Number },
+      improvementCount: { type: Number },
+      notApplicableCount: { type: Number },
+      formula: { type: String },
+      score: { type: Number },
+      scoringMethod: { type: String },
+      weightedAchieved: { type: Number },
+      weightedTotal: { type: Number },
+      criticalRequirementCount: { type: Number },
+      majorRequirementCount: { type: Number },
+      minorRequirementCount: { type: Number },
+    },
+
+    traceabilityMatrix: [
+      {
+        clauseNumber: { type: String },
+        clauseTitle: { type: String },
+        clauseText: { type: String },
+        guidelineName: { type: String },
+        folderName: { type: String },
+        applicable: { type: Boolean },
+        complianceStatus: { type: String },
+        supportingSopSection: { type: String },
+        confidenceScore: { type: Number },
+      },
+    ],
+
+    crossSopDependencies: [
+      {
+        referencedType: { type: String },
+        referenceText: { type: String },
+        found: { type: Boolean },
+        status: { type: String },
+        matchedSopIdentifier: { type: String },
+        matchedSopName: { type: String },
+        riskLevel: { type: String },
+        note: { type: String },
       },
     ],
 

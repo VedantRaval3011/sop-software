@@ -3,6 +3,7 @@ import {
   extractLineRefs,
   getLinesText,
   type ParsedSop,
+  type SopSectionType,
 } from "@/lib/sopStructureParser";
 import { applySemanticValidation } from "@/lib/semanticRelevance";
 
@@ -128,6 +129,89 @@ function clauseKey(c: { guidelineName?: string; clauseNumber?: string }): string
   return `${c.guidelineName ?? ""}::${c.clauseNumber ?? ""}`;
 }
 
+function formatLineRef(n: number): string {
+  return `L${String(n).padStart(3, "0")}`;
+}
+
+/** Scope/purpose excerpt used when AI omits SOP evidence (common for not-applicable findings). */
+export function getRepresentativeSopExcerpt(
+  parsedSop: ParsedSop,
+  sopIdentifier?: string,
+  sopName?: string,
+): { sopTextSnippet: string; sopSectionAffected: string } {
+  const sectionKinds: Array<SopSectionType | "first"> = ["scope", "purpose", "general", "first"];
+
+  for (const kind of sectionKinds) {
+    const section =
+      kind === "first" ? parsedSop.sections[0] : parsedSop.sections.find((s) => s.type === kind);
+    if (!section) continue;
+
+    const lineNumbers = Array.from(
+      { length: section.lineEnd - section.lineStart + 1 },
+      (_, i) => section.lineStart + i,
+    );
+    const lineText = getLinesText(parsedSop, lineNumbers).trim();
+    if (lineText.length < 15) continue;
+
+    const sectionRef = section.id
+      ? `${formatLineRef(section.lineStart)} [§${section.id} ${section.title}]`
+      : formatLineRef(section.lineStart);
+
+    return {
+      sopTextSnippet: lineText.slice(0, 500),
+      sopSectionAffected: sectionRef,
+    };
+  }
+
+  const openingLines = parsedSop.lines
+    .slice(0, 5)
+    .map((l) => l.text)
+    .join(" ")
+    .trim();
+  if (openingLines.length >= 10) {
+    const firstSection = parsedSop.sections[0];
+    return {
+      sopTextSnippet: openingLines.slice(0, 500),
+      sopSectionAffected: firstSection?.id
+        ? `§${firstSection.id}`
+        : firstSection
+          ? formatLineRef(firstSection.lineStart)
+          : "1",
+    };
+  }
+
+  if (sopIdentifier && sopName) {
+    return {
+      sopTextSnippet: `${sopIdentifier}_${sopName}`,
+      sopSectionAffected: parsedSop.sections[0]?.id || "1",
+    };
+  }
+
+  return { sopTextSnippet: "", sopSectionAffected: "" };
+}
+
+/** Fill missing SOP citation fields from parsed document content. */
+export function enrichFindingSopContent(
+  finding: ComplianceFinding,
+  parsedSop: ParsedSop,
+  sopIdentifier?: string,
+  sopName?: string,
+): ComplianceFinding {
+  const needsSnippet = !cleanFindingText(finding.sopTextSnippet);
+  const needsSection =
+    !finding.sopSectionAffected?.trim() || isPlaceholderText(finding.sopSectionAffected);
+
+  if (!needsSnippet && !needsSection) return finding;
+
+  const excerpt = getRepresentativeSopExcerpt(parsedSop, sopIdentifier, sopName);
+  return {
+    ...finding,
+    sopTextSnippet: needsSnippet && excerpt.sopTextSnippet ? excerpt.sopTextSnippet : finding.sopTextSnippet,
+    sopSectionAffected:
+      needsSection && excerpt.sopSectionAffected ? excerpt.sopSectionAffected : finding.sopSectionAffected,
+  };
+}
+
 /**
  * Validate and enrich a finding against actual SOP and guideline content.
  * Adjusts confidence, fills evidence from line refs, and flags unsupported claims.
@@ -137,6 +221,7 @@ export function validateFindingEvidence(
   clause: ClauseForValidation,
   sopContent: string,
   parsedSop: ParsedSop,
+  sopMeta?: { identifier: string; name: string },
 ): ComplianceFinding {
   const result = { ...finding };
 
@@ -225,6 +310,13 @@ export function validateFindingEvidence(
   }
 
   result.matchConfidence = Math.min(100, Math.max(0, Math.round(result.matchConfidence)));
+
+  if (!cleanFindingText(result.sopTextSnippet) || !result.sopSectionAffected?.trim()) {
+    const enriched = enrichFindingSopContent(result, parsedSop, sopMeta?.identifier, sopMeta?.name);
+    result.sopTextSnippet = enriched.sopTextSnippet;
+    result.sopSectionAffected = enriched.sopSectionAffected;
+  }
+
   return result;
 }
 
@@ -280,13 +372,16 @@ export function validateAllFindings(
   clauses: ClauseForValidation[],
   sopContent: string,
   parsedSop: ParsedSop,
+  sopMeta?: { identifier: string; name: string },
 ): ComplianceFinding[] {
   const clauseMap = new Map(clauses.map((c) => [clauseKey(c), c]));
   const covered = auditClauseCoverage(findings, clauses);
 
   return covered.map((f) => {
     const clause = clauseMap.get(clauseKey(f));
-    if (!clause || f.complianceLevel === "analysis-failed") return f;
-    return validateFindingEvidence(f, clause, sopContent, parsedSop);
+    if (!clause || f.complianceLevel === "analysis-failed") {
+      return enrichFindingSopContent(f, parsedSop, sopMeta?.identifier, sopMeta?.name);
+    }
+    return validateFindingEvidence(f, clause, sopContent, parsedSop, sopMeta);
   });
 }

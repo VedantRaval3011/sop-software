@@ -1,7 +1,17 @@
 import ComplianceReport from "@/models/ComplianceReport";
-import type { ComplianceFinding } from "@/lib/complianceEngine";
-import { calculateCompliancePercentage } from "@/lib/complianceFormatter";
+import type {
+  AuditCompleteness,
+  ComplianceFinding,
+  ComplianceScoreBreakdown,
+  CrossSopDependency,
+  TraceabilityMatrixEntry,
+} from "@/lib/complianceEngine";
+import { computeWeightedScoreBreakdown } from "@/lib/complianceClassification";
 import mongoose from "mongoose";
+
+function isObjectId(value?: string): boolean {
+  return !!value && mongoose.Types.ObjectId.isValid(value);
+}
 
 export async function saveComplianceReport(data: {
   sopId: string;
@@ -12,6 +22,13 @@ export async function saveComplianceReport(data: {
   findings: (ComplianceFinding & { guidelineId?: string; folderName?: string })[];
   overallScore: number;
   complianceStatus: string;
+  // structured regulatory audit output (V5)
+  scoreBreakdown?: ComplianceScoreBreakdown;
+  traceabilityMatrix?: TraceabilityMatrixEntry[];
+  crossSopDependencies?: CrossSopDependency[];
+  auditCompleteness?: AuditCompleteness;
+  clauseCoveragePct?: number;
+  analysisEngineVersion?: string;
   // accepted but not stored — callers may still pass these
   sopContentLength?: number;
   processingTimeMs?: number;
@@ -21,13 +38,17 @@ export async function saveComplianceReport(data: {
   const partialCount = data.findings.filter((f) => f.complianceLevel === "partial").length;
   const nonCompliantCount = data.findings.filter((f) => f.complianceLevel === "non-compliant").length;
   const notApplicableCount = data.findings.filter((f) => f.complianceLevel === "not-applicable").length;
-  const applicable = data.findings.filter(
-    (f) => f.complianceLevel !== "not-applicable" && f.complianceLevel !== "analysis-failed",
-  );
+
+  // Transparent weighted score — recommendations excluded, criticality-weighted.
+  const breakdown = data.scoreBreakdown ?? computeWeightedScoreBreakdown(data.findings);
   const scoreFromFindings =
-    applicable.length > 0
-      ? Math.round(calculateCompliancePercentage(compliantCount, partialCount, applicable.length)) / 10
-      : data.overallScore;
+    breakdown.totalApplicableRequirements > 0 ? breakdown.score : data.overallScore;
+
+  const criticalCount = data.findings.filter((f) => f.findingCategory === "Critical Non-Compliance").length;
+  const majorCount = data.findings.filter((f) => f.findingCategory === "Major Gap").length;
+  const minorCount = data.findings.filter((f) => f.findingCategory === "Minor Gap").length;
+  const improvementCount = data.findings.filter((f) => f.findingCategory === "Improvement Opportunity").length;
+  const bestPracticeCount = data.findings.filter((f) => f.findingCategory === "Best Practice Recommendation").length;
 
   const reportData = {
     sopId: new mongoose.Types.ObjectId(data.sopId),
@@ -44,8 +65,19 @@ export async function saveComplianceReport(data: {
     partialCount,
     nonCompliantCount,
     notApplicableCount,
+    criticalCount,
+    majorCount,
+    minorCount,
+    improvementCount,
+    bestPracticeCount,
+    clauseCoveragePct: data.clauseCoveragePct ?? data.auditCompleteness?.clauseCoveragePct ?? 0,
+    analysisEngineVersion: data.analysisEngineVersion ?? "v5",
+    scoreBreakdown: breakdown,
+    auditCompleteness: data.auditCompleteness,
+    traceabilityMatrix: data.traceabilityMatrix ?? [],
+    crossSopDependencies: data.crossSopDependencies ?? [],
     findings: data.findings.map((f) => ({
-      guidelineId: f.guidelineId ? new mongoose.Types.ObjectId(f.guidelineId) : undefined,
+      guidelineId: isObjectId(f.guidelineId) ? new mongoose.Types.ObjectId(f.guidelineId) : undefined,
       guidelineName: f.guidelineName ?? "",
       folderName: f.folderName ?? "",
       clauseNumber: f.clauseNumber,
@@ -61,6 +93,24 @@ export async function saveComplianceReport(data: {
       suggestedText: f.suggestedText,
       impactAnalysis: f.impactAnalysis ?? "",
       estimatedEffort: f.estimatedEffort,
+      findingCategory: f.findingCategory,
+      riskLevel: f.riskLevel,
+      guidelineReference: f.guidelineReference,
+      evidenceFound: f.evidenceFound ?? "",
+      evidenceMissing: f.evidenceMissing ?? "",
+      evidenceStrength: f.evidenceStrength,
+      pageNumber: f.pageNumber ?? "",
+      paragraphNumber: f.paragraphNumber ?? "",
+      requiresManualReview: f.requiresManualReview ?? false,
+      findingType: f.findingType ?? "guideline-clause",
+      rootCauseKey: f.rootCauseKey ?? "",
+      mergedClauseRefs: f.mergedClauseRefs,
+      applicability: f.applicability,
+      requirementCriticality: f.requirementCriticality,
+      scopeOwner: f.scopeOwner,
+      whyApplies: f.whyApplies ?? "",
+      whyEvidenceInsufficient: f.whyEvidenceInsufficient ?? "",
+      whyScoreReduced: f.whyScoreReduced ?? "",
     })),
     analyzedAt: new Date(),
   };

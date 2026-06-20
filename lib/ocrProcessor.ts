@@ -49,7 +49,11 @@ export function normalizeText(raw: string): string {
   return raw
     .replace(/\r\n/g, "\n")
     .replace(/\r/g, "\n")
-    .replace(/\s+/g, " ")
+    // Collapse runs of spaces/tabs but PRESERVE newlines so clause/section
+    // boundaries survive for extraction.
+    .replace(/[ \t\f\v]+/g, " ")
+    .replace(/ *\n */g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
     .replace(/\bPage\s+\d+\s+of\s+\d+\b/gi, "")
     .replace(/\b(\d+)\s*\/\s*(\d+)\b/g, (m, a, b) =>
       a.length <= 3 && b.length <= 3 ? "" : m,
@@ -116,44 +120,120 @@ export function extractKeywords(text: string): string[] {
 }
 
 // ── Clause Extraction ──────────────────────────────────────────────────────
+//
+// Goal: extract EVERY clause/section of a guideline so compliance is assessed
+// against the full document, not a single truncated fallback clause.
+//
+// Strategy:
+//   1. Detect headings using several bounded patterns (dotted section numbers,
+//      labelled sections, line-start numbering). Titles are length-capped so
+//      detection still works even when newlines were stripped from older data.
+//   2. If at least a few real headings are found, build one clause per heading.
+//   3. Otherwise fall back to CHUNKING the full text into ordered segments so
+//      no content is dropped (every part of the guideline is still analysed).
 
-const CLAUSE_PATTERNS = [
-  /(\d+(?:\.\d+)*)\s+([A-Z][^\n]{3,})/g,
-  /Section\s+([A-Z]\.?\d*):?\s*([^\n]+)/gi,
-  /Clause\s+(\d+)\s*[-–]\s*([^\n]+)/gi,
-  /Article\s+(\d+(?:\.\d+)*)\s+([^\n]+)/gi,
-];
+interface ClauseBoundary {
+  number: string;
+  title: string;
+  index: number;
+}
+
+// Dotted section numbers: "9.3 Lifecycle validation", "4.2.1 Records"
+const DOTTED_HEADING_RE = /(\d+\.\d+(?:\.\d+){0,3})\s+([A-Z(][^\n]{2,99})/g;
+// Labelled headings: "Section 5: Scope", "Annex 15", "Article 4 Personnel"
+const LABELLED_HEADING_RE =
+  /\b(Section|Clause|Article|Annex|Appendix|Part|Chapter)\s+([0-9A-Z][\w.\-]*)\s*[:.\-)]?\s+([A-Z(][^\n]{2,90})/gi;
+// Line-start single/double digit headings: "5. Quality system"
+const LINE_START_HEADING_RE = /(?:^|\n)\s*(\d{1,2})\.?\s+([A-Z][A-Za-z][^\n]{3,90})/g;
+
+const MIN_HEADINGS = 3;
+const MAX_CLAUSE_CHARS = 6000;
+const CHUNK_CHARS = 3500;
+const MAX_CHUNKS = 25;
+
+function cleanTitle(raw: string): string {
+  return raw.trim().replace(/\s+/g, " ").slice(0, 110);
+}
+
+function collectBoundaries(text: string): ClauseBoundary[] {
+  const found: ClauseBoundary[] = [];
+  const push = (number: string, title: string, index: number) => {
+    const t = cleanTitle(title);
+    if (t.length < 2) return;
+    found.push({ number: number.trim(), title: t, index });
+  };
+
+  let m: RegExpExecArray | null;
+
+  const dotted = new RegExp(DOTTED_HEADING_RE.source, "g");
+  while ((m = dotted.exec(text)) !== null) push(m[1], m[2], m.index);
+
+  const labelled = new RegExp(LABELLED_HEADING_RE.source, "gi");
+  while ((m = labelled.exec(text)) !== null) push(`${m[1]} ${m[2]}`, m[3], m.index);
+
+  const lineStart = new RegExp(LINE_START_HEADING_RE.source, "g");
+  while ((m = lineStart.exec(text)) !== null) push(m[1], m[2], m.index);
+
+  // Order by position and drop near-duplicate boundaries (same heading caught
+  // by more than one pattern).
+  found.sort((a, b) => a.index - b.index);
+  const deduped: ClauseBoundary[] = [];
+  for (const b of found) {
+    const prev = deduped[deduped.length - 1];
+    if (prev && b.index - prev.index < 8) continue;
+    deduped.push(b);
+  }
+  return deduped;
+}
+
+function chunkIntoClauses(text: string, fallbackName: string): GuidelineClause[] {
+  const segments = text.match(/[^.!?\n]+[.!?\n]?\s*/g) ?? [text];
+  const chunks: string[] = [];
+  let buf = "";
+  for (const seg of segments) {
+    if (buf.length + seg.length > CHUNK_CHARS && buf) {
+      chunks.push(buf);
+      buf = "";
+      if (chunks.length >= MAX_CHUNKS) break;
+    }
+    buf += seg;
+  }
+  if (buf.trim() && chunks.length < MAX_CHUNKS) chunks.push(buf);
+
+  const total = chunks.length;
+  return chunks.map((c, i) => {
+    const clauseText = c.trim().slice(0, MAX_CLAUSE_CHARS);
+    return {
+      clauseNumber: String(i + 1),
+      clauseTitle: total > 1 ? `${fallbackName} (part ${i + 1} of ${total})` : fallbackName,
+      clauseText,
+      keywords: extractKeywords(clauseText),
+    };
+  });
+}
 
 export function extractClauses(normalizedText: string, fallbackName: string): GuidelineClause[] {
-  for (const pattern of CLAUSE_PATTERNS) {
-    const matches: { number: string; title: string; index: number }[] = [];
-    let m: RegExpExecArray | null;
-    const re = new RegExp(pattern.source, pattern.flags);
-    while ((m = re.exec(normalizedText)) !== null) {
-      matches.push({ number: m[1], title: m[2].trim().slice(0, 120), index: m.index });
-    }
-    if (matches.length >= 2) {
-      return matches.map((match, i) => {
-        const start = match.index + match.number.length + match.title.length + 1;
-        const end = i + 1 < matches.length ? matches[i + 1].index : normalizedText.length;
-        const clauseText = normalizedText.slice(start, end).trim().slice(0, 5000);
-        return {
-          clauseNumber: match.number,
-          clauseTitle: match.title,
-          clauseText,
-          keywords: extractKeywords(clauseText),
-        };
+  const text = normalizedText ?? "";
+  const boundaries = collectBoundaries(text);
+
+  if (boundaries.length >= MIN_HEADINGS) {
+    const clauses: GuidelineClause[] = [];
+    for (let i = 0; i < boundaries.length; i++) {
+      const b = boundaries[i];
+      const end = i + 1 < boundaries.length ? boundaries[i + 1].index : text.length;
+      const clauseText = text.slice(b.index, end).trim().slice(0, MAX_CLAUSE_CHARS);
+      // Skip noise boundaries that captured almost no body text.
+      if (clauseText.length < 30) continue;
+      clauses.push({
+        clauseNumber: b.number,
+        clauseTitle: b.title,
+        clauseText,
+        keywords: extractKeywords(clauseText),
       });
     }
+    if (clauses.length >= MIN_HEADINGS) return clauses;
   }
 
-  // Fallback: single clause with full text
-  return [
-    {
-      clauseNumber: "1",
-      clauseTitle: fallbackName,
-      clauseText: normalizedText.slice(0, 5000),
-      keywords: extractKeywords(normalizedText),
-    },
-  ];
+  // Full-coverage fallback: chunk the entire document so nothing is dropped.
+  return chunkIntoClauses(text, fallbackName);
 }

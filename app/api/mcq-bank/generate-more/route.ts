@@ -1,10 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { connectDB } from "@/lib/mongodb";
-import MCQ from "@/models/MCQ";
-import MCQRecycle from "@/models/MCQRecycle";
+import MCQBank from "@/models/MCQBank";
 import SOP from "@/models/SOP";
 import { generateJson } from "@/lib/gemini";
-import { isSimilarQuestion } from "@/lib/similarity";
+import { appendGeneratedToBank, type BankInputMcq } from "@/lib/mcq-bank-write";
 import { invalidateDashboardSopsCache } from "@/lib/server-cache";
 import { requireAuth } from "@/lib/withAuth";
 
@@ -30,49 +29,22 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "SOP not found" }, { status: 404 });
     }
 
-    const existing = await MCQ.find({ identifier, language, status: "approved" })
-      .select("question")
-      .lean();
-    const excluded = existing.map((e) => e.question).join("\n- ");
+    // Exclude the questions already in this SOP's bank so the model produces new ones.
+    const existingBank = await MCQBank.findOne({ sopId: sop._id, language }).select("mcqs.question").lean();
+    const excluded = (existingBank?.mcqs ?? []).map((m) => m.question).join("\n- ");
 
-    const result = await generateJson<{ questions: Array<Record<string, string>> }>(
+    const result = await generateJson<{ questions: BankInputMcq[] }>(
       REPLACE_PROMPT,
       `SOP content:\n${sop.content.slice(0, 40000)}\n\nExcluded similar questions:\n- ${excluded}\n\nGenerate ${count} new unique questions in ${language}.`,
     );
 
-    const approved = [];
-    for (const q of result.questions ?? []) {
-      const duplicate = existing.some((e) => isSimilarQuestion(q.question, e.question));
-      if (duplicate) {
-        await MCQRecycle.create({
-          ...q,
-          identifier,
-          language,
-          sopId: sop._id,
-          department: sop.department,
-          similarityScore: 0.75,
-          reason: "auto_replace_duplicate",
-        });
-        continue;
-      }
-      const doc = await MCQ.create({
-        ...q,
-        correctAnswer: q.correctAnswer as "A" | "B" | "C" | "D",
-        difficulty: (q.difficulty as "easy" | "medium" | "hard") ?? "medium",
-        language,
-        sopId: sop._id,
-        identifier,
-        department: sop.department,
-        status: "approved",
-      });
-      approved.push(doc);
-    }
+    // appendGeneratedToBank dedups against the existing bank before appending.
+    const { inserted, total } = await appendGeneratedToBank(sop, language, result.questions ?? []);
 
-    const mcqCount = await MCQ.countDocuments({ identifier, status: "approved" });
-    await SOP.updateMany({ identifier }, { mcqCount });
+    await SOP.updateMany({ identifier, language }, { mcqCount: total });
     invalidateDashboardSopsCache();
 
-    return NextResponse.json({ replaced: approved.length, mcqCount });
+    return NextResponse.json({ replaced: inserted, mcqCount: total });
   } catch (error) {
     return NextResponse.json(
       { error: error instanceof Error ? error.message : "Generate more failed" },

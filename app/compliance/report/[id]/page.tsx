@@ -24,6 +24,24 @@ interface ComplianceFinding {
   reviewStatus?: 'pending' | 'accepted' | 'disputed' | 'implemented';
 }
 
+interface AuditCompleteness {
+  totalGuidelinesReviewed: number;
+  totalChaptersReviewed: number;
+  totalClausesReviewed: number;
+  applicableClauses: number;
+  notApplicableClauses: number;
+  compliantCount: number;
+  partialCount: number;
+  nonCompliantCount: number;
+  criticalFindings: number;
+  majorFindings: number;
+  minorFindings: number;
+  improvementOpportunities: number;
+  clauseCoveragePct: number;
+  sopCoveragePct: number;
+  overallScore: number;
+}
+
 interface ComplianceReport {
   _id: string;
   sopIdentifier: string;
@@ -35,6 +53,7 @@ interface ComplianceReport {
   compliantCount: number;
   partialCount: number;
   nonCompliantCount: number;
+  auditCompleteness?: AuditCompleteness;
   findings: ComplianceFinding[];
   analyzedAt: string;
 }
@@ -206,6 +225,55 @@ export default function ComplianceReportDetailPage() {
             ))}
           </div>
         </div>
+
+        {/* Audit completeness report — proves the entire guideline library was reviewed */}
+        {report.auditCompleteness && (() => {
+          const ac = report.auditCompleteness!;
+          const coverage = [
+            { label: 'Guidelines Reviewed', value: ac.totalGuidelinesReviewed, tone: 'text-indigo-700' },
+            { label: 'Chapters Reviewed', value: ac.totalChaptersReviewed, tone: 'text-indigo-700' },
+            { label: 'Clauses Reviewed', value: ac.totalClausesReviewed, tone: 'text-indigo-700' },
+            { label: 'Applicable', value: ac.applicableClauses, tone: 'text-blue-700' },
+            { label: 'Not Applicable', value: ac.notApplicableClauses, tone: 'text-slate-500' },
+          ];
+          const outcomes = [
+            { label: 'Compliant', value: ac.compliantCount, tone: 'text-emerald-600' },
+            { label: 'Partial', value: ac.partialCount, tone: 'text-amber-600' },
+            { label: 'Non-Compliant', value: ac.nonCompliantCount, tone: 'text-rose-600' },
+            { label: 'Critical', value: ac.criticalFindings, tone: 'text-red-600' },
+            { label: 'Major', value: ac.majorFindings, tone: 'text-orange-600' },
+            { label: 'Minor', value: ac.minorFindings, tone: 'text-yellow-600' },
+            { label: 'Improvements', value: ac.improvementOpportunities, tone: 'text-sky-600' },
+          ];
+          return (
+            <div className="rounded-2xl border border-indigo-200 bg-indigo-50/40 overflow-hidden">
+              <div className="px-5 py-3 bg-indigo-100/60 border-b border-indigo-200 flex items-center justify-between flex-wrap gap-2">
+                <span className="text-sm font-black text-indigo-800">🛡️ Audit Completeness Report</span>
+                <span className="text-[11px] font-bold text-indigo-600">
+                  {ac.totalClausesReviewed} clauses across {ac.totalGuidelinesReviewed} guidelines · {ac.clauseCoveragePct}% clause coverage · {ac.sopCoveragePct}% SOP coverage
+                </span>
+              </div>
+              <div className="p-5 space-y-4">
+                <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
+                  {coverage.map(m => (
+                    <div key={m.label} className="p-3 rounded-xl border border-indigo-100 bg-white text-center">
+                      <p className={`text-xl font-black leading-none ${m.tone}`}>{m.value}</p>
+                      <p className="text-[9px] font-bold text-gray-500 uppercase tracking-wider mt-1.5 leading-tight">{m.label}</p>
+                    </div>
+                  ))}
+                </div>
+                <div className="grid grid-cols-3 md:grid-cols-7 gap-2">
+                  {outcomes.map(m => (
+                    <div key={m.label} className="p-3 rounded-xl border border-gray-200 bg-white text-center">
+                      <p className={`text-xl font-black leading-none ${m.tone}`}>{m.value}</p>
+                      <p className="text-[9px] font-bold text-gray-500 uppercase tracking-wider mt-1.5 leading-tight">{m.label}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          );
+        })()}
 
         {/* Findings */}
         <div className="bg-white rounded-2xl border border-gray-200 shadow-sm p-6">

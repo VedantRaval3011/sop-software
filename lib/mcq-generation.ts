@@ -1,10 +1,9 @@
-import MCQ from "@/models/MCQ";
-import MCQRecycle from "@/models/MCQRecycle";
 import SOP, { type ISOP } from "@/models/SOP";
+import MCQBank from "@/models/MCQBank";
 import { generateJson } from "@/lib/gemini";
 import { invalidateDashboardSopsCache } from "@/lib/server-cache";
-import { isSimilarQuestion, SIMILARITY_THRESHOLD } from "@/lib/similarity";
 import { connectDB } from "@/lib/mongodb";
+import { replaceBankForSop } from "@/lib/mcq-bank-write";
 
 export interface GeneratedMCQ {
   question: string;
@@ -41,57 +40,12 @@ Rules:
 - Questions must be answerable from the SOP text only
 - No duplicate or near-duplicate questions`;
 
-async function loadExistingQuestions(
-  identifier: string,
-  language: "English" | "Gujarati",
-) {
-  const [approved, recycled] = await Promise.all([
-    MCQ.find({ identifier, language, status: "approved" }).select("question").lean(),
-    MCQRecycle.find({ identifier, language }).select("question").lean(),
-  ]);
-  return [...approved, ...recycled].map((q) => q.question);
-}
-
-async function deduplicateQuestions(
-  questions: GeneratedMCQ[],
-  identifier: string,
-  language: "English" | "Gujarati",
-  sopId: string,
-  department: string,
-) {
-  const existing = await loadExistingQuestions(identifier, language);
-  const approved: GeneratedMCQ[] = [];
-  const recycled: GeneratedMCQ[] = [];
-
-  for (const q of questions) {
-    const duplicate = existing.some((eq) => isSimilarQuestion(q.question, eq));
-    if (duplicate) {
-      recycled.push(q);
-      await MCQRecycle.create({
-        ...q,
-        identifier,
-        language,
-        sopId,
-        department,
-        similarityScore: SIMILARITY_THRESHOLD,
-        reason: "similarity_duplicate",
-      });
-    } else {
-      approved.push(q);
-      existing.push(q.question);
-    }
-  }
-
-  return { approved, recycled };
-}
-
 async function generateForLanguage(
   sop: ISOP,
   language: "English" | "Gujarati",
   count = 10,
-): Promise<{ approved: GeneratedMCQ[]; recycled: number }> {
-  const langLabel = language === "Gujarati" ? "Gujarati" : "English";
-  const userPrompt = `Language: ${langLabel}
+): Promise<GeneratedMCQ[]> {
+  const userPrompt = `Language: ${language}
 SOP Identifier: ${sop.identifier}
 Department: ${sop.department}
 Generate exactly ${count} MCQs.
@@ -100,17 +54,19 @@ SOP CONTENT:
 ${sop.content.slice(0, 80000)}`;
 
   const result = await generateJson<{ questions: GeneratedMCQ[] }>(MCQ_SYSTEM_PROMPT, userPrompt);
-  const questions = result.questions ?? [];
+  return result.questions ?? [];
+}
 
-  const { approved, recycled } = await deduplicateQuestions(
-    questions,
-    sop.identifier,
-    langLabel,
-    sop._id.toString(),
-    sop.department,
-  );
-
-  return { approved, recycled: recycled.length };
+/** Keep one representative SOP record per language (prefer the one with the most
+ *  content) so we generate exactly one MCQ bank per (SOP family, language). */
+function representativesByLanguage(sops: ISOP[]): Map<"English" | "Gujarati", ISOP> {
+  const byLang = new Map<"English" | "Gujarati", ISOP>();
+  for (const s of sops) {
+    const lang = (s.language ?? "English") as "English" | "Gujarati";
+    const cur = byLang.get(lang);
+    if (!cur || (s.content?.length ?? 0) > (cur.content?.length ?? 0)) byLang.set(lang, s);
+  }
+  return byLang;
 }
 
 export async function runMcqGeneration(identifier: string): Promise<{
@@ -134,39 +90,42 @@ export async function runMcqGeneration(identifier: string): Promise<{
   let totalRecycled = 0;
 
   try {
-    for (const sop of sops) {
+    const reps = representativesByLanguage(sops);
+
+    for (const [lang, sop] of reps) {
       if (!sop.content || sop.content.length < 50) continue;
-      const lang = (sop.language ?? "English") as "English" | "Gujarati";
-      const { approved, recycled } = await generateForLanguage(sop, lang, 10);
-      totalRecycled += recycled;
+
+      const generated = await generateForLanguage(sop, lang, 10);
 
       await SOP.updateMany({ _id: { $in: sopIds } }, { pipelineStatus: "similarity_checking" });
 
-      const docs = approved.map((q) => ({
-        ...q,
-        language: lang,
-        sopId: sop._id,
-        identifier: sop.identifier,
-        department: sop.department,
-        status: "approved" as const,
-      }));
+      // Write straight into the MCQ Bank (mcqbanks) — the single source the bank
+      // UI, registry and LMS exams all read. The previous active bank is archived
+      // to the Obsolete MCQs section and a fresh active bank is installed.
+      const { inserted, skipped } = await replaceBankForSop(sop, lang, generated);
+      totalApproved += inserted;
+      totalRecycled += skipped;
 
-      if (docs.length) {
-        await MCQ.insertMany(docs);
-        totalApproved += docs.length;
-      }
+      // Reflect this language's bank total on every record of this identifier+language
+      // so the Dashboard "X questions" column stays in sync.
+      const idRegex = new RegExp(`^${sop.identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i");
+      const bankTotal = await MCQBank.findOne({ sopIdentifier: idRegex, language: lang })
+        .select("totalQuestions")
+        .lean();
+      const langSopIds = sops
+        .filter((s) => ((s.language ?? "English") as string) === lang)
+        .map((s) => s._id);
+      await SOP.updateMany(
+        { _id: { $in: langSopIds } },
+        { mcqCount: bankTotal?.totalQuestions ?? inserted },
+      );
     }
 
     await SOP.updateMany({ _id: { $in: sopIds } }, { pipelineStatus: "updating_platform" });
 
-    const mcqCount = await MCQ.countDocuments({
-      identifier: new RegExp(`^${identifier}$`, "i"),
-      status: "approved",
-    });
-
     await SOP.updateMany(
       { _id: { $in: sopIds } },
-      { mcqCount, pipelineStatus: "approved", status: "completed" },
+      { pipelineStatus: "approved", status: "completed" },
     );
 
     invalidateDashboardSopsCache();

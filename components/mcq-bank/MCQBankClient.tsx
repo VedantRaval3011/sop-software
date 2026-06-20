@@ -217,6 +217,7 @@ function StatusCard({
   genCompleted, genTarget, genRemaining,
   onOpen, onRowClick,
   onMcqWithClick, onMcqWithoutClick,
+  onLangEnClick, onLangGuClick,
 }: {
   title: string; subtitle: string; isGrand?: boolean;
   totalSOPs: number; sopWithMCQs: number; sopWithoutMCQs: number;
@@ -228,6 +229,8 @@ function StatusCard({
   onRowClick?: (f: "approved" | "partial" | "pending" | "similar") => void;
   onMcqWithClick?: () => void;
   onMcqWithoutClick?: () => void;
+  onLangEnClick?: () => void;
+  onLangGuClick?: () => void;
 }) {
   return (
     <div className={`flex h-full w-full min-w-0 flex-col rounded-[10px] border px-2 py-1.5 text-left shadow-sm ${
@@ -271,8 +274,8 @@ function StatusCard({
         <CM label="SOPs" value={totalSOPs} onClick={onOpen} />
         <CM label="w/ MCQs" value={sopWithMCQs} vc="text-emerald-600" onClick={onMcqWithClick ?? onOpen} />
         <CM label="w/o MCQs" value={sopWithoutMCQs} vc={sopWithoutMCQs > 0 ? "text-red-600" : "text-gray-900"} onClick={onMcqWithoutClick ?? onOpen} />
-        <CM label="w/ EN" value={totalSopEng} />
-        <CM label="w/ GU" value={totalSopGuj} vc="text-orange-500" />
+        <CM label="w/ EN" value={totalSopEng} onClick={onLangEnClick} />
+        <CM label="w/ GU" value={totalSopGuj} vc="text-orange-500" onClick={onLangGuClick} />
         <TripleRow items={[
           { label: "Approved", value: approvedSOPs, vc: "text-emerald-600", onClick: onRowClick ? () => onRowClick("approved") : undefined },
           { label: "Partial",  value: partialSOPs,  vc: "text-amber-500",  onClick: onRowClick ? () => onRowClick("partial")  : undefined },
@@ -780,6 +783,16 @@ export function MCQBankClient() {
     mcqRegistryRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   }, []);
 
+  // Filter the registry by language (clicking "w/ EN" / "w/ GU" on a card).
+  const applyLangFilter = useCallback((department: string, lang: "English" | "Gujarati") => {
+    setObsoleteOnly(false);
+    setDeptFilter(department === "Total" ? "all" : department);
+    setMcqPresence("all");
+    setRegLangFilter(lang);
+    setSearch("");
+    mcqRegistryRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, []);
+
   // Open the department folder modal (Digital Repository view) for a department.
   const openDeptModal = useCallback((department: string) => {
     if (department === "Total") return;
@@ -926,6 +939,8 @@ export function MCQBankClient() {
                     onOpen={() => applyDeptFilter("Total")}
                     onMcqWithClick={() => applyPresenceFilter("Total", "found")}
                     onMcqWithoutClick={() => applyPresenceFilter("Total", "notFound")}
+                    onLangEnClick={() => applyLangFilter("Total", "English")}
+                    onLangGuClick={() => applyLangFilter("Total", "Gujarati")}
                   />
                   {orderedDepts.map((dept) => (
                     <StatusCard
@@ -948,6 +963,8 @@ export function MCQBankClient() {
                       onOpen={() => openDeptModal(dept.department)}
                       onMcqWithClick={() => applyPresenceFilter(dept.department, "found")}
                       onMcqWithoutClick={() => applyPresenceFilter(dept.department, "notFound")}
+                      onLangEnClick={() => applyLangFilter(dept.department, "English")}
+                      onLangGuClick={() => applyLangFilter(dept.department, "Gujarati")}
                       onRowClick={() => applyDeptFilter(dept.department)}
                     />
                   ))}
