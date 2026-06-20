@@ -5,6 +5,10 @@ export interface IEmployee extends Document {
   designation: string;
   department: string;
   employeeId?: string;
+  /** Date the employee joined the organisation. */
+  dateOfJoining?: Date;
+  /** When true, the employee must complete induction-training SOPs. */
+  inductionTrainingRequired: boolean;
   isActive: boolean;
   /** Auto-generated login handle for the learning module. */
   lmsUsername?: string;
@@ -20,6 +24,8 @@ const EmployeeSchema = new Schema<IEmployee>(
     designation: { type: String, required: true, trim: true },
     department:  { type: String, required: true, trim: true, index: true },
     employeeId:  { type: String, trim: true },
+    dateOfJoining: { type: Date },
+    inductionTrainingRequired: { type: Boolean, default: false, index: true },
     isActive:    { type: Boolean, default: true, index: true },
     // Casing is preserved (e.g. "Abbas.Mehdi"); login matches case-insensitively.
     lmsUsername: { type: String, trim: true, unique: true, sparse: true },

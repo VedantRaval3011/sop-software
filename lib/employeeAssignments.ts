@@ -1,5 +1,8 @@
 import TrainingMatrixRecord from '@/models/TrainingMatrixRecord';
 import TrainingMatrixUpload from '@/models/TrainingMatrixUpload';
+import InductionTrainingMatrixRecord from '@/models/InductionTrainingMatrixRecord';
+import InductionTrainingMatrixUpload from '@/models/InductionTrainingMatrixUpload';
+import Employee from '@/models/Employee';
 import SOP, { type ISOP } from '@/models/SOP';
 import { resolveSopFamilyNames, isPlaceholderSopName } from '@/lib/sop-name-resolution';
 
@@ -259,5 +262,112 @@ async function computeEmployeeAssignmentsMap(): Promise<Map<string, EmployeeSopA
     });
   }
 
+  await mergeInductionAssignments(map, nameByBase);
+
   return map;
+}
+
+async function mergeInductionAssignments(
+  map: Map<string, EmployeeSopAssignment[]>,
+  nameByBase: Map<string, string>,
+): Promise<void> {
+  const flagged = await Employee.find({ inductionTrainingRequired: true, isActive: true })
+    .select('name department designation dateOfJoining')
+    .lean<Array<{ name: string; department: string; designation: string }>>();
+
+  if (flagged.length === 0) return;
+
+  const add = (department: string, name: string, assignment: EmployeeSopAssignment) => {
+    const key = empKey(department, name);
+    if (!map.has(key)) map.set(key, []);
+    const list = map.get(key)!;
+    const dedupeKey = assignmentKey(assignment);
+    const existing = list.find((a) => assignmentKey(a) === dedupeKey);
+    if (!existing || isEarlier(assignment, existing)) {
+      if (existing) {
+        const idx = list.indexOf(existing);
+        list[idx] = assignment;
+      } else {
+        list.push(assignment);
+      }
+    }
+  };
+
+  const flaggedKeys = new Set(flagged.map((e) => empKey(e.department, e.name)));
+
+  const inductionRecords = await InductionTrainingMatrixRecord.find({
+    status: { $ne: 'na' },
+  })
+    .select('employeeName department sopCode sopName month monthName year rawSymbol status')
+    .lean();
+
+  for (const r of inductionRecords as Array<{
+    employeeName: string;
+    department: string;
+    sopCode: string;
+    sopName?: string;
+    month: number;
+    monthName: string;
+    year: number;
+    rawSymbol?: string;
+    status?: string;
+  }>) {
+    const key = empKey(r.department, r.employeeName);
+    if (!flaggedKeys.has(key)) continue;
+    add(r.department, r.employeeName, {
+      sopCode: r.sopCode,
+      sopName: r.sopName,
+      month: r.month,
+      monthName: r.monthName || MONTH_NAMES[r.month] || `Month ${r.month}`,
+      year: r.year,
+      trainingType: 'induction',
+      status: r.status,
+    });
+  }
+
+  // Fallback: dept induction matrix SOPs for flagged employees with no per-employee records yet.
+  const uploads = await InductionTrainingMatrixUpload.find({
+    fileType: 'main',
+    'snapshot.sopMonthMap': { $exists: true },
+  })
+    .sort({ uploadedAt: -1 })
+    .lean();
+
+  const latestInductionByDept = new Map<string, {
+    year: number;
+    snapshot: { sopMonthMap?: Record<string, string> };
+  }>();
+
+  for (const up of uploads as Array<{
+    department?: string;
+    year?: number;
+    snapshot?: { sopMonthMap?: Record<string, string> };
+  }>) {
+    const dept = String(up.department || '').trim();
+    if (!dept || latestInductionByDept.has(dept) || !up.snapshot?.sopMonthMap) continue;
+    latestInductionByDept.set(dept, { year: up.year ?? new Date().getFullYear(), snapshot: up.snapshot });
+  }
+
+  for (const emp of flagged) {
+    const key = empKey(emp.department, emp.name);
+    const existing = map.get(key) || [];
+    const hasInduction = existing.some((a) => a.trainingType === 'induction');
+    if (hasInduction) continue;
+
+    const snap = latestInductionByDept.get(String(emp.department || '').trim());
+    if (!snap?.snapshot.sopMonthMap) continue;
+
+    for (const [rawKey, monthName] of Object.entries(snap.snapshot.sopMonthMap)) {
+      const month = monthNameToNum(monthName);
+      if (!month) continue;
+      add(emp.department, emp.name, {
+        sopCode: rawKey,
+        sopName: nameByBase.get(stripVersion(rawKey)),
+        month,
+        monthName,
+        year: snap.year,
+        trainingType: 'induction',
+      });
+    }
+  }
 }

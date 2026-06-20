@@ -5,6 +5,12 @@ import MCQBank from '@/models/MCQBank';
 import InductionTrainingMatrixUpload from '@/models/InductionTrainingMatrixUpload';
 import DepartmentTrainer from '@/models/DepartmentTrainer';
 import { groupSOPRecords, baseIdentifierFromIdentifier } from '@/lib/sop-utils';
+import {
+  buildExcelToDbBaseLookup,
+  dbBasePresentInExcelCodes,
+  expandSopIdentifierVariants,
+  resolveExcelCodeToDbBase,
+} from '@/lib/sopIdentifierNormalize';
 import { getServerGroupedCache, setServerGroupedCache, invalidateDashboardSopsCache } from '@/lib/server-cache';
 import { getInductionTrainingMatrixCacheEntry, setInductionTrainingMatrixCached } from '@/lib/inductionTrainingMatrixCache';
 import { resolveEngGujFilePaths } from '@/lib/pathLanguageDetection';
@@ -40,6 +46,47 @@ function canonDept(raw: string): string {
 
 function isValidDept(d: string): boolean {
   return Boolean(d) && !/^(unknown|general)$/i.test(d);
+}
+
+const CANON_MONTH: Record<string, string> = {
+  january: 'January', jan: 'January',
+  february: 'February', feb: 'February',
+  march: 'March', mar: 'March',
+  april: 'April', apr: 'April',
+  may: 'May',
+  june: 'June', jun: 'June',
+  july: 'July', jul: 'July',
+  august: 'August', aug: 'August',
+  september: 'September', sep: 'September', sept: 'September',
+  october: 'October', oct: 'October',
+  november: 'November', nov: 'November',
+  december: 'December', dec: 'December',
+};
+
+function canonMonthLabel(raw: string): string {
+  const t = String(raw || '').trim();
+  if (!t) return t;
+  return CANON_MONTH[t.toLowerCase()] || t;
+}
+
+function monthCountsFromSchedule(excel: { excelCodes: Set<string>; sopMonthMap: Record<string, string> } | null): Record<string, number> {
+  if (!excel) return {};
+  const smm = excel.sopMonthMap ?? {};
+  const mc: Record<string, number> = {};
+  for (const base of excel.excelCodes) {
+    const mo = smm[base];
+    if (!mo) continue;
+    let primary: string | null = null;
+    for (const part of mo.split(',').map((s: string) => s.trim()).filter(Boolean)) {
+      const m = canonMonthLabel(part);
+      if (m) {
+        primary = m;
+        break;
+      }
+    }
+    if (primary) mc[primary] = (mc[primary] || 0) + 1;
+  }
+  return mc;
 }
 
 // ── MCQ buckets (ported from the reference overview) ─────────────────────────
@@ -280,6 +327,11 @@ async function computeOverviewPayload(forceFresh: boolean) {
       setServerGroupedCache(registry);
     }
     const active = registry.filter((r) => !r.isObsolete);
+    const excelToDbBase = buildExcelToDbBaseLookup(active);
+    const dbBaseInExcelSet = (dbBase: string, codes: Set<string>) =>
+      dbBasePresentInExcelCodes(dbBase, codes, excelToDbBase);
+
+    const stripVer = (c: string) => String(c || '').toUpperCase().replace(/-\d+$/, '').trim();
 
     const mcqLangStatMap = new Map<string, { eng: LangStat; guj: LangStat }>();
     const mcqStatMap = new Map<string, LangStat>();
@@ -375,6 +427,28 @@ async function computeOverviewPayload(forceFresh: boolean) {
       meta.isDualLanguage = langs.has('ENG') && langs.has('GUJ');
     }
 
+    const obsoleteBaseSet = new Set<string>();
+    for (const row of registry.filter((r) => r.isObsolete)) {
+      const base = baseIdentifierFromIdentifier(row.identifier);
+      if (base) obsoleteBaseSet.add(base.toUpperCase());
+      for (const variant of expandSopIdentifierVariants(row.identifier)) {
+        const s = stripVer(variant);
+        if (s) obsoleteBaseSet.add(s);
+      }
+    }
+
+    const isMatrixAssignableCode = (raw: string): boolean => {
+      const stripped = stripVer(raw);
+      if (!stripped) return false;
+      if (obsoleteBaseSet.has(stripped)) return false;
+      const dbBase = resolveExcelCodeToDbBase(stripped, excelToDbBase);
+      if (dbBase) {
+        if (obsoleteBaseSet.has(dbBase)) return false;
+        return dbBaseSet.has(dbBase);
+      }
+      return dbBaseSet.has(stripped);
+    };
+
     const departments = [
       ...DEFAULT_DEPARTMENTS,
       ...[...deptSet].filter((d) => !DEFAULT_DEPARTMENTS.includes(d)).sort((a, b) => a.localeCompare(b)),
@@ -449,12 +523,11 @@ async function computeOverviewPayload(forceFresh: boolean) {
     }
 
     // Latest snapshot per canonical department.
-    const stripVer = (c: string) => String(c || '').toUpperCase().replace(/-\d+$/, '').trim();
     const normalizeTraining = (training: Record<string, boolean> | undefined) => {
       const out: Record<string, boolean> = {};
       for (const [k, v] of Object.entries(training || {})) {
         const b = stripVer(k);
-        if (!b) continue;
+        if (!b || !isMatrixAssignableCode(b)) continue;
         out[b] = out[b] || !!v;
       }
       return out;
@@ -469,9 +542,19 @@ async function computeOverviewPayload(forceFresh: boolean) {
       const dept = canonDept(up.department);
       if (excelByDept.has(dept)) continue; // uploads are sorted desc — keep newest
       const snap = up.snapshot || {};
-      const excelCodes = new Set<string>((snap.sopCodes || []).map(stripVer).filter(Boolean));
+      const excelCodes = new Set<string>();
+      for (const raw of snap.sopCodes || []) {
+        const b = stripVer(String(raw));
+        if (b && isMatrixAssignableCode(b)) excelCodes.add(b);
+      }
       const sopMonthMap: Record<string, string> = {};
-      for (const [k, m] of Object.entries(snap.sopMonthMap || {})) { const b = stripVer(k); if (b && m) sopMonthMap[b] = m; }
+      for (const [k, m] of Object.entries(snap.sopMonthMap || {})) {
+        const b = stripVer(k);
+        if (b && m && isMatrixAssignableCode(b)) {
+          sopMonthMap[b] = m;
+          excelCodes.add(b);
+        }
+      }
       const employees = (snap.employees || []).map((e) => ({
         name: e.name, designation: e.designation, department: dept, training: normalizeTraining(e.training),
       }));
@@ -487,7 +570,10 @@ async function computeOverviewPayload(forceFresh: boolean) {
     // How many distinct departments contain each SOP code in Excel (repetition).
     const sopCodeToDeptCount = new Map<string, number>();
     for (const { excelCodes } of excelByDept.values()) {
-      for (const c of excelCodes) sopCodeToDeptCount.set(c, (sopCodeToDeptCount.get(c) || 0) + 1);
+      for (const c of excelCodes) {
+        const key = resolveExcelCodeToDbBase(c, excelToDbBase) || c;
+        sopCodeToDeptCount.set(key, (sopCodeToDeptCount.get(key) || 0) + 1);
+      }
     }
 
     // Global union of every Excel code across all department uploads.
@@ -514,10 +600,10 @@ async function computeOverviewPayload(forceFresh: boolean) {
       const langDbListByKey: Record<string, string[]> = { ENG: engDbList, GUJ: gujDbList };
       const engNeeded = engDbList.length;
       const gujNeeded = gujDbList.length;
-      const engFound = codes.filter((c) => excelCodesSet.has(c) && (dbBaseLangs.get(c) || new Set(['ENG'])).has('ENG')).length;
-      const engMissing = codes.filter((c) => !excelCodesSet.has(c) && (dbBaseLangs.get(c) || new Set(['ENG'])).has('ENG')).length;
-      const gujFound = codes.filter((c) => excelCodesSet.has(c) && (dbBaseLangs.get(c) || new Set(['ENG'])).has('GUJ')).length;
-      const gujMissing = codes.filter((c) => !excelCodesSet.has(c) && (dbBaseLangs.get(c) || new Set(['ENG'])).has('GUJ')).length;
+      const engFound = codes.filter((c) => dbBaseInExcelSet(c, excelCodesSet) && (dbBaseLangs.get(c) || new Set(['ENG'])).has('ENG')).length;
+      const engMissing = codes.filter((c) => !dbBaseInExcelSet(c, excelCodesSet) && (dbBaseLangs.get(c) || new Set(['ENG'])).has('ENG')).length;
+      const gujFound = codes.filter((c) => dbBaseInExcelSet(c, excelCodesSet) && (dbBaseLangs.get(c) || new Set(['ENG'])).has('GUJ')).length;
+      const gujMissing = codes.filter((c) => !dbBaseInExcelSet(c, excelCodesSet) && (dbBaseLangs.get(c) || new Set(['ENG'])).has('GUJ')).length;
       const langBreakdown = [
         { key: 'ENG', label: 'ENG', found: excel ? engFound : engNeeded, missing: excel ? engMissing : 0 },
         ...(gujNeeded > 0 ? [{ key: 'GUJ', label: 'GUJ', found: excel ? gujFound : gujNeeded, missing: excel ? gujMissing : 0 }] : []),
@@ -536,8 +622,8 @@ async function computeOverviewPayload(forceFresh: boolean) {
       // Excel / training-matrix enrichment from the upload snapshot.
       const excelCodes = excelCodesSet;
       const employees = excel?.employees ?? [];
-      const foundInDb = codes.filter((c) => excelCodes.has(c));
-      const missingFromExcelCodes = codes.filter((c) => !excelCodes.has(c));
+      const foundInDb = codes.filter((c) => dbBaseInExcelSet(c, excelCodes));
+      const missingFromExcelCodes = codes.filter((c) => !dbBaseInExcelSet(c, excelCodes));
       const missingFromExcelList = missingFromExcelCodes.map((c) => ({ sopCode: c, title: dbBaseMeta.get(c)!.title, department: deptName }));
       const fullyTrained = employees.filter((e) => {
         const vals = Object.values(e.training || {});
@@ -553,7 +639,7 @@ async function computeOverviewPayload(forceFresh: boolean) {
       // Repetition buckets (how many departments share each SOP in Excel).
       // Use allExcelUnion (not just this dept's own Excel) so that per-dept bucket
       // sums reflect global coverage — matching the total card's excelSopCount.
-      const foundInAnyExcel = codes.filter((c) => allExcelUnion.has(c));
+      const foundInAnyExcel = codes.filter((c) => dbBaseInExcelSet(c, allExcelUnion));
       const repeat3PlusList: Array<{ sopCode: string; title: string; department: string; count: number }> = [];
       const repeat2List: typeof repeat3PlusList = [];
       const repeat1List: typeof repeat3PlusList = [];
@@ -579,8 +665,12 @@ async function computeOverviewPayload(forceFresh: boolean) {
       let excelDeptSplitUnknownFound = 0;
       if (excel) {
         for (const c of excelCodes) {
-          const meta = dbBaseMeta.get(c);
-          if (!meta) continue; // not in DB — skip (not a "found" code)
+          const dbBase = resolveExcelCodeToDbBase(c, excelToDbBase);
+          const meta = dbBase ? dbBaseMeta.get(dbBase) : undefined;
+          if (!meta) {
+            excelDeptSplitUnknownFound++;
+            continue;
+          }
           const owner = meta.dept;
           if (departments.includes(owner)) {
             excelDeptSplitFoundByDept[owner] = (excelDeptSplitFoundByDept[owner] || 0) + 1;
@@ -591,7 +681,7 @@ async function computeOverviewPayload(forceFresh: boolean) {
       }
       for (const d of departments) {
         const ownerCodes = codesByDept[d] || [];
-        const missingCodes = ownerCodes.filter((c) => !allExcelUnion.has(c));
+        const missingCodes = ownerCodes.filter((c) => !dbBaseInExcelSet(c, allExcelUnion));
         excelDeptSplitMissingByDept[d] = missingCodes.length;
         excelDeptSplitMissingListByDept[d] = missingCodes.map((c) => ({
           sopCode: c,
@@ -666,33 +756,19 @@ async function computeOverviewPayload(forceFresh: boolean) {
       const codes = codesByDept[dept] || [];
       const excel = excelByDept.get(dept) || null;
       const card = buildCard(codes, dept, excel);
+      for (const e of card.employees) allExcelEmployees.push(e);
+      sopCodesByDept[dept] = card.sopCodes;
+      sopMonthMapByDept[dept] = excel?.sopMonthMap ?? {};
+      const deptMonthCounts = monthCountsFromSchedule(excel);
+      monthCountsByDept[dept] = deptMonthCounts;
       perDept[dept] = {
         ...card,
+        monthCounts: deptMonthCounts,
         uploaded: excel?.uploaded ?? false,
         fileUrl: (excel?.fileUrl ?? null) as null,
         uploadedAt: (excel?.uploadedAt ?? null) as null,
         ...(excel?.fileName ? { fileName: excel.fileName } : {}),
       };
-      for (const e of card.employees) allExcelEmployees.push(e);
-      sopCodesByDept[dept] = card.sopCodes;
-      sopMonthMapByDept[dept] = excel?.sopMonthMap ?? {};
-      // Month counts must match exactly what a month click renders: one entry per
-      // base code (Excel ∪ DB) that maps to a month via sopMonthMap. The snapshot's
-      // own monthCounts is a separate field that can drift from sopMonthMap, so we
-      // recompute from the same map + code set the table filters on.
-      monthCountsByDept[dept] = (() => {
-        const smm = excel?.sopMonthMap ?? {};
-        const baseForMonths = new Set<string>([...(excel?.excelCodes ?? []), ...codes]);
-        const mc: Record<string, number> = {};
-        for (const base of baseForMonths) {
-          const mo = smm[base];
-          if (!mo) continue;
-          for (const m of mo.split(',').map((s: string) => s.trim()).filter(Boolean)) {
-            mc[m] = (mc[m] || 0) + 1;
-          }
-        }
-        return mc;
-      })();
     }
 
     // 8. Total card — aggregate Excel data across all departments.
@@ -732,6 +808,7 @@ async function computeOverviewPayload(forceFresh: boolean) {
       dbSopCountsByDept[dept] = codes.length;
     }
     const departmentCount = departments.filter((d) => (codesByDept[d] || []).length > 0).length;
+    const uploadedDepartmentCount = departments.filter((d) => excelByDept.has(d)).length;
 
     const totalCard = {
       ...totalBase,
@@ -741,6 +818,7 @@ async function computeOverviewPayload(forceFresh: boolean) {
       excelSopCount: totalBase.foundInDb,
       missingSopCount: totalBase.missingFromExcel,
       departmentCount,
+      uploadedDepartmentCount,
       totalDepartments: departments.length,
     };
 

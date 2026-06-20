@@ -6,6 +6,7 @@ import type { VersionDiagnosticsReport } from "@/lib/version-diagnostics";
 import { useDashboardStore } from "@/lib/store/dashboard-store";
 import { ComplianceFullViewer } from "./ComplianceFullViewer";
 import { Badge, Btn, Modal } from "./ui";
+import { displaySopCode } from "@/lib/sop-display";
 
 interface GuidelineItem {
   _id: string;
@@ -117,7 +118,7 @@ export function ComplianceModal({
               ]);
               setResultKey({ sopId: sop.id, guidelineId: selectedGuidelines[0] });
               showToast(
-                `${sop.identifier}: ${event.findingsCount} findings, score ${event.score}/10`,
+                `${displaySopCode(sop.identifier)}: ${event.findingsCount} findings, score ${event.score}/10`,
               );
               onComplete?.();
             }
@@ -175,7 +176,7 @@ export function ComplianceModal({
                     )
                   }
                 />
-                <span className="font-semibold">{s.identifier}</span>
+                <span className="font-semibold">{displaySopCode(s.identifier)}</span>
                 <span className="truncate text-slate-500">{s.name}</span>
               </label>
             ))}
@@ -536,7 +537,7 @@ export function AdminToolsModal({
                       diagReport.incompleteSops.map((s) => (
                         <tr key={s.identifier} className="border-t border-slate-100 align-top">
                           <td className="px-2 py-1 font-mono font-bold text-violet-700">
-                            {s.identifier}
+                            {displaySopCode(s.identifier)}
                             <span className="ml-1 font-sans text-[9px] font-normal text-slate-400">
                               v{s.currentVersion} · {s.language}
                             </span>

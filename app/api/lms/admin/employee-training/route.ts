@@ -9,10 +9,18 @@ import {
   lmsServerTtl,
 } from '@/lib/lmsCache';
 import Employee from '@/models/Employee';
+import SOP from '@/models/SOP';
 import LearningProgress from '@/models/lms/LearningProgress';
 import TrainingMatrixUpload from '@/models/TrainingMatrixUpload';
 import { getEmployeeAssignmentsMap } from '@/lib/employeeAssignments';
 import { getJourneyContent } from '@/lib/lmsJourneyContent';
+import {
+  hasGujaratiScript,
+  isInvalidSopAssignmentCode,
+  isPlaceholderSopName,
+  resolveSopFamilyNames,
+} from '@/lib/sop-name-resolution';
+import type { ISOP } from '@/models/SOP';
 
 export const dynamic = 'force-dynamic';
 
@@ -87,7 +95,11 @@ type ComponentKey = keyof typeof COMPONENT_GROUPS;
 
 export interface SopBreakdown {
   sopCode: string;
+  /** Canonical registry identity (sopBaseId) for distinct counting; absent when the code matches no SOP. */
+  sopKey?: string;
   sopName: string;
+  /** Gujarati display name when a Gujarati registry record exists. */
+  sopNameGujarati?: string;
   status: SopStatus;
   /** Scheduled month numbers (1 = Jan … 12 = Dec) from the matrix snapshot. */
   months: number[];
@@ -110,6 +122,10 @@ export interface EmployeeTrainingRecord {
   /** Count of assigned SOPs per month, index 0 = Jan … 11 = Dec. */
   monthlyCounts: number[];
   sops: SopBreakdown[];
+  /** Employee has at least one regular training SOP assigned. */
+  hasTraining: boolean;
+  /** Employee has at least one induction SOP assigned. */
+  hasInduction: boolean;
 }
 
 function empKey(department: string, name: string): string {
@@ -199,6 +215,65 @@ export async function GET(req: NextRequest) {
             .filter(([, content]) => content.sop?.name)
             .map(([code, content]) => [code, content.sop!.name]),
         );
+        // Canonical registry identity (sopBaseId) per assignment code. Distinct
+        // SOP roll-ups dedupe on this so versions / code-format variants of the
+        // same SOP count once, and codes with no matching SOP are left out.
+        const keyByCode = new Map<string, string>(
+          contentEntries
+            .filter(([, content]) => content.sop)
+            .map(([code, content]) => [
+              code,
+              (content.sop!.sopBaseId || content.sop!.identifier).toUpperCase(),
+            ]),
+        );
+
+        const basesNeeded = new Set<string>();
+        for (const code of uniqueSopCodes) {
+          const base = keyByCode.get(code) || stripVersion(code);
+          if (base && !isInvalidSopAssignmentCode(base)) basesNeeded.add(base);
+        }
+        const sopFamilies = new Map<string, ISOP[]>();
+        if (basesNeeded.size > 0) {
+          const familyRows = await SOP.find({
+            isObsolete: { $ne: true },
+            $or: [
+              { sopBaseId: { $in: [...basesNeeded] } },
+              { identifier: { $in: [...uniqueSopCodes] } },
+            ],
+          })
+            .select('name identifier sopBaseId language')
+            .lean<ISOP[]>();
+          for (const row of familyRows) {
+            const base = String(row.sopBaseId || stripVersion(row.identifier || '')).toUpperCase();
+            if (!base) continue;
+            if (!sopFamilies.has(base)) sopFamilies.set(base, []);
+            sopFamilies.get(base)!.push(row);
+          }
+        }
+        const resolvedByBase = new Map<string, ReturnType<typeof resolveSopFamilyNames>>();
+        for (const base of basesNeeded) {
+          resolvedByBase.set(base, resolveSopFamilyNames(sopFamilies.get(base) || [], base));
+        }
+        const resolveAssignmentNames = (sopCode: string, matrixName?: string) => {
+          const base = keyByCode.get(sopCode) || stripVersion(sopCode);
+          const resolved = base ? resolvedByBase.get(base) : undefined;
+          const english =
+            (resolved?.englishName && !isPlaceholderSopName(resolved.englishName, sopCode) ? resolved.englishName : '') ||
+            (() => {
+              const raw = nameByCode.get(sopCode) || matrixName || '';
+              if (!raw || isPlaceholderSopName(raw, sopCode)) return '';
+              return hasGujaratiScript(raw) ? '' : raw;
+            })() ||
+            sopCode;
+          const gujarati =
+            resolved?.gujaratiName ||
+            (() => {
+              const raw = nameByCode.get(sopCode) || matrixName || '';
+              if (raw && hasGujaratiScript(raw) && !isPlaceholderSopName(raw, sopCode)) return raw;
+              return undefined;
+            })();
+          return { english, gujarati: gujarati && gujarati !== english ? gujarati : undefined };
+        };
 
         const records: EmployeeTrainingRecord[] = employees.map((emp) => {
           const id          = String(emp._id);
@@ -216,12 +291,14 @@ export async function GET(req: NextRequest) {
           const monthlyCounts = new Array(12).fill(0) as number[];
           if (sched) {
             for (const a of assignments) {
+              if (isInvalidSopAssignmentCode(a.sopCode)) continue;
               const months = sched.get(stripVersion(a.sopCode));
               if (months) for (const m of months) monthlyCounts[m - 1]++;
             }
           }
 
-          const sops: SopBreakdown[] = assignments.map((a) => {
+          const sops: SopBreakdown[] = assignments.flatMap((a) => {
+            if (isInvalidSopAssignmentCode(a.sopCode)) return [];
 
             const available = availableByCode.get(a.sopCode) ?? [];
             const availableSet = new Set(available);
@@ -247,14 +324,18 @@ export async function GET(req: NextRequest) {
               ]),
             ) as Record<ComponentKey, ComponentStatus>;
 
-            return {
+            const { english, gujarati } = resolveAssignmentNames(a.sopCode, a.sopName);
+
+            return [{
               sopCode: a.sopCode,
-              sopName: nameByCode.get(a.sopCode) || a.sopName || a.sopCode,
+              sopKey: keyByCode.get(a.sopCode) || stripVersion(a.sopCode).toUpperCase(),
+              sopName: english,
+              sopNameGujarati: gujarati,
               status,
               months: sched?.get(stripVersion(a.sopCode)) ?? [],
               hasExam: availableSet.has('quiz'),
               components,
-            };
+            }];
           });
 
           const overallPct = totalSteps > 0 ? Math.round((doneSteps / totalSteps) * 100) : 0;
@@ -265,13 +346,15 @@ export async function GET(req: NextRequest) {
             designation:      emp.designation,
             department:       emp.department,
             isActive:         emp.isActive,
-            totalSops:        assignments.length,
+            totalSops:        sops.length,
             completedSops,
             partialSops,
             notCompletedSops,
             overallPct,
             monthlyCounts,
             sops,
+            hasTraining:  assignments.some((a) => a.trainingType === 'training'),
+            hasInduction: assignments.some((a) => a.trainingType === 'induction'),
           };
         });
 

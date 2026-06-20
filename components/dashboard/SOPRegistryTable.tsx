@@ -319,7 +319,7 @@ export function SOPRegistryTable({
     async (sop: RegistrySOP) => {
       try {
         await onRevive(sop);
-        showToast(`${sop.identifier} restored to the SOP Registry`);
+        showToast(`${displaySopCode(sop.identifier)} restored to the SOP Registry`);
       } catch (err) {
         showToast(err instanceof Error ? err.message : "Failed to revive SOP");
       }
@@ -336,7 +336,7 @@ export function SOPRegistryTable({
     setObsoleting(true);
     try {
       await onObsolete(target);
-      showToast(`${target.identifier} moved to Obsolete SOPs`);
+      showToast(`${displaySopCode(target.identifier)} moved to Obsolete SOPs`);
     } catch (err) {
       showToast(err instanceof Error ? err.message : "Failed to move SOP to Obsolete");
     } finally {
@@ -354,7 +354,7 @@ export function SOPRegistryTable({
       // Only close on success; a wrong password keeps the dialog open so the
       // user can retry without losing their place.
       setDeleteTarget(null);
-      showToast(`${target.identifier} permanently deleted`);
+      showToast(`${displaySopCode(target.identifier)} permanently deleted`);
     } catch (err) {
       setDeleteError(err instanceof Error ? err.message : "Failed to delete SOP");
     } finally {
@@ -376,7 +376,7 @@ export function SOPRegistryTable({
         title="Move SOP to Obsolete"
         message={
           obsoleteTarget
-            ? `Move SOP ${obsoleteTarget.identifier} to Obsolete SOPs? All files, versions, history, and metadata will be preserved. The SOP will be removed from active listings.`
+            ? `Move SOP ${displaySopCode(obsoleteTarget.identifier)} to Obsolete SOPs? All files, versions, history, and metadata will be preserved. The SOP will be removed from active listings.`
             : ""
         }
         confirmLabel="Move to Obsolete"
@@ -389,7 +389,7 @@ export function SOPRegistryTable({
         title="Permanently delete SOP"
         message={
           deleteTarget
-            ? `Permanently delete SOP ${deleteTarget.identifier}? This removes all versions, languages, history, and metadata from the registry and cannot be undone.`
+            ? `Permanently delete SOP ${displaySopCode(deleteTarget.identifier)}? This removes all versions, languages, history, and metadata from the registry and cannot be undone.`
             : ""
         }
         confirmLabel="Delete permanently"
@@ -1067,7 +1067,7 @@ function SOPDetailPanel({
       <div className="space-y-2">
         <SectionHeading>Basic Information</SectionHeading>
         <div className="space-y-1 text-[10px]">
-          <DetailRow label="SOP Number:" value={sop.identifier} />
+          <DetailRow label="SOP Number:" value={displaySopCode(sop.identifier)} />
           <DetailRow label="Version:" value={sop.version || "—"} />
           <DetailRow label="Department:" value={sop.department || "Other"} />
           {sop.location && <DetailRow label="Location:" value={sop.location} title={sop.location} />}

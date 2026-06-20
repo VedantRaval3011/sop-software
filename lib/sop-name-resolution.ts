@@ -101,6 +101,14 @@ export function isPlaceholderSopName(name: string, identifier?: string): boolean
   return false;
 }
 
+/** True when a training-matrix SOP code is junk (e.g. "---"), not a real code. */
+export function isInvalidSopAssignmentCode(code: string): boolean {
+  const trimmed = String(code || "").trim();
+  if (!trimmed) return true;
+  if (/^[-–—√✓✗×•·*]+$/.test(trimmed)) return true;
+  return false;
+}
+
 function nameScore(
   name: string,
   identifier: string,

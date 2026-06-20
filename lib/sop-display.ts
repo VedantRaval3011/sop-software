@@ -6,18 +6,47 @@
  * Keep this as the single source of truth — do not duplicate the logic.
  */
 
-/** Canonical SOP code without trailing noise (e.g. "QAGE01-11_ENG" → "QAGE01-11"). */
-export function displaySopCode(identifier: string): string {
-  const match = identifier.match(/^([A-Z]+\d+[-]\d+)/i);
-  if (match) return match[1].toUpperCase();
-  const seg = identifier.split("_")[0];
-  return /^[A-Z]{2,}\d/i.test(seg) ? seg.toUpperCase() : identifier;
+import {
+  expandSopIdentifierVariants,
+  formatSopCodeDisplay,
+  normalizeSopIdentifierKey,
+} from "@/lib/sopIdentifierNormalize";
+
+function stripRevisionSuffix(code: string): string {
+  return String(code || "").toUpperCase().replace(/-\d+$/, "").trim();
 }
 
-/** SOP name with the leading SOP code stripped (e.g. "QAGE01-11 - Title" → "Title"). */
+/** Prefix variants to strip from titles (raw + zero-padded doc index). */
+function titlePrefixCandidates(identifier: string): string[] {
+  const out = new Set<string>();
+  const formatted = formatSopCodeDisplay(identifier);
+  if (formatted) out.add(formatted);
+  const raw = String(identifier || "").trim().toUpperCase();
+  if (raw) out.add(raw);
+  const nk = normalizeSopIdentifierKey(raw);
+  if (nk) out.add(nk);
+  for (const variant of expandSopIdentifierVariants(identifier)) {
+    out.add(formatSopCodeDisplay(variant));
+    out.add(stripRevisionSuffix(variant));
+    out.add(variant.toUpperCase());
+  }
+  return [...out].filter(Boolean);
+}
+
+/** Canonical SOP code with zero-padded document index (e.g. QCMI1-0 → QCMI01-0). */
+export function displaySopCode(identifier: string): string {
+  const trimmed = String(identifier || "").trim();
+  if (!trimmed) return "";
+  return formatSopCodeDisplay(trimmed);
+}
+
+/** SOP name with the leading SOP code stripped (e.g. "QCMI1-0 - Title" → "Title"). */
 export function displaySopTitle(name: string, identifier: string): string {
-  const code = displaySopCode(identifier);
-  const codePattern = code.replace(/[-]/g, String.raw`[\s_-]`);
-  const stripped = name.replace(new RegExp(`^${codePattern}[\\s_-]*`, "i"), "").trim();
-  return stripped || name;
+  if (!name) return name;
+  for (const code of titlePrefixCandidates(identifier)) {
+    const escaped = code.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/-/g, "[\\s_-]");
+    const stripped = name.replace(new RegExp(`^${escaped}[\\s_-]*`, "i"), "").trim();
+    if (stripped && stripped !== name.trim()) return stripped;
+  }
+  return name;
 }

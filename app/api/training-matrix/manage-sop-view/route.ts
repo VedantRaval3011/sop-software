@@ -22,6 +22,12 @@ import {
   setManageSopViewCached,
 } from "@/lib/manageSopViewCache";
 import { filterPrimaryRegistryRowsUniqueByFamily } from "@/lib/registryPrimaryRows";
+import {
+  expandSopIdentifierVariants,
+  sopBaseDisplayFromIdentifier,
+  sopFamilyKeyFromIdentifier,
+  sopCodeMatchesSearch,
+} from "@/lib/sopIdentifierNormalize";
 import { NextRequest, NextResponse } from "next/server";
 
 const DEFAULT_DEPARTMENTS = [
@@ -70,6 +76,41 @@ function stripVersion(code: string): string {
     .toUpperCase()
     .replace(/-\d+$/, "")
     .trim();
+}
+
+/** Map internal base keys (QAGE4) to registry display codes (QAGE04). */
+function buildSopDisplayCodeMaps(registryRows: Array<{ sopNo?: string; identifier?: string }>) {
+  const displayByStripBase = new Map<string, string>();
+  const displayByFamilyKey = new Map<string, string>();
+
+  for (const row of registryRows) {
+    const id = String(row?.sopNo || row?.identifier || "").trim();
+    if (!id) continue;
+    const display = sopBaseDisplayFromIdentifier(id);
+    const fk = sopFamilyKeyFromIdentifier(id);
+    if (fk) displayByFamilyKey.set(fk, display);
+    for (const variant of expandSopIdentifierVariants(id)) {
+      const base = stripVersion(variant);
+      if (base) displayByStripBase.set(base.toUpperCase(), display);
+    }
+  }
+
+  const resolveDisplaySopCode = (code: string): string => {
+    const upper = String(code || "").trim().toUpperCase();
+    if (!upper) return "";
+    const direct = displayByStripBase.get(upper);
+    if (direct) return direct;
+    const fk =
+      sopFamilyKeyFromIdentifier(upper) ||
+      sopFamilyKeyFromIdentifier(`${upper}-0`);
+    if (fk) {
+      const fromFamily = displayByFamilyKey.get(fk);
+      if (fromFamily) return fromFamily;
+    }
+    return sopBaseDisplayFromIdentifier(upper) || upper;
+  };
+
+  return { resolveDisplaySopCode };
 }
 
 function resolveActiveMatrixYear(
@@ -139,6 +180,8 @@ export interface SOPViewDeptStat {
 
 export interface SOPViewRow {
   sopCode: string;
+  /** Registry-aligned document code for UI (e.g. QAGE04 vs internal QAGE4). */
+  displaySopCode?: string;
   sopName: string;
   gujaratiName?: string;
   isDualLanguage?: boolean;
@@ -348,9 +391,9 @@ async function buildManageSopViewResponse(
     ]);
     const dataFetchMs = elapsedMs(dataFetchStartMs);
 
-    // Build dept → baseSopCode → monthNum (1..12) schedule map.
+    // Build dept → baseSopCode → monthNums (1..12) schedule map.
     // Multiple uploads per dept are merged; the most recent upload wins per (dept, sopCode).
-    const scheduleMap = new Map<string, Map<string, number>>();
+    const scheduleMap = new Map<string, Map<string, number[]>>();
     for (const dept of DEFAULT_DEPARTMENTS) scheduleMap.set(dept, new Map());
 
     const normalizeDept = (raw: string | undefined | null): string | null => {
@@ -368,12 +411,18 @@ async function buildManageSopViewResponse(
       return direct || null;
     };
 
-    const monthNameToNum = (name: string): number | null => {
-      if (!name) return null;
-      const idx = MONTH_NAMES.findIndex(
-        (m) => m && m.toLowerCase() === String(name).trim().toLowerCase(),
-      );
-      return idx > 0 ? idx : null;
+    const monthNamesToNums = (raw: string): number[] => {
+      const nums: number[] = [];
+      for (const part of String(raw)
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)) {
+        const idx = MONTH_NAMES.findIndex(
+          (m) => m && m.toLowerCase() === part.toLowerCase(),
+        );
+        if (idx > 0) nums.push(idx);
+      }
+      return nums;
     };
 
     for (const upload of scheduleUploads as any[]) {
@@ -386,9 +435,9 @@ async function buildManageSopViewResponse(
         const base = stripVersion(String(rawKey)).toUpperCase();
         if (!base) continue;
         if (deptSched.has(base)) continue; // latest upload wins
-        const monthNum = monthNameToNum(String(monthName));
-        if (!monthNum) continue;
-        deptSched.set(base, monthNum);
+        const monthNums = monthNamesToNums(String(monthName));
+        if (monthNums.length === 0) continue;
+        deptSched.set(base, monthNums);
       }
     }
 
@@ -478,6 +527,11 @@ async function buildManageSopViewResponse(
         }
       }
     }
+
+    const { resolveDisplaySopCode } = buildSopDisplayCodeMaps([
+      ...registryRows,
+      ...(canonicalRows as Array<{ sopNo?: string; identifier?: string }>),
+    ]);
 
     // Build designation set per department AND count employees per dept per designation,
     // plus the resolved roster (name + designation) used by the Employees view.
@@ -794,11 +848,11 @@ async function buildManageSopViewResponse(
       canonicalEntries = Array.from(sopSet.entries());
     }
 
-    // Apply search filter
+    // Apply search filter (match display codes too: QCMI1 ↔ QCMI01)
     const filteredSOPs = canonicalEntries.filter(([code, name]) => {
       if (!search) return true;
       return (
-        code.toLowerCase().includes(search) ||
+        sopCodeMatchesSearch(search, code, resolveDisplaySopCode(code)) ||
         name.toLowerCase().includes(search)
       );
     });
@@ -859,8 +913,9 @@ async function buildManageSopViewResponse(
         //   - It appears in that dept's schedule snapshot
         //   - It has training records in that dept (total > 0)
         //   - It is assigned to that dept via MatrixSOPAssignment
-        let scheduledMonth: number | null =
-          scheduleMap.get(dept)?.get(sopCode.toUpperCase()) || null;
+        const schedMonths =
+          scheduleMap.get(dept)?.get(sopCode.toUpperCase()) || [];
+        let scheduledMonth: number | null = schedMonths[0] ?? null;
         if (!scheduledMonth) {
           for (let m = 1; m <= 12; m++) {
             if (monthlyCounts[m] && monthlyCounts[m] > 0) {
@@ -911,6 +966,7 @@ async function buildManageSopViewResponse(
 
       return {
         sopCode,
+        displaySopCode: resolveDisplaySopCode(sopCode),
         sopName: finalEnglish,
         gujaratiName: gujarati,
         isDualLanguage: !!gujarati,
@@ -1023,18 +1079,20 @@ async function buildManageSopViewResponse(
     for (const dept of DEFAULT_DEPARTMENTS) {
       const sched = scheduleMap.get(dept);
       if (!sched) continue;
-      for (const [, monthNum] of sched) {
-        if (!monthNum) continue;
-        sopCountsByDeptMonth[dept][monthNum] =
-          (sopCountsByDeptMonth[dept][monthNum] || 0) + 1;
+      for (const [, monthNums] of sched) {
+        if (!monthNums.length) continue;
         sopCountsByDept[dept] = (sopCountsByDept[dept] || 0) + 1;
+        const primaryMonth = monthNums[0];
+        sopCountsByDeptMonth[dept][primaryMonth] =
+          (sopCountsByDeptMonth[dept][primaryMonth] || 0) + 1;
       }
     }
-    // Distinct SOPs per month across all depts (for the Σ row)
+    // Distinct SOPs per month across all depts (for the Σ row) — primary month only.
     for (const [, sched] of scheduleMap) {
       const localSeen = new Map<number, Set<string>>();
-      for (const [base, monthNum] of sched) {
-        if (!monthNum) continue;
+      for (const [base, monthNums] of sched) {
+        if (!monthNums.length) continue;
+        const monthNum = monthNums[0];
         if (!localSeen.has(monthNum)) localSeen.set(monthNum, new Set());
         localSeen.get(monthNum)!.add(base);
       }
@@ -1502,6 +1560,16 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       invalidateInductionTrainingMatrixCache(),
       invalidateManageSopViewCache(),
     ]).catch(() => {});
+
+    // Warm the training-matrix overview cache so assigned-SOP counts are fresh
+    // when the user navigates back from Manage SOPs.
+    try {
+      await fetch(`${request.nextUrl.origin}/api/training-matrix/overview?refresh=1`, {
+        cache: "no-store",
+      });
+    } catch {
+      // Non-fatal — the next overview GET will recompute after invalidation.
+    }
 
     console.info(
       `${MANAGE_SOP_API_LOG} POST /api/training-matrix/manage-sop-view source=manage-sop dbConnectMs=${dbConnectMs} upsertEntries=${upsertEntries.length} removalEntries=${removalEntries.length} inserted=${totalInserted} removed=${totalRemoved} updated=${totalMatched} unchanged=${totalUnchanged} warnings=${warnings.length} totalMs=${elapsedMs(reqStartMs)}`,

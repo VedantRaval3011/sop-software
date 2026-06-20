@@ -16,6 +16,7 @@ export interface JourneyContent {
   sop: {
     name: string;
     identifier: string;
+    sopBaseId?: string;
     department: string;
     fileUrl?: string;
     fileType?: string;
@@ -48,7 +49,7 @@ export async function getJourneyContent(sopCode: string): Promise<JourneyContent
         isObsolete: { $ne: true },
       })
         .sort({ versionNum: -1, uploadedAt: -1 })
-        .select('name identifier department fileUrl fileType mediaLinks sopDocuments mcqCount')
+        .select('name identifier sopBaseId department fileUrl fileType mediaLinks sopDocuments mcqCount')
         .lean();
 
       const escaped = sopCode.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -78,6 +79,7 @@ export async function getJourneyContent(sopCode: string): Promise<JourneyContent
           ? {
               name: sop.name,
               identifier: sop.identifier,
+              sopBaseId: sop.sopBaseId,
               department: sop.department,
               fileUrl: sop.fileUrl,
               fileType: sop.fileType,

@@ -3,6 +3,7 @@
 import { Fragment, createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useAuthGuard } from '@/hooks/useAuthGuard';
+import { sopFamilyCodesMatch } from '@/lib/sopIdentifierNormalize';
 
 function stripVersion(code: string): string {
   return String(code || '').toUpperCase().replace(/-\d+$/, '').trim();
@@ -29,7 +30,16 @@ function monthMatchesActive(month: string, activeMonth: string): boolean {
 function sopCodesMatch(a: string, b: string): boolean {
   const au = String(a || '').toUpperCase();
   const bu = String(b || '').toUpperCase();
-  return au === bu || stripVersion(au) === stripVersion(bu);
+  if (au === bu || stripVersion(au) === stripVersion(bu)) return true;
+  return sopFamilyCodesMatch(a, b);
+}
+
+function excelCodeInKnownDbBuckets(excelBase: string, known: Set<string>): boolean {
+  if (known.has(excelBase)) return true;
+  for (const dbBase of known) {
+    if (sopFamilyCodesMatch(excelBase, dbBase)) return true;
+  }
+  return false;
 }
 
 function trainingStatusForSop(
@@ -689,6 +699,7 @@ interface TotalCardData {
   fullyTrained: number;
   incomplete: number;
   departmentCount: number;
+  uploadedDepartmentCount?: number;
   totalDepartments: number;
   missingFromExcelList: Array<{ sopCode: string; title: string; department: string }>;
   trainersMissingList: Array<{ sopCode: string; month: string; department: string }>;
@@ -3197,7 +3208,7 @@ export default function TrainingMatrixPage() {
   const [empCapsules, setEmpCapsules] = useState<any[]>([]);
 
   const fetchData = useCallback(async (forceRefresh = false) => {
-    const CACHE_KEY = 'training_matrix_overview_cache_v5';
+    const CACHE_KEY = 'training_matrix_overview_cache_v6';
     const FRESH_TTL_MS = 5 * 60 * 1000;
 
     // Tier 1: localStorage — show any cached data immediately (even if stale), then revalidate.
@@ -3234,6 +3245,7 @@ export default function TrainingMatrixPage() {
         setData(json as OverviewData);
         try {
           localStorage.setItem(CACHE_KEY, JSON.stringify({ payload: json, cachedAt: Date.now() }));
+          if (forceRefresh) localStorage.removeItem('training_matrix_needs_refresh_v1');
         } catch { /* storage quota — ignore */ }
       }
     } catch (e) {
@@ -3244,7 +3256,42 @@ export default function TrainingMatrixPage() {
   }, []);
 
   useEffect(() => {
-    fetchData();
+    let needsRefresh = false;
+    try {
+      needsRefresh = !!localStorage.getItem('training_matrix_needs_refresh_v1');
+    } catch { /* ignore */ }
+    fetchData(needsRefresh);
+  }, [fetchData]);
+
+  // When Manage SOPs saves in another tab, pick up the refreshed overview cache.
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== 'training_matrix_overview_cache_v6' || !e.newValue) return;
+      try {
+        const { payload } = JSON.parse(e.newValue);
+        if (payload?.success && overviewHasTrainerBuckets(payload as OverviewData)) {
+          setData(payload as OverviewData);
+          localStorage.removeItem('training_matrix_needs_refresh_v1');
+        }
+      } catch { /* ignore malformed cache */ }
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, []);
+
+  // Revalidate when returning after Manage SOPs assignment edits.
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState !== 'visible') return;
+      if (!localStorage.getItem('training_matrix_needs_refresh_v1')) return;
+      void fetchData(true).finally(() => {
+        try {
+          localStorage.removeItem('training_matrix_needs_refresh_v1');
+        } catch { /* ignore */ }
+      });
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
   }, [fetchData]);
 
   // Keep groupBy reasonable per view
@@ -3253,7 +3300,16 @@ export default function TrainingMatrixPage() {
     if (viewMode === 'employee' && groupBy === 'month') setGroupBy('department');
   }, [viewMode, groupBy]);
 
-  // Build the SOP list for the table based on active dept + month
+  // Active registry SOPs only — excludes obsolete / Excel-only ghosts (e.g. QAIO38).
+  const activeDbCodeSet = useMemo(() => {
+    const s = new Set<string>();
+    for (const k of Object.keys(data?.sopStatusByCode || {})) {
+      const base = stripVersion(k).toUpperCase();
+      if (base) s.add(base);
+    }
+    return s;
+  }, [data?.sopStatusByCode]);
+
   const visibleSops = useMemo(() => {
     if (!data) return [];
     const depts: Dept[] = activeDept === 'All' ? [...departments] : [activeDept];
@@ -3263,6 +3319,7 @@ export default function TrainingMatrixPage() {
       const dSopCodes = data.sopCodesByDept?.[d] || [];
       const dMonthMap = data.sopMonthMapByDept?.[d] || {};
       for (const c of dSopCodes) {
+        if (!activeDbCodeSet.has(stripVersion(c).toUpperCase())) continue;
         const sopMonth = monthForCode(dMonthMap, c);
         if (monthMatchesActive(sopMonth, activeMonth)) {
           codes.add(c);
@@ -3271,7 +3328,7 @@ export default function TrainingMatrixPage() {
       }
     }
     return [...codes].sort((a, b) => a.localeCompare(b)).map((c) => ({ code: c, month: monthOf[c] }));
-  }, [data, activeDept, activeMonth]);
+  }, [data, activeDept, activeMonth, activeDbCodeSet]);
 
   const visibleEmployees = useMemo(() => {
     if (!data) return [];
@@ -3658,13 +3715,14 @@ export default function TrainingMatrixPage() {
               if (!deptData?.uploaded) continue;
               for (const c of deptData.sopCodes || []) {
                 const base = stripVersion(c);
+                if (!activeDbCodeSet.has(base.toUpperCase())) continue;
                 // Top-level "Excel SOPs (uploaded)" counts every uploaded Excel code
                 // (including ones not in the DB), so don't drop non-DB codes here —
                 // otherwise the shown rows undercount vs the chip. The DB-membership
                 // filter only applies when drilling into a specific DB-owner dept.
                 if (opts.dbDept && opts.dbDept !== 'All') {
                   if (opts.dbDept === 'NA') {
-                    if (codesInKnownDeptBuckets!.has(base)) continue;
+                    if (excelCodeInKnownDbBuckets(base, codesInKnownDeptBuckets!)) continue;
                   } else {
                     if (!registryDbCodes!.has(base)) continue;
                     const targetDbCodes = new Set(
@@ -3957,7 +4015,7 @@ export default function TrainingMatrixPage() {
         })
         .catch(() => {});
     },
-    [data, departments],
+    [data, departments, activeDbCodeSet],
   );
 
   // Applies a repeat-based filter directly to the SOP table (no modal)
@@ -4272,8 +4330,12 @@ export default function TrainingMatrixPage() {
 
     for (const dept of depts) {
       const employees = data.perDept?.[dept]?.employees || [];
-      const excelCodes = (data.sopCodesByDept?.[dept] || []).map((c: string) => stripVersion(c));
-      const dbCodes = ((data.totalCard as any)?.dbSopsByDept?.[dept] || []).map((x: any) => stripVersion(x.sopCode));
+      const excelCodes = (data.sopCodesByDept?.[dept] || [])
+        .map((c: string) => stripVersion(c))
+        .filter((c) => activeDbCodeSet.has(c.toUpperCase()));
+      const dbCodes = ((data.totalCard as any)?.dbSopsByDept?.[dept] || [])
+        .map((x: any) => stripVersion(x.sopCode))
+        .filter((c: string) => activeDbCodeSet.has(c.toUpperCase()));
       const baseCodes = Array.from(new Set([...excelCodes, ...dbCodes]));
       const sopCodes = capsuleSopFilter
         ? baseCodes.filter((c) => capsuleSopFilter.sopCodes.has(String(c).toUpperCase()))
@@ -4354,7 +4416,7 @@ export default function TrainingMatrixPage() {
     }
 
     return out.filter((g) => g.sops.length > 0);
-  }, [data, activeDept, activeMonth, search, capsuleSopFilter]);
+  }, [data, activeDept, activeMonth, search, capsuleSopFilter, activeDbCodeSet]);
 
   const falsySopRows = useMemo((): FalsySopRow[] => {
     const rows: FalsySopRow[] = [];
@@ -4457,19 +4519,16 @@ export default function TrainingMatrixPage() {
     const totalRepeat2List = Array.from(_allRepeat2.values());
     const totalRepeatOnceList = Array.from(_allRepeatOnce.values());
 
-    // Aggregate Excel SOP Dept Split across all uploaded depts (found only — missing is global).
-    const totalExcelDeptFoundByDept: Record<string, number> = {};
-    let totalExcelDeptUnknownFound = 0;
+    // Total strip: assigned SOP count per matrix department (= each dept card header).
+    const totalExcelDeptAssignedByMatrix: Record<string, number> = {};
     let totalExcelDeptTotal = 0;
     for (const dept of departments) {
       const deptData = data?.perDept?.[dept] as any;
       if (!deptData?.uploaded || !deptData.excelDeptSplit) continue;
       const split = deptData.excelDeptSplit;
-      totalExcelDeptTotal += split.total ?? 0;
-      totalExcelDeptUnknownFound += split.unknownFound ?? 0;
-      for (const d of departments) {
-        totalExcelDeptFoundByDept[d] = (totalExcelDeptFoundByDept[d] || 0) + (split.foundByDept?.[d] || 0);
-      }
+      const assigned = split.total ?? 0;
+      totalExcelDeptAssignedByMatrix[dept] = assigned;
+      totalExcelDeptTotal += assigned;
     }
     const totalExcelDeptMissingByDept = (t as any).excelDeptSplit?.missingByDept || {};
     const totalExcelDeptUnknownMissing = (t as any).excelDeptSplit?.unknownMissing ?? 0;
@@ -4486,7 +4545,10 @@ export default function TrainingMatrixPage() {
     const totalExpiryNear = t.nearExpiryCount ?? t.dueSoon30Count ?? 0;
     const totalExpiryNoDate = t.noDateCount ?? 0;
 
-    const totalSopsMonthSum = MONTHS.reduce((sum, m) => sum + (totalMonthCounts[m] ?? 0), 0);
+    const totalMonthSum = MONTHS.reduce((sum, m) => sum + (totalMonthCounts[m] ?? 0), 0);
+    const uploadedDeptCount =
+      t.uploadedDepartmentCount ??
+      departments.filter((d) => (data?.perDept?.[d] as DeptCardData | undefined)?.uploaded).length;
 
     return (
       <CardShell accent={getDeptAccent('Total')} icon={TotalIcon} title="Total">
@@ -4618,25 +4680,21 @@ export default function TrainingMatrixPage() {
               </div>
             </div>
             <DeptStrip
-              foundCounts={{
-                ...totalExcelDeptFoundByDept,
-                ...(totalExcelDeptUnknownFound > 0 ? { NA: totalExcelDeptUnknownFound } : {}),
-              }}
+              foundCounts={totalExcelDeptAssignedByMatrix}
               missingCounts={{
                 ...totalExcelDeptMissingByDept,
                 ...(totalExcelDeptUnknownMissing > 0 ? { NA: totalExcelDeptUnknownMissing } : {}),
               }}
               order={
-                totalExcelDeptUnknownFound > 0 || totalExcelDeptUnknownMissing > 0
+                totalExcelDeptUnknownMissing > 0
                   ? [...departments, 'NA']
                   : departments
               }
-              onSelectFound={(dbDept) =>
+              onSelectFound={(matrixDept) =>
                 applySummaryCapsuleFilter({
-                  dept: 'All',
-                  dbDept: dbDept === 'NA' ? 'NA' : dbDept,
+                  dept: matrixDept,
                   type: 'found_any',
-                  title: `Total · Found (DB Dept: ${dbDept})`,
+                  title: `Total · Assigned SOPs (${matrixDept} matrix)`,
                 })
               }
               onSelectMissing={(dbDept) =>
@@ -4886,10 +4944,10 @@ export default function TrainingMatrixPage() {
         </SummaryTopic>
         <SummaryTopic>
         <SopsMonthHeaderRow
-          monthSum={totalSopsMonthSum}
-          deptNumerator={t.departmentCount}
+          monthSum={totalMonthSum}
+          deptNumerator={uploadedDeptCount}
           deptDenominator={t.totalDepartments}
-          title="Sum of monthly SOP counts (this card). Dept: uploads / configured departments."
+          title="Sum of monthly assigned SOP counts. Dept: matrix uploads / configured departments."
         />
         <MonthStrip
           monthCounts={totalMonthCounts}
@@ -4911,7 +4969,8 @@ export default function TrainingMatrixPage() {
   };
 
   const renderDeptCard = (dept: Dept, d: DeptCardData) => {
-    const deptMonthSum = MONTHS.reduce((sum, m) => sum + (d.monthCounts?.[m] ?? 0), 0);
+    const deptMonthCountsMap = data?.monthCountsByDept?.[dept] ?? d.monthCounts ?? {};
+    const deptMonthSum = MONTHS.reduce((sum, m) => sum + (deptMonthCountsMap[m] ?? 0), 0);
     const deptTrainerBuckets = resolveTrainerBucketCounts(d);
     const Icon = getDeptIcon(dept);
     const globalMissingCount = data?.totalCard?.missingSopCount ?? 0;
@@ -5333,12 +5392,12 @@ export default function TrainingMatrixPage() {
         <SummaryTopic>
         <SopsMonthHeaderRow
           monthSum={deptMonthSum}
-          deptNumerator={data?.totalCard?.departmentCount ?? 0}
+          deptNumerator={d.uploaded ? 1 : 0}
           deptDenominator={data?.totalCard?.totalDepartments ?? DEFAULT_DEPARTMENTS.length}
-          title="Sum of monthly SOP counts (this department). Dept: uploads / configured departments."
+          title="Sum of monthly assigned SOP counts for this department matrix."
         />
         <MonthStrip
-          monthCounts={d.monthCounts}
+          monthCounts={deptMonthCountsMap}
           onSelectMonth={(m) => {
             setViewMode('sop');
             setGroupBy('department');

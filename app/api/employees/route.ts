@@ -1,9 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
 import bcrypt from 'bcryptjs';
 import { connectDB } from '@/lib/mongodb';
-import { getEmployeeAssignmentsMap } from '@/lib/employeeAssignments';
+import { getEmployeeAssignmentsMap, invalidateEmployeeAssignmentsCache } from '@/lib/employeeAssignments';
 import { generateUniqueLmsUsername } from '@/lib/lms-credentials';
 import { syncEmployeesFromMatrixThrottled } from '@/lib/syncEmployeesFromMatrix';
+import {
+  parseDateOfJoining,
+  resolveInductionTrainingRequired,
+  formatDateOfJoiningInput,
+} from '@/lib/employeeInduction';
 import Employee from '@/models/Employee';
 
 export const dynamic = 'force-dynamic';
@@ -46,7 +51,14 @@ export async function GET(req: NextRequest) {
     // learning-module password is set without the hash ever leaving the server.
     const safe = employees.map((emp) => {
       const { lmsPasswordHash, ...rest } = emp as typeof emp & { lmsPasswordHash?: string };
-      return { ...rest, hasLmsPassword: !!lmsPasswordHash };
+      const dateOfJoining = rest.dateOfJoining
+        ? formatDateOfJoiningInput(rest.dateOfJoining as Date)
+        : undefined;
+      return {
+        ...rest,
+        dateOfJoining,
+        hasLmsPassword: !!lmsPasswordHash,
+      };
     });
 
     if (!includeAssignments) {
@@ -73,11 +85,14 @@ export async function POST(req: NextRequest) {
   try {
     await connectDB();
     const body = await req.json();
-    const { name, designation, department, employeeId, password } = body;
+    const { name, designation, department, employeeId, password, dateOfJoining, inductionTrainingRequired } = body;
 
     if (!name?.trim() || !designation?.trim() || !department?.trim()) {
       return NextResponse.json({ error: 'name, designation, and department are required' }, { status: 400 });
     }
+
+    const doj = parseDateOfJoining(dateOfJoining);
+    const inductionRequired = resolveInductionTrainingRequired(doj, inductionTrainingRequired === true);
 
     let lmsPasswordHash: string | undefined;
     if (typeof password === 'string' && password.length > 0) {
@@ -93,13 +108,22 @@ export async function POST(req: NextRequest) {
       designation: designation.trim(),
       department: department.trim(),
       employeeId: employeeId?.trim() || undefined,
+      dateOfJoining: doj,
+      inductionTrainingRequired: inductionRequired,
       lmsUsername,
       lmsPasswordHash,
     });
 
     const employee = created.toObject();
     delete employee.lmsPasswordHash;
-    return NextResponse.json({ employee: { ...employee, hasLmsPassword: !!lmsPasswordHash } }, { status: 201 });
+    invalidateEmployeeAssignmentsCache();
+    return NextResponse.json({
+      employee: {
+        ...employee,
+        dateOfJoining: doj ? formatDateOfJoiningInput(doj) : undefined,
+        hasLmsPassword: !!lmsPasswordHash,
+      },
+    }, { status: 201 });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes('duplicate key') || msg.includes('E11000')) {
