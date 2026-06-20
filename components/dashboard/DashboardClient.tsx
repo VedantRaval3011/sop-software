@@ -18,6 +18,7 @@ import {
   paginate,
 } from "@/lib/sop-utils";
 import { exportSopsToExcel } from "@/lib/export-missing";
+import { displaySopCode } from "@/lib/sop-display";
 import { canMutate, isAdmin } from "@/lib/roles";
 import type { AppRole } from "@/lib/auth";
 import { DashboardHeader } from "./DashboardHeader";
@@ -374,7 +375,7 @@ export function DashboardClient() {
     ];
     const rows = items.map((s) =>
       [
-        s.identifier,
+        displaySopCode(s.identifier),
         s.version,
         `"${s.name.replace(/"/g, '""')}"`,
         s.department,

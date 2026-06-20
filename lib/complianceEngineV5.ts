@@ -20,6 +20,8 @@
  */
 
 import { generateComplianceJson } from "@/lib/gemini";
+import { isGeminiDailyQuotaError } from "@/lib/gemini-client";
+import { getComplianceProvider } from "@/lib/llm";
 import {
   getScoreLabel,
   type AuditCompleteness,
@@ -80,25 +82,73 @@ export interface SopLibraryEntry {
 //     without exceeding the send rate (so no 503 burst), cutting wall-clock time further.
 // Minimal JSON for compliant/N/A keeps each call fast; full detail only on gaps.
 
-const MAX_CLAUSES_PER_BATCH = 40;
-const MAX_CLAUSES_DEEP_BATCH = 8;
+function envInt(key: string, fallback: number): number {
+  const n = Number(process.env[key]);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
+function isOllamaProvider(): boolean {
+  return getComplianceProvider() === "ollama";
+}
+
+const MAX_CLAUSES_PER_BATCH = envInt(
+  "COMPLIANCE_MAX_CLAUSES_PER_BATCH",
+  isOllamaProvider() ? 3 : isGeminiFreeTier() ? 80 : 40,
+);
+const MAX_CLAUSES_DEEP_BATCH = envInt(
+  "COMPLIANCE_MAX_CLAUSES_DEEP_BATCH",
+  isOllamaProvider() ? 2 : 8,
+);
 /**
  * Safety cap on phase-2 deep enrichment. A thorough screening pass legitimately
  * surfaces many gaps; deep-enrich the most material ones (sorted by severity) and
  * let the remainder keep their screening-level detail so runtime stays bounded.
+ * Local Ollama skips deep enrichment entirely — screening findings are sufficient.
  */
-const MAX_DEEP_GAP_CLAUSES = 120;
+const MAX_DEEP_GAP_CLAUSES =
+  isOllamaProvider() || isGeminiFreeTier() ? 0 : 120;
+const SKIP_DEEP_ENRICHMENT =
+  isOllamaProvider() ||
+  isGeminiFreeTier() ||
+  process.env.COMPLIANCE_SKIP_DEEP_ENRICHMENT === "true";
 /**
  * Pipelined workers. The 400ms send-gap in lib/gemini.ts is the true rate limit and is
  * preserved regardless of worker count — these workers only overlap response latency so
  * the pipeline stays full. Keep moderate (not 20+) to avoid a 503 pile-up if the API slows.
+ * Local Ollama must run one batch at a time — parallel workers only queue longer prompts.
  */
-const BATCH_CONCURRENCY = 8;
-const DEEP_BATCH_CONCURRENCY = 6;
-const BATCH_DELAY_MS = 300;
-const MAX_SOP_CHARS_PER_BATCH = 55_000;
-const MAX_CLAUSE_TEXT_CHARS = 350;
-const MAX_CLAUSE_TEXT_DEEP = 1_500;
+function isGeminiFreeTier(): boolean {
+  return getComplianceProvider() === "gemini" && process.env.GEMINI_FREE_TIER !== "false";
+}
+
+const BATCH_CONCURRENCY = isOllamaProvider()
+  ? envInt("COMPLIANCE_BATCH_CONCURRENCY", 1)
+  : isGeminiFreeTier()
+    ? envInt("COMPLIANCE_BATCH_CONCURRENCY", 1)
+    : envInt("COMPLIANCE_BATCH_CONCURRENCY", 8);
+const DEEP_BATCH_CONCURRENCY = isOllamaProvider()
+  ? envInt("COMPLIANCE_DEEP_BATCH_CONCURRENCY", 1)
+  : isGeminiFreeTier()
+    ? envInt("COMPLIANCE_DEEP_BATCH_CONCURRENCY", 1)
+    : envInt("COMPLIANCE_DEEP_BATCH_CONCURRENCY", 6);
+const BATCH_DELAY_MS = isOllamaProvider() ? 500 : isGeminiFreeTier() ? 0 : 300;
+const MAX_SOP_CHARS_PER_BATCH = envInt(
+  "COMPLIANCE_MAX_SOP_CHARS_PER_BATCH",
+  isOllamaProvider() ? 4_000 : 55_000,
+);
+const MAX_SECTION_SUMMARY_CHARS = isOllamaProvider()
+  ? envInt("COMPLIANCE_MAX_SECTION_SUMMARY_CHARS", 400)
+  : Number.MAX_SAFE_INTEGER;
+const MAX_CLAUSE_TEXT_CHARS = isOllamaProvider()
+  ? envInt("COMPLIANCE_MAX_CLAUSE_TEXT_CHARS", 180)
+  : 350;
+const MAX_CLAUSE_TEXT_DEEP = isOllamaProvider() ? 800 : 1_500;
+
+/** Minimal screening prompt for local Ollama — short input/output keeps batches under timeout. */
+const OLLAMA_SCREENING_PROMPT = `You are a GMP/QA auditor. Screen each clause against the SOP. Return EXACTLY one finding per clause, same order.
+Levels: "compliant" | "partial" | "non-compliant" | "not-applicable".
+Be honest — most applicable clauses are "partial" or "non-compliant", not "compliant".
+Return ONLY compact JSON: {"findings":[{"guidelineName","clauseNumber","clauseTitle","guidelineReference","applicability","scopeOwner","complianceLevel","matchConfidence","requirementCriticality","issueSeverity","sopSectionAffected","sopTextSnippet","evidenceFound","evidenceMissing","mismatchExplanation"(≤12 words for gaps/NA),"guidelineRequirement"(gaps only)}]}`;
 
 /** Fast screening prompt — compact JSON, but tuned to surface every genuine gap, not rubber-stamp "compliant". */
 const SCREENING_PROMPT = `You are an experienced GMP/QA regulatory auditor (EU GMP, WHO, FDA, PIC/S, ICH) performing a defensible clause-by-clause gap assessment.
@@ -370,13 +420,30 @@ async function analyzeBatch(
     .join("\n\n");
 
   const sopBlock = indexedSopContent.slice(0, MAX_SOP_CHARS_PER_BATCH);
+  const summaryBlock =
+    sectionSummary.length > MAX_SECTION_SUMMARY_CHARS
+      ? `${sectionSummary.slice(0, MAX_SECTION_SUMMARY_CHARS)}…`
+      : sectionSummary;
 
-  const userPrompt = `DEPARTMENT: ${department}
+  const userPrompt =
+    isOllamaProvider() && !options?.deep
+      ? `DEPARTMENT: ${department}
+SOP: ${sopIdentifier} — ${sopName}
+BATCH: ${batchLabel} | ${batch.length} clauses
+
+CLAUSES:
+${clausesBlock}
+
+SOP EXCERPT:
+${sopBlock}
+
+Return exactly ${batch.length} findings as JSON.`
+      : `DEPARTMENT: ${department}
 SOP: ${sopIdentifier} — ${sopName}
 BATCH: ${batchLabel} | ${batch.length} clauses${options?.deep ? " | DEEP GAP ENRICHMENT" : " | SCREENING"}
 
 === SOP SECTION MAP ===
-${sectionSummary}
+${summaryBlock}
 
 === CLAUSES (audit each in order against the indexed SOP) ===
 ${clausesBlock}
@@ -385,15 +452,29 @@ ${clausesBlock}
 ${sopBlock}
 
 Return exactly ${batch.length} findings in the same order. Include guidelineName, evidenceFound and evidenceMissing on every finding.${
-    options?.deep
-      ? " These are confirmed gaps — provide FULL impactAnalysis, suggestedAction, suggestedText, whyApplies, and whyEvidenceInsufficient for each."
-      : ""
-  }`;
+          options?.deep
+            ? " These are confirmed gaps — provide FULL impactAnalysis, suggestedAction, suggestedText, whyApplies, and whyEvidenceInsufficient for each."
+            : ""
+        }`;
+
+  const screeningPrompt = isOllamaProvider() ? OLLAMA_SCREENING_PROMPT : SCREENING_PROMPT;
+  const startedAt = Date.now();
+  if (isOllamaProvider()) {
+    console.log(
+      `[compliance-v5] ollama ${options?.deep ? "deep" : "screen"} batch ${batchLabel}: ${batch.length} clauses, ~${userPrompt.length} chars`,
+    );
+  }
 
   const parsed = await generateComplianceJson<{ findings: RawFinding[] }>(
-    options?.deep ? SYSTEM_PROMPT : SCREENING_PROMPT,
+    options?.deep ? SYSTEM_PROMPT : screeningPrompt,
     userPrompt,
   );
+
+  if (isOllamaProvider()) {
+    console.log(
+      `[compliance-v5] ollama batch ${batchLabel} done in ${Math.round((Date.now() - startedAt) / 1000)}s`,
+    );
+  }
 
   if (!Array.isArray(parsed.findings)) {
     throw new SyntaxError(`Batch ${batchLabel}: invalid findings array`);
@@ -487,8 +568,20 @@ async function runBatchesParallel(
   const results: ComplianceFinding[][] = new Array(batches.length);
   let completed = 0;
   let nextIndex = 0;
+  let quotaAbortMessage: string | null = null;
   const runStart = Date.now();
   const deep = phase === "deep";
+
+  const markBatchFailed = (
+    batch: GuidelineClauseInput[],
+    msg: string,
+  ): ComplianceFinding[] =>
+    batch.map((clause) => {
+      const f = finalizeFinding(undefined, clause);
+      f.complianceLevel = "analysis-failed";
+      f.mismatchExplanation = msg.slice(0, 200);
+      return f;
+    });
 
   const worker = async (): Promise<void> => {
     while (true) {
@@ -496,6 +589,17 @@ async function runBatchesParallel(
       if (i >= batches.length) return;
       const label = `${phase} ${i + 1}/${batches.length}`;
       const t0 = Date.now();
+
+      if (quotaAbortMessage) {
+        results[i] = markBatchFailed(batches[i], quotaAbortMessage);
+        completed++;
+        console.log(
+          `[complianceV5] ${label} skipped (quota exhausted) ` +
+            `(${completed}/${batches.length} ${phase}, elapsed ${Math.round((Date.now() - runStart) / 1000)}s)`,
+        );
+        continue;
+      }
+
       try {
         results[i] = await analyzeBatchResilient(
           ctx.sopIdentifier,
@@ -509,13 +613,24 @@ async function runBatchesParallel(
         );
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[complianceV5] ${label} failed — marking ${batches[i].length} clauses as analysis-failed: ${msg.slice(0, 200)}`);
-        results[i] = batches[i].map((clause) => {
-          const f = finalizeFinding(undefined, clause);
-          f.complianceLevel = "analysis-failed";
-          f.mismatchExplanation = `Batch failed (${msg.slice(0, 120)}) — retry analysis`;
-          return f;
-        });
+        if (isGeminiDailyQuotaError(err)) {
+          if (!quotaAbortMessage) {
+            quotaAbortMessage = msg;
+            const remaining = batches.length - completed - 1;
+            console.error(
+              `[complianceV5] ${msg} — aborting ${remaining} remaining batch(es)`,
+            );
+          }
+          results[i] = markBatchFailed(batches[i], msg);
+        } else {
+          console.error(
+            `[complianceV5] ${label} failed — marking ${batches[i].length} clauses as analysis-failed: ${msg.slice(0, 200)}`,
+          );
+          results[i] = markBatchFailed(
+            batches[i],
+            `Batch failed (${msg.slice(0, 120)}) — retry analysis`,
+          );
+        }
       }
       completed++;
       console.log(
@@ -728,7 +843,7 @@ export async function analyzeSOPComplianceV5(request: {
   }
 
   console.log(
-    `[complianceV5] ${request.sopIdentifier}: phase 1 screening — ${request.guidelineClauses.length} clauses in ${screenBatches.length} batches (serialized, model: flash)`,
+    `[complianceV5] ${request.sopIdentifier}: phase 1 screening — ${request.guidelineClauses.length} clauses in ${screenBatches.length} batches (provider: ${getComplianceProvider()}, batch size: ${MAX_CLAUSES_PER_BATCH}, concurrency: ${BATCH_CONCURRENCY}${isGeminiFreeTier() ? ", free-tier: 1 model, ~4s gap, no deep phase" : ""})`,
   );
 
   const screeningFindings = await runBatchesParallel(
@@ -760,7 +875,7 @@ export async function analyzeSOPComplianceV5(request: {
     .slice(0, MAX_DEEP_GAP_CLAUSES)
     .map((x) => x.c);
 
-  if (gapClauses.length > 0) {
+  if (gapClauses.length > 0 && !SKIP_DEEP_ENRICHMENT) {
     const deepBatches: GuidelineClauseInput[][] = [];
     for (let i = 0; i < gapClauses.length; i += MAX_CLAUSES_DEEP_BATCH) {
       deepBatches.push(gapClauses.slice(i, i + MAX_CLAUSES_DEEP_BATCH));
@@ -780,6 +895,10 @@ export async function analyzeSOPComplianceV5(request: {
     for (const f of deepFindings) {
       findingByKey.set(clauseKey(f), f);
     }
+  } else if (gapClauses.length > 0 && SKIP_DEEP_ENRICHMENT) {
+    console.log(
+      `[complianceV5] ${request.sopIdentifier}: skipping phase 2 deep enrichment (${gapClauses.length} gaps — screening detail kept${isGeminiFreeTier() ? ", Gemini free tier" : ", local Ollama mode"})`,
+    );
   }
 
   // Preserve original clause order for traceability and scoring.

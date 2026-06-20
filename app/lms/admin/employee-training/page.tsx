@@ -1,22 +1,36 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useSession } from 'next-auth/react';
 import { useRouter } from 'next/navigation';
 import {
   ArrowLeft, Loader2, RefreshCw, Search, ChevronDown, X,
-  CheckCircle2, MinusCircle, Circle, Video, Presentation,
-  FileText, ListChecks, Minus, ArrowUp, ArrowDown, ChevronsUpDown,
 } from 'lucide-react';
+import { TrainingDeptCapsules, type TrainingDeptCapsule } from '@/components/lms/TrainingDeptCapsules';
+import {
+  EmployeeTrainingGrid,
+  buildMonthlyBreakdown,
+  type EmployeeGridRow,
+  type MonthBreakdown,
+} from '@/components/employees/EmployeeTrainingGrid';
+import {
+  SopTrainingGrid,
+  type SopGridRow,
+  type SopGridDrill,
+} from '@/components/lms/SopTrainingGrid';
 import {
   lmsClientFields,
   LMS_CLIENT_FRESH_MS,
   readLmsClientCache,
   writeLmsClientCache,
 } from '@/lib/lmsCache';
+import { hasGujaratiScript, isInvalidSopAssignmentCode, isPlaceholderSopName } from '@/lib/sop-name-resolution';
+import { baseIdentifierFromIdentifier } from '@/lib/sop-utils';
+import type { DashboardStats, RegistrySOP } from '@/lib/types';
 
-const DEPARTMENTS = ['All', 'QA', 'QC', 'Microbiology', 'Production', 'Store', 'Engineering', 'Personnel'];
+// Preferred department display order; departments not listed fall after these.
+const DEPT_ORDER = ['QA', 'QC', 'Microbiology', 'Production', 'Store', 'Engineering', 'Personnel'];
 
 type ComponentStatus = 'completed' | 'partial' | 'not_completed' | 'na';
 type SopStatus = 'completed' | 'partial' | 'not_completed';
@@ -24,11 +38,17 @@ type ComponentKey = 'videos' | 'slides' | 'sopDoc' | 'mcq';
 
 interface SopBreakdown {
   sopCode: string;
+  sopKey?: string;
   sopName: string;
+  sopNameGujarati?: string;
   status: SopStatus;
   months: number[];
   hasExam: boolean;
   components: Record<ComponentKey, ComponentStatus>;
+}
+
+interface SopTrainingRow extends SopGridRow {
+  months: number[];
 }
 
 interface EmployeeTrainingRecord {
@@ -44,45 +64,14 @@ interface EmployeeTrainingRecord {
   overallPct: number;
   monthlyCounts: number[];
   sops: SopBreakdown[];
+  hasTraining: boolean;
+  hasInduction: boolean;
 }
 
-const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 const MONTHS_FULL = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 
-type SortDir = 'asc' | 'desc';
-interface SortState { key: string; dir: SortDir; }
-
-function nextSort(prev: SortState, key: string, defaultDir: SortDir = 'asc'): SortState {
-  if (prev.key === key) return { key, dir: prev.dir === 'asc' ? 'desc' : 'asc' };
-  return { key, dir: defaultDir };
-}
-
-/** Sortable table header cell with a direction indicator. */
-function SortHeader({
-  label, sortKey, sort, onSort, align = 'left', cls = 'px-4 py-3',
-}: {
-  label: ReactNode;
-  sortKey: string;
-  sort: SortState;
-  onSort: (key: string) => void;
-  align?: 'left' | 'center';
-  cls?: string;
-}) {
-  const active = sort.key === sortKey;
-  return (
-    <th
-      onClick={() => onSort(sortKey)}
-      className={`${cls} cursor-pointer select-none text-xs font-semibold uppercase tracking-wider transition hover:text-gray-700 ${active ? 'text-gray-700' : 'text-gray-500'}`}
-    >
-      <span className={`inline-flex items-center gap-1 ${align === 'center' ? 'w-full justify-center' : ''}`}>
-        {label}
-        {active
-          ? (sort.dir === 'asc' ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />)
-          : <ChevronsUpDown className="h-3 w-3 opacity-30" />}
-      </span>
-    </th>
-  );
-}
+const emptySopMonthlyBreakdown = (): MonthBreakdown[] =>
+  Array.from({ length: 12 }, () => ({ completed: 0, partial: 0, notCompleted: 0 }));
 
 type EmpStatus = 'completed' | 'in_progress' | 'not_started';
 
@@ -92,36 +81,180 @@ function employeeStatus(r: EmployeeTrainingRecord): EmpStatus {
   return 'in_progress';
 }
 
-const COMPONENT_META: { key: ComponentKey; label: string; Icon: typeof Video }[] = [
-  { key: 'videos', label: 'Videos',        Icon: Video },
-  { key: 'slides', label: 'Slides / PPTs', Icon: Presentation },
-  { key: 'sopDoc', label: 'SOP Document',  Icon: FileText },
-  { key: 'mcq',    label: 'MCQs',          Icon: ListChecks },
-];
+// ─── Department summary capsules ──────────────────────────────────────────────
 
-function ComponentBadge({ status }: { status: ComponentStatus }) {
-  if (status === 'na') {
-    return <span className="inline-flex items-center gap-1 text-xs text-gray-300"><Minus className="h-3.5 w-3.5" /> N/A</span>;
+// Per-SOP roll-up across the employees assigned to it. A SOP counts once
+// (distinct), and its department-wide status follows the rule: Completed only
+// when every assigned employee finished it; Not Done when none has any progress;
+// Partial otherwise.
+
+interface ComponentRollup { completed: number; partial: number; not: number; }
+
+interface DeptAcc {
+  totalEmployees: number; empCompleted: number; empPartial: number; empNot: number;
+  empTraining: number; empInduction: number;
+  slides: ComponentRollup;
+  videos: ComponentRollup;
+  mcq: ComponentRollup;
+}
+
+const emptyComponentRollup = (): ComponentRollup => ({ completed: 0, partial: 0, not: 0 });
+
+const emptyDeptAcc = (): DeptAcc => ({
+  totalEmployees: 0, empCompleted: 0, empPartial: 0, empNot: 0,
+  empTraining: 0, empInduction: 0,
+  slides: emptyComponentRollup(), videos: emptyComponentRollup(), mcq: emptyComponentRollup(),
+});
+
+type ComponentRollupKey = 'slides' | 'videos' | 'mcq';
+
+function employeeComponentStatus(r: EmployeeTrainingRecord, key: ComponentRollupKey): EmpStatus {
+  const statuses = r.sops.map((s) => s.components[key]).filter((st) => st !== 'na');
+  if (statuses.length === 0) return 'not_started';
+  if (statuses.every((st) => st === 'completed')) return 'completed';
+  if (statuses.some((st) => st === 'completed' || st === 'partial')) return 'in_progress';
+  return 'not_started';
+}
+
+function bumpComponentRollup(rollup: ComponentRollup, status: EmpStatus) {
+  if (status === 'completed') rollup.completed++;
+  else if (status === 'in_progress') rollup.partial++;
+  else rollup.not++;
+}
+
+function addToDeptAcc(acc: DeptAcc, r: EmployeeTrainingRecord) {
+  acc.totalEmployees += 1;
+  const st = employeeStatus(r);
+  if (st === 'completed')        acc.empCompleted++;
+  else if (st === 'in_progress') acc.empPartial++;
+  else                           acc.empNot++;
+  if (r.hasTraining)  acc.empTraining++;
+  if (r.hasInduction) acc.empInduction++;
+  bumpComponentRollup(acc.slides, employeeComponentStatus(r, 'slides'));
+  bumpComponentRollup(acc.videos, employeeComponentStatus(r, 'videos'));
+  bumpComponentRollup(acc.mcq, employeeComponentStatus(r, 'mcq'));
+}
+
+function countRegistrySopStatus(rows: SopTrainingRow[]) {
+  let sopCompleted = 0;
+  let sopPartial = 0;
+  let sopNot = 0;
+  for (const row of rows) {
+    if (row.assigned > 0 && row.completed === row.assigned) sopCompleted++;
+    else if (row.assigned > 0 && (row.completed > 0 || row.partial > 0)) sopPartial++;
+    else sopNot++;
   }
-  if (status === 'completed') {
-    return (
-      <span className="inline-flex items-center gap-1 rounded-full bg-green-50 px-2 py-0.5 text-xs font-semibold text-green-700">
-        <CheckCircle2 className="h-3.5 w-3.5" /> Completed
-      </span>
-    );
+  return { sopCompleted, sopPartial, sopNot };
+}
+
+function buildRegistrySopRows(
+  registry: RegistrySOP[],
+  trainingRows: SopTrainingRow[],
+  dept: string,
+): SopTrainingRow[] {
+  const trainingByKey = new Map<string, SopTrainingRow>();
+  for (const row of trainingRows) {
+    trainingByKey.set(row.sopCode.toUpperCase(), row);
+    trainingByKey.set(row.sopKey.toUpperCase(), row);
+    trainingByKey.set(baseIdentifierFromIdentifier(row.sopCode).toUpperCase(), row);
   }
-  if (status === 'partial') {
-    return (
-      <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-xs font-semibold text-amber-700">
-        <MinusCircle className="h-3.5 w-3.5" /> Partial
-      </span>
-    );
+
+  const active = registry.filter((r) => !r.isObsolete);
+  const scoped = dept === 'All'
+    ? active
+    : active.filter((r) => r.department === dept);
+
+  return scoped.map((sop) => {
+    const id = sop.identifier.toUpperCase();
+    const base = baseIdentifierFromIdentifier(sop.identifier).toUpperCase();
+    const train = trainingByKey.get(id) ?? trainingByKey.get(base);
+    return {
+      sopKey: base || id,
+      sopCode: sop.identifier,
+      sopName: sop.name,
+      sopNameGujarati: sop.nameGujarati,
+      department: sop.department,
+      months: train?.months ?? [],
+      assigned: train?.assigned ?? 0,
+      completed: train?.completed ?? 0,
+      partial: train?.partial ?? 0,
+      notCompleted: train?.notCompleted ?? 0,
+      completionPct: train?.completionPct ?? 0,
+      monthlyBreakdown: train?.monthlyBreakdown ?? emptySopMonthlyBreakdown(),
+    };
+  });
+}
+
+function deptAccToCapsule(
+  department: string,
+  acc: DeptAcc,
+  sopTotals: { totalSops: number; sopCompleted: number; sopPartial: number; sopNot: number },
+): TrainingDeptCapsule {
+  return {
+    department,
+    totalSops: sopTotals.totalSops,
+    sopCompleted: sopTotals.sopCompleted,
+    sopPartial: sopTotals.sopPartial,
+    sopNot: sopTotals.sopNot,
+    totalEmployees: acc.totalEmployees,
+    empCompleted: acc.empCompleted, empPartial: acc.empPartial, empNot: acc.empNot,
+    empTraining: acc.empTraining, empInduction: acc.empInduction,
+    slidesTotal: acc.totalEmployees, slidesCompleted: acc.slides.completed,
+    slidesPartial: acc.slides.partial, slidesNot: acc.slides.not,
+    videosTotal: acc.totalEmployees, videosCompleted: acc.videos.completed,
+    videosPartial: acc.videos.partial, videosNot: acc.videos.not,
+    mcqTotal: acc.totalEmployees, mcqCompleted: acc.mcq.completed,
+    mcqPartial: acc.mcq.partial, mcqNot: acc.mcq.not,
+  };
+}
+
+function buildSopTrainingRows(records: EmployeeTrainingRecord[], dept: string): SopTrainingRow[] {
+  const byKey = new Map<string, SopTrainingRow>();
+  for (const emp of records) {
+    if (dept !== 'All' && (emp.department || 'Unknown') !== dept) continue;
+    for (const s of emp.sops) {
+      if (isInvalidSopAssignmentCode(s.sopCode)) continue;
+      const key = s.sopKey || s.sopCode.toUpperCase();
+      let row = byKey.get(key);
+      if (!row) {
+        row = {
+          sopKey: key,
+          sopCode: s.sopCode,
+          sopName: s.sopName,
+          sopNameGujarati: s.sopNameGujarati,
+          department: '',
+          months: s.months,
+          assigned: 0,
+          completed: 0,
+          partial: 0,
+          notCompleted: 0,
+          completionPct: 0,
+          monthlyBreakdown: emptySopMonthlyBreakdown(),
+        };
+        byKey.set(key, row);
+      }
+      if (s.sopName && !isPlaceholderSopName(s.sopName, s.sopCode) && !hasGujaratiScript(s.sopName)) {
+        row.sopName = s.sopName;
+      }
+      if (s.sopNameGujarati && !row.sopNameGujarati) row.sopNameGujarati = s.sopNameGujarati;
+      if (s.months.length > row.months.length) row.months = s.months;
+      row.assigned++;
+      if (s.status === 'completed') row.completed++;
+      else if (s.status === 'partial') row.partial++;
+      else row.notCompleted++;
+      for (const m of s.months) {
+        const idx = m - 1;
+        if (idx < 0 || idx > 11) continue;
+        if (s.status === 'completed') row.monthlyBreakdown[idx].completed++;
+        else if (s.status === 'partial') row.monthlyBreakdown[idx].partial++;
+        else row.monthlyBreakdown[idx].notCompleted++;
+      }
+    }
   }
-  return (
-    <span className="inline-flex items-center gap-1 rounded-full bg-gray-100 px-2 py-0.5 text-xs font-semibold text-gray-500">
-      <Circle className="h-3.5 w-3.5" /> Pending
-    </span>
-  );
+  return [...byKey.values()].map((row) => ({
+    ...row,
+    completionPct: row.assigned > 0 ? Math.round((row.completed / row.assigned) * 100) : 0,
+  }));
 }
 
 const SOP_STATUS_META: Record<SopStatus, { label: string; chip: string }> = {
@@ -130,176 +263,101 @@ const SOP_STATUS_META: Record<SopStatus, { label: string; chip: string }> = {
   not_completed: { label: 'Not Completed',       chip: 'bg-gray-100 text-gray-600' },
 };
 
-const SOP_STATUS_RANK: Record<SopStatus, number> = { not_completed: 0, partial: 1, completed: 2 };
-const COMP_STATUS_RANK: Record<ComponentStatus, number> = { na: 0, not_completed: 1, partial: 2, completed: 3 };
+// ─── SOP drill-down modal ────────────────────────────────────────────────────
 
-function sopSortValue(s: SopBreakdown, key: string): string | number {
-  if (key === 'sopName') return s.sopName.toLowerCase();
-  if (key === 'status') return SOP_STATUS_RANK[s.status];
-  return COMP_STATUS_RANK[s.components[key as ComponentKey]];
-}
-
-// ─── Drill-down modal ────────────────────────────────────────────────────────
-
-type DrillState =
-  | { kind: 'status'; record: EmployeeTrainingRecord; status: SopStatus }
-  | { kind: 'month';  record: EmployeeTrainingRecord; month: number };
-
-function StatPill({ label, value, tone }: { label: string; value: number; tone: string }) {
-  return (
-    <span className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold ${tone}`}>
-      {value} {label}
-    </span>
-  );
-}
-
-function DrillDownModal({ drill, onClose }: { drill: DrillState; onClose: () => void }) {
-  const { record } = drill;
+function SopDrillDownModal({
+  drill, records, dept, onClose,
+}: {
+  drill: SopGridDrill;
+  records: EmployeeTrainingRecord[];
+  dept: string;
+  onClose: () => void;
+}) {
+  const { row: sop } = drill;
   const [query, setQuery] = useState('');
-  const [sort, setSort]   = useState<SortState>({ key: 'sopName', dir: 'asc' });
-  const onSort = (key: string) => setSort((prev) => nextSort(prev, key, key === 'sopName' ? 'asc' : 'desc'));
-
-  const sops = useMemo(() =>
-    drill.kind === 'status'
-      ? record.sops.filter((s) => s.status === drill.status)
-      : record.sops.filter((s) => s.months.includes(drill.month)),
-    [drill, record],
-  );
 
   const rows = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    const filtered = q
-      ? sops.filter((s) => `${s.sopName} ${s.sopCode}`.toLowerCase().includes(q))
-      : sops;
-    const dir = sort.dir === 'asc' ? 1 : -1;
-    return [...filtered].sort((a, b) => {
-      const va = sopSortValue(a, sort.key);
-      const vb = sopSortValue(b, sort.key);
-      if (va < vb) return -dir;
-      if (va > vb) return dir;
-      return a.sopName.localeCompare(b.sopName);
+    const scoped = dept === 'All' ? records : records.filter((r) => (r.department || 'Unknown') === dept);
+    const matches = scoped.flatMap((emp) => {
+      const hit = emp.sops.find((s) => (s.sopKey || s.sopCode.toUpperCase()) === sop.sopKey);
+      if (!hit) return [];
+      if (drill.kind === 'status' && hit.status !== drill.status) return [];
+      if (drill.kind === 'month') {
+        if (!hit.months.includes(drill.month)) return [];
+        if (hit.status !== drill.status) return [];
+      }
+      return [{ emp, hit }];
     });
-  }, [sops, query, sort]);
+    const q = query.trim().toLowerCase();
+    if (!q) return matches;
+    return matches.filter((item) =>
+      `${item.emp.employeeName} ${item.emp.designation} ${item.emp.department}`.toLowerCase().includes(q),
+    );
+  }, [drill, records, dept, sop.sopKey, query]);
 
   const title =
     drill.kind === 'status'
       ? SOP_STATUS_META[drill.status].label
-      : `${MONTHS_FULL[drill.month - 1]} — Scheduled SOPs`;
+      : `${MONTHS_FULL[drill.month - 1]} — ${SOP_STATUS_META[drill.status].label}`;
   const titleChip =
     drill.kind === 'status' ? SOP_STATUS_META[drill.status].chip : 'bg-blue-100 text-blue-700';
-
-  // Summary tallies for the SOPs in view.
-  const examCount      = sops.filter((s) => s.hasExam).length;
-  const completedCount = sops.filter((s) => s.status === 'completed').length;
-  const partialCount   = sops.filter((s) => s.status === 'partial').length;
-  const pendingCount   = sops.filter((s) => s.status === 'not_completed').length;
+  const gujaratiRe = /[\u0A80-\u0AFF]/;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
-      <div
-        className="flex max-h-[85vh] w-full max-w-4xl flex-col overflow-hidden rounded-2xl bg-white shadow-xl"
-        onClick={(e) => e.stopPropagation()}
-      >
+      <div className="flex max-h-[85vh] w-full max-w-3xl flex-col overflow-hidden rounded-2xl bg-white shadow-xl" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-start justify-between border-b border-gray-200 px-5 py-4">
-          <div>
-            <h2 className="text-sm font-bold text-gray-900">{record.employeeName}</h2>
-            <p className="mt-0.5 text-xs text-gray-400">{record.designation} · {record.department}</p>
-            <div className="mt-2 flex flex-wrap items-center gap-1.5">
-              <span className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold ${titleChip}`}>
-                {title} · {sops.length} SOP{sops.length !== 1 ? 's' : ''}
-              </span>
-              {drill.kind === 'month' && (
-                <>
-                  {completedCount > 0 && <StatPill label="completed" value={completedCount} tone="bg-green-100 text-green-700" />}
-                  {partialCount   > 0 && <StatPill label="partial"   value={partialCount}   tone="bg-amber-100 text-amber-700" />}
-                  {pendingCount   > 0 && <StatPill label="pending"   value={pendingCount}   tone="bg-gray-100 text-gray-600" />}
-                </>
-              )}
-              {examCount > 0 && (
-                <span className="inline-flex items-center gap-1 rounded-full bg-purple-100 px-2.5 py-1 text-xs font-semibold text-purple-700">
-                  <ListChecks className="h-3.5 w-3.5" /> {examCount} with exam
-                </span>
-              )}
-            </div>
+          <div className="min-w-0 flex-1 pr-4">
+            <p className="font-semibold text-gray-900 leading-tight">{sop.sopName}</p>
+            {sop.sopNameGujarati && gujaratiRe.test(sop.sopNameGujarati) && (
+              <p className="mt-0.5 text-xs font-medium text-indigo-700 leading-tight">{sop.sopNameGujarati}</p>
+            )}
+            <p className="mt-0.5 text-xs text-gray-400">{sop.sopCode}</p>
+            <span className={`mt-2 inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${titleChip}`}>
+              {title} · {rows.length} employee{rows.length !== 1 ? 's' : ''}
+            </span>
           </div>
           <button onClick={onClose} className="rounded-lg p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-700">
             <X className="h-5 w-5" />
           </button>
         </div>
-
-        {/* Search within the drill-down */}
-        {sops.length > 0 && (
-          <div className="flex items-center gap-2 border-b border-gray-100 px-5 py-2.5">
-            <div className="relative flex-1 max-w-xs">
+        {rows.length > 3 && (
+          <div className="border-b border-gray-100 px-5 py-2.5">
+            <div className="relative max-w-xs">
               <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-gray-400" />
               <input
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="Search SOP name or code…"
+                placeholder="Search employee…"
                 className="w-full rounded-lg border border-gray-200 bg-white py-1.5 pl-8 pr-8 text-xs focus:border-purple-300 focus:outline-none"
               />
-              {query && (
-                <button onClick={() => setQuery('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-300 hover:text-gray-600">
-                  <X className="h-3.5 w-3.5" />
-                </button>
-              )}
             </div>
-            <span className="text-xs text-gray-400">{rows.length} of {sops.length}</span>
           </div>
         )}
-
         <div className="overflow-auto">
-          {sops.length === 0 ? (
-            <p className="py-12 text-center text-sm text-gray-400">No SOPs in this category.</p>
-          ) : rows.length === 0 ? (
-            <p className="py-12 text-center text-sm text-gray-400">No SOPs match your search.</p>
+          {rows.length === 0 ? (
+            <p className="py-12 text-center text-sm text-gray-400">No employees in this category.</p>
           ) : (
             <table className="w-full text-left text-sm">
-              <thead className="sticky top-0 bg-gray-50 border-b border-gray-200">
+              <thead className="sticky top-0 border-b border-gray-200 bg-gray-50">
                 <tr>
-                  <SortHeader label="SOP" sortKey="sopName" sort={sort} onSort={onSort} cls="px-4 py-2.5" />
-                  <SortHeader label="Status" sortKey="status" sort={sort} onSort={onSort} cls="px-4 py-2.5" />
-                  {COMPONENT_META.map(({ key, label, Icon }) => (
-                    <SortHeader
-                      key={key}
-                      sortKey={key}
-                      sort={sort}
-                      onSort={onSort}
-                      cls="px-4 py-2.5"
-                      label={<span className="inline-flex items-center gap-1"><Icon className="h-3.5 w-3.5" /> {label}</span>}
-                    />
-                  ))}
+                  <th className="px-4 py-2.5 text-xs font-semibold uppercase tracking-wider text-gray-500">Employee</th>
+                  <th className="px-4 py-2.5 text-xs font-semibold uppercase tracking-wider text-gray-500">Designation</th>
+                  <th className="px-4 py-2.5 text-xs font-semibold uppercase tracking-wider text-gray-500">Department</th>
+                  <th className="px-4 py-2.5 text-xs font-semibold uppercase tracking-wider text-gray-500">Status</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-100">
-                {rows.map((s) => (
-                  <tr key={s.sopCode} className="hover:bg-gray-50">
-                    <td className="px-4 py-3 align-top">
-                      <p className="font-semibold text-gray-900 leading-tight">{s.sopName}</p>
-                      <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
-                        <span className="text-xs text-gray-400">{s.sopCode}</span>
-                        {s.hasExam && (
-                          <span className="inline-flex items-center gap-0.5 rounded bg-purple-50 px-1.5 py-0.5 text-[10px] font-semibold text-purple-600">
-                            <ListChecks className="h-3 w-3" /> Exam
-                          </span>
-                        )}
-                        {drill.kind === 'status' && s.months.length > 0 && (
-                          <span className="rounded bg-blue-50 px-1.5 py-0.5 text-[10px] font-semibold text-blue-600">
-                            {s.months.map((m) => MONTHS[m - 1]).join(', ')}
-                          </span>
-                        )}
-                      </div>
-                    </td>
-                    <td className="px-4 py-3 align-top">
-                      <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold ${SOP_STATUS_META[s.status].chip}`}>
-                        {SOP_STATUS_META[s.status].label}
+                {rows.map((row) => (
+                  <tr key={row.emp.employeeId} className="hover:bg-gray-50">
+                    <td className="px-4 py-3 font-medium text-gray-900">{row.emp.employeeName}</td>
+                    <td className="px-4 py-3 text-gray-600">{row.emp.designation || '—'}</td>
+                    <td className="px-4 py-3 text-gray-600">{row.emp.department || '—'}</td>
+                    <td className="px-4 py-3">
+                      <span className={`inline-flex rounded-full px-2 py-0.5 text-xs font-semibold ${SOP_STATUS_META[row.hit.status].chip}`}>
+                        {SOP_STATUS_META[row.hit.status].label}
                       </span>
                     </td>
-                    {COMPONENT_META.map(({ key }) => (
-                      <td key={key} className="px-4 py-3 align-top">
-                        <ComponentBadge status={s.components[key]} />
-                      </td>
-                    ))}
                   </tr>
                 ))}
               </tbody>
@@ -311,6 +369,8 @@ function DrillDownModal({ drill, onClose }: { drill: DrillState; onClose: () => 
   );
 }
 
+type ViewMode = 'employee' | 'sop';
+
 // ─── Page ────────────────────────────────────────────────────────────────────
 
 export default function EmployeeTrainingDashboardPage() {
@@ -318,81 +378,131 @@ export default function EmployeeTrainingDashboardPage() {
   const router = useRouter();
 
   const [records, setRecords] = useState<EmployeeTrainingRecord[]>([]);
+  const [registry, setRegistry] = useState<RegistrySOP[]>([]);
+  const [sopStats, setSopStats] = useState<DashboardStats | null>(null);
   const [loading, setLoading] = useState(true);
   const [dept,    setDept]    = useState('All');
   const [search,  setSearch]  = useState('');
   const [filter,  setFilter]  = useState<'all' | EmpStatus>('all');
-  const [sort,    setSort]    = useState<SortState>({ key: 'name', dir: 'asc' });
-  const [drill,   setDrill]   = useState<DrillState | null>(null);
-
-  const onSort = (key: string) => setSort((prev) => nextSort(prev, key, key === 'name' || key === 'designation' || key === 'department' ? 'asc' : 'desc'));
+  const [viewMode, setViewMode] = useState<ViewMode>('employee');
+  const [sopDrill, setSopDrill] = useState<SopGridDrill | null>(null);
 
   useEffect(() => {
     if (authStatus === 'unauthenticated') router.push('/login');
   }, [authStatus, router]);
 
   const load = useCallback(async (force = false) => {
-    const field = lmsClientFields.adminEmployeeTraining(dept);
+    const field = lmsClientFields.adminEmployeeTraining('all');
     const cached = !force ? readLmsClientCache<{ records: EmployeeTrainingRecord[] }>(field) : null;
     if (cached?.value) {
       setRecords(cached.value.records || []);
-      setLoading(false);
-      if (Date.now() - cached.cachedAt <= LMS_CLIENT_FRESH_MS) return;
+      if (!force && Date.now() - cached.cachedAt <= LMS_CLIENT_FRESH_MS) {
+        setLoading(false);
+      }
     } else {
       setLoading(true);
     }
     try {
-      const params = new URLSearchParams();
-      if (dept !== 'All') params.set('department', dept);
-      const res  = await fetch(`/api/lms/admin/employee-training?${params}`);
-      const json = await res.json();
-      const recs = json.records || [];
-      setRecords(recs);
-      writeLmsClientCache(field, { records: recs });
+      const [trainingRes, statsRes, registryRes] = await Promise.all([
+        fetch('/api/lms/admin/employee-training', { cache: 'no-store' }),
+        fetch('/api/sops/stats', { cache: 'no-store' }),
+        fetch('/api/sops?all=1', { cache: 'no-store' }),
+      ]);
+      if (trainingRes.ok) {
+        const json = await trainingRes.json();
+        const recs = json.records || [];
+        setRecords(recs);
+        writeLmsClientCache(field, { records: recs });
+      }
+      if (statsRes.ok) setSopStats(await statsRes.json());
+      if (registryRes.ok) {
+        const json = await registryRes.json();
+        setRegistry((json.items || []).filter((r: RegistrySOP) => !r.isObsolete));
+      }
     } finally {
       setLoading(false);
     }
-  }, [dept]);
+  }, []);
 
   useEffect(() => { load(); }, [load]);
 
-  const visible = useMemo(() => {
+  const gridRows = useMemo((): EmployeeGridRow[] => {
     const q = search.trim().toLowerCase();
-    const filtered = records.filter((r) => {
-      if (q && !`${r.employeeName} ${r.designation} ${r.department}`.toLowerCase().includes(q)) return false;
-      if (filter !== 'all') return employeeStatus(r) === filter;
-      return true;
-    });
-    const dir = sort.dir === 'asc' ? 1 : -1;
-    const valueOf = (r: EmployeeTrainingRecord): string | number => {
-      switch (sort.key) {
-        case 'name':             return r.employeeName.toLowerCase();
-        case 'designation':      return (r.designation || '').toLowerCase();
-        case 'department':       return (r.department || '').toLowerCase();
-        case 'totalSops':        return r.totalSops;
-        case 'completedSops':    return r.completedSops;
-        case 'partialSops':      return r.partialSops;
-        case 'notCompletedSops': return r.notCompletedSops;
-        case 'overallPct':       return r.overallPct;
-        default:
-          if (sort.key.startsWith('m')) return r.monthlyCounts[Number(sort.key.slice(1))] ?? 0;
-          return 0;
-      }
-    };
-    return [...filtered].sort((a, b) => {
-      const va = valueOf(a);
-      const vb = valueOf(b);
-      if (va < vb) return -dir;
-      if (va > vb) return dir;
-      return a.employeeName.localeCompare(b.employeeName);
-    });
-  }, [records, search, filter, sort]);
+    return records
+      .filter((r) => {
+        if (dept !== 'All' && (r.department || 'Unknown') !== dept) return false;
+        if (q && !`${r.employeeName} ${r.designation} ${r.department}`.toLowerCase().includes(q)) return false;
+        if (filter !== 'all') return employeeStatus(r) === filter;
+        return true;
+      })
+      .map((r) => ({
+        employeeId:       r.employeeId,
+        employeeName:     r.employeeName,
+        designation:      r.designation,
+        department:       r.department,
+        isActive:         r.isActive,
+        totalSops:        r.totalSops,
+        completedSops:    r.completedSops,
+        partialSops:      r.partialSops,
+        notCompletedSops: r.notCompletedSops,
+        overallPct:       r.overallPct,
+        monthlyBreakdown: buildMonthlyBreakdown(r.sops),
+        sops:             r.sops,
+        trainingLoaded:   true,
+      }));
+  }, [records, dept, search, filter]);
 
-  const counts = useMemo(() => ({
-    completed:   records.filter((r) => employeeStatus(r) === 'completed').length,
-    in_progress: records.filter((r) => employeeStatus(r) === 'in_progress').length,
-    not_started: records.filter((r) => employeeStatus(r) === 'not_started').length,
-  }), [records]);
+  const trainingSopRows = useMemo(() => buildSopTrainingRows(records, 'All'), [records]);
+
+  const sopRows = useMemo((): SopGridRow[] => {
+    const q = search.trim().toLowerCase();
+    return buildRegistrySopRows(registry, trainingSopRows, dept).filter((row) => {
+      if (!q) return true;
+      const hay = `${row.sopName} ${row.sopNameGujarati || ''} ${row.sopCode} ${row.department}`.toLowerCase();
+      return hay.includes(q);
+    });
+  }, [registry, trainingSopRows, dept, search]);
+
+  // Employee metrics from training records; SOP totals from the dashboard registry
+  // (/api/sops/stats + /api/sops?all=1 — same source as the main SOP dashboard).
+  const capsules = useMemo<TrainingDeptCapsule[]>(() => {
+    const total = emptyDeptAcc();
+    const byDept = new Map<string, DeptAcc>();
+    for (const r of records) {
+      const name = r.department || 'Unknown';
+      if (!byDept.has(name)) byDept.set(name, emptyDeptAcc());
+      addToDeptAcc(byDept.get(name)!, r);
+      addToDeptAcc(total, r);
+    }
+    const statsByDept = new Map(
+      (sopStats?.departments ?? []).map((d) => [d.department, d.total]),
+    );
+    const rank = (d: string) => {
+      const i = DEPT_ORDER.findIndex((o) => d.toLowerCase().startsWith(o.toLowerCase()));
+      return i < 0 ? DEPT_ORDER.length : i;
+    };
+    const capsuleFor = (department: string, acc: DeptAcc): TrainingDeptCapsule => {
+      const deptScope = department === 'Total' ? 'All' : department;
+      const rows = buildRegistrySopRows(registry, trainingSopRows, deptScope);
+      const status = countRegistrySopStatus(rows);
+      return deptAccToCapsule(department, acc, {
+        totalSops: statsByDept.get(department) ?? rows.length,
+        ...status,
+      });
+    };
+    const depts = [...byDept.entries()]
+      .sort((a, b) => rank(a[0]) - rank(b[0]) || a[0].localeCompare(b[0]))
+      .map(([name, acc]) => capsuleFor(name, acc));
+    return [capsuleFor('Total', total), ...depts];
+  }, [records, registry, trainingSopRows, sopStats]);
+
+  const deptOptions = useMemo(
+    () => ['All', ...capsules.filter((c) => c.department !== 'Total').map((c) => c.department)],
+    [capsules],
+  );
+
+  const handleSelectDept = (department: string) =>
+    setDept((prev) => (prev === department ? 'All' : department));
 
   if (authStatus === 'loading') {
     return <div className="flex min-h-screen items-center justify-center"><Loader2 className="h-8 w-8 animate-spin text-purple-400" /></div>;
@@ -401,7 +511,7 @@ export default function EmployeeTrainingDashboardPage() {
   return (
     <div className="min-h-screen bg-gray-50">
       <header className="sticky top-0 z-20 border-b border-gray-200 bg-white/95 backdrop-blur">
-        <div className="mx-auto flex w-full max-w-screen-2xl items-center justify-between px-4 py-3 sm:px-6 lg:px-8">
+        <div className="mx-auto flex w-full max-w-[1920px] items-center justify-between px-2 py-3 sm:px-4">
           <div className="flex items-center gap-3">
             <Link href="/lms/admin" className="flex items-center gap-1 text-xs font-medium text-gray-500 hover:text-gray-800">
               <ArrowLeft className="h-3.5 w-3.5" /> Training Status
@@ -415,35 +525,41 @@ export default function EmployeeTrainingDashboardPage() {
         </div>
       </header>
 
-      <main className="mx-auto w-full max-w-screen-2xl px-4 py-6 sm:px-6 lg:px-8 space-y-5">
-        {/* Clickable summary cards */}
-        {!loading && records.length > 0 && (
-          <div className="grid grid-cols-3 gap-3 sm:grid-cols-3">
-            {([
-              { key: 'completed',   label: 'Fully Trained', count: counts.completed,   activeColor: 'bg-green-600 border-green-600 text-white', idleColor: 'text-green-700 bg-green-50 border-green-200 hover:bg-green-100' },
-              { key: 'in_progress', label: 'In Progress',   count: counts.in_progress, activeColor: 'bg-blue-500 border-blue-500 text-white',   idleColor: 'text-blue-700 bg-blue-50 border-blue-200 hover:bg-blue-100' },
-              { key: 'not_started', label: 'Not Started',   count: counts.not_started, activeColor: 'bg-gray-500 border-gray-500 text-white',   idleColor: 'text-gray-600 bg-gray-50 border-gray-200 hover:bg-gray-100' },
-            ] as const).map(({ key, label, count, activeColor, idleColor }) => (
-              <button
-                key={key}
-                onClick={() => setFilter((prev) => (prev === key ? 'all' : key))}
-                className={`rounded-xl border px-4 py-3 text-left transition-all ${filter === key ? activeColor : idleColor}`}
-              >
-                <p className="text-2xl font-bold">{count}</p>
-                <p className="text-xs font-medium opacity-90">{label}</p>
-              </button>
-            ))}
-          </div>
+      <main className="mx-auto w-full max-w-[1920px] px-2 py-6 sm:px-4 space-y-5">
+        {/* Department summary capsules */}
+        {!loading && registry.length > 0 && (
+          <TrainingDeptCapsules
+            capsules={capsules}
+            selected={dept}
+            onSelect={handleSelectDept}
+          />
         )}
 
-        {/* Search + department + clear */}
+        {/* Search + department + view toggle */}
         <div className="flex flex-wrap items-center gap-2">
+          <div className="flex rounded-lg border border-gray-200 bg-white p-0.5">
+            <button
+              type="button"
+              onClick={() => setViewMode('employee')}
+              className={`rounded-md px-3 py-1.5 text-xs font-semibold transition ${viewMode === 'employee' ? 'bg-purple-600 text-white' : 'text-gray-600 hover:bg-gray-50'}`}
+            >
+              By Employee
+            </button>
+            <button
+              type="button"
+              onClick={() => setViewMode('sop')}
+              className={`rounded-md px-3 py-1.5 text-xs font-semibold transition ${viewMode === 'sop' ? 'bg-purple-600 text-white' : 'text-gray-600 hover:bg-gray-50'}`}
+            >
+              By SOP
+            </button>
+          </div>
+
           <div className="relative flex-1 min-w-52 max-w-sm">
             <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-gray-400" />
             <input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search name, designation, department…"
+              placeholder={viewMode === 'employee' ? 'Search name, designation, department…' : 'Search SOP name, code…'}
               className="w-full rounded-lg border border-gray-200 bg-white py-2 pl-8 pr-8 text-xs focus:border-purple-300 focus:outline-none"
             />
             {search && (
@@ -459,7 +575,7 @@ export default function EmployeeTrainingDashboardPage() {
               onChange={(e) => setDept(e.target.value)}
               className="appearance-none rounded-lg border border-gray-200 bg-white py-2 pl-3 pr-7 text-xs font-medium text-gray-600 focus:outline-none"
             >
-              {DEPARTMENTS.map((d) => <option key={d} value={d}>{d}</option>)}
+              {deptOptions.map((d) => <option key={d} value={d}>{d}</option>)}
             </select>
             <ChevronDown className="pointer-events-none absolute right-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-gray-400" />
           </div>
@@ -473,154 +589,36 @@ export default function EmployeeTrainingDashboardPage() {
             </button>
           )}
 
-          <span className="ml-auto text-xs text-gray-400">{visible.length} employee{visible.length !== 1 ? 's' : ''}</span>
+          <span className="ml-auto text-xs text-gray-400">
+            {viewMode === 'employee'
+              ? `${gridRows.length} employee${gridRows.length !== 1 ? 's' : ''}`
+              : `${sopRows.length} SOP${sopRows.length !== 1 ? 's' : ''}`}
+          </span>
         </div>
 
-        {loading ? (
-          <div className="flex items-center justify-center py-20">
-            <Loader2 className="h-8 w-8 animate-spin text-purple-400" />
-          </div>
-        ) : visible.length === 0 ? (
-          <div className="rounded-xl border border-gray-200 bg-white py-16 text-center">
-            <p className="text-sm font-medium text-gray-500">No records found</p>
+        {viewMode === 'employee' ? (
+          <div className="flex min-h-[calc(100vh-16rem)] flex-col">
+            <EmployeeTrainingGrid
+              rows={gridRows}
+              rosterLoading={loading}
+              trainingLoading={false}
+              showActions={false}
+            />
           </div>
         ) : (
-          <div className="rounded-xl border border-gray-200 bg-white shadow-sm overflow-x-auto">
-            <table className="w-full text-left text-sm">
-              <thead className="bg-gray-50 border-b border-gray-200">
-                <tr>
-                  <SortHeader label="Employee"      sortKey="name"             sort={sort} onSort={onSort} />
-                  <SortHeader label="Designation"   sortKey="designation"      sort={sort} onSort={onSort} />
-                  <SortHeader label="Department"    sortKey="department"       sort={sort} onSort={onSort} />
-                  <SortHeader label="Total SOPs"    sortKey="totalSops"        sort={sort} onSort={onSort} align="center" />
-                  <SortHeader label="Completed"     sortKey="completedSops"    sort={sort} onSort={onSort} align="center" />
-                  <SortHeader label="Partial"       sortKey="partialSops"      sort={sort} onSort={onSort} align="center" />
-                  <SortHeader label="Not Completed" sortKey="notCompletedSops" sort={sort} onSort={onSort} align="center" />
-                  {MONTHS.map((m, i) => (
-                    <SortHeader key={m} label={m} sortKey={`m${i}`} sort={sort} onSort={onSort} align="center" cls="px-2 py-3" />
-                  ))}
-                  <SortHeader label="Overall %"     sortKey="overallPct"       sort={sort} onSort={onSort} />
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-gray-100">
-                {visible.map((r) => {
-                  const empStatus = employeeStatus(r);
-                  return (
-                    <tr key={r.employeeId} className={`hover:bg-gray-50 ${!r.isActive ? 'opacity-60' : ''}`}>
-                      {/* Employee */}
-                      <td className="px-4 py-3">
-                        <div className="flex items-center gap-3">
-                          <div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-sm font-bold ${r.isActive ? 'bg-purple-100 text-purple-700' : 'bg-gray-100 text-gray-400'}`}>
-                            {r.employeeName.charAt(0)}
-                          </div>
-                          <p className="font-semibold text-gray-900 leading-tight">
-                            {r.employeeName}
-                            {!r.isActive && (
-                              <span className="ml-1.5 rounded-full bg-red-100 px-1.5 py-0.5 text-[10px] font-semibold text-red-600">Left</span>
-                            )}
-                          </p>
-                        </div>
-                      </td>
-
-                      <td className="px-4 py-3 text-gray-600">{r.designation || '—'}</td>
-                      <td className="px-4 py-3 text-gray-600">{r.department || '—'}</td>
-                      <td className="px-4 py-3 text-center font-semibold text-gray-700">{r.totalSops}</td>
-
-                      {/* Clickable counts */}
-                      <td className="px-4 py-3 text-center">
-                        <CountCell
-                          count={r.completedSops}
-                          tone="green"
-                          onClick={() => r.completedSops > 0 && setDrill({ kind: 'status', record: r, status: 'completed' })}
-                        />
-                      </td>
-                      <td className="px-4 py-3 text-center">
-                        <CountCell
-                          count={r.partialSops}
-                          tone="amber"
-                          onClick={() => r.partialSops > 0 && setDrill({ kind: 'status', record: r, status: 'partial' })}
-                        />
-                      </td>
-                      <td className="px-4 py-3 text-center">
-                        <CountCell
-                          count={r.notCompletedSops}
-                          tone="gray"
-                          onClick={() => r.notCompletedSops > 0 && setDrill({ kind: 'status', record: r, status: 'not_completed' })}
-                        />
-                      </td>
-
-                      {/* Per-month assigned SOP counts */}
-                      {r.monthlyCounts.map((c, i) => (
-                        <td key={i} className="px-2 py-3 text-center">
-                          {c > 0 ? (
-                            <button
-                              onClick={() => setDrill({ kind: 'month', record: r, month: i + 1 })}
-                              title={`View SOPs scheduled in ${MONTHS_FULL[i]}`}
-                              className="inline-flex h-6 min-w-6 items-center justify-center rounded-md bg-blue-50 px-1.5 text-xs font-semibold text-blue-700 transition hover:bg-blue-100"
-                            >
-                              {c}
-                            </button>
-                          ) : (
-                            <span className="text-xs text-gray-200">·</span>
-                          )}
-                        </td>
-                      ))}
-
-                      {/* Overall % */}
-                      <td className="px-4 py-3">
-                        {r.totalSops === 0 ? (
-                          <span className="text-xs text-gray-400 italic">No SOPs</span>
-                        ) : (
-                          <div className="flex items-center gap-2">
-                            <div className="h-2 w-28 overflow-hidden rounded-full bg-gray-100">
-                              <div
-                                className={`h-full rounded-full transition-all ${empStatus === 'completed' ? 'bg-green-500' : 'bg-purple-500'}`}
-                                style={{ width: `${r.overallPct}%` }}
-                              />
-                            </div>
-                            <span className="text-xs font-bold text-gray-700">{r.overallPct}%</span>
-                          </div>
-                        )}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+          <div className="flex min-h-[calc(100vh-16rem)] flex-col">
+            <SopTrainingGrid
+              rows={sopRows}
+              loading={loading}
+              onDrill={setSopDrill}
+            />
           </div>
         )}
       </main>
 
-      {drill && (
-        <DrillDownModal drill={drill} onClose={() => setDrill(null)} />
+      {sopDrill && (
+        <SopDrillDownModal drill={sopDrill} records={records} dept={dept} onClose={() => setSopDrill(null)} />
       )}
     </div>
-  );
-}
-
-function CountCell({
-  count,
-  tone,
-  onClick,
-}: {
-  count: number;
-  tone: 'green' | 'amber' | 'gray';
-  onClick: () => void;
-}) {
-  if (count === 0) {
-    return <span className="text-sm text-gray-300">0</span>;
-  }
-  const toneCls =
-    tone === 'green' ? 'bg-green-50 text-green-700 hover:bg-green-100' :
-    tone === 'amber' ? 'bg-amber-50 text-amber-700 hover:bg-amber-100' :
-    'bg-gray-100 text-gray-600 hover:bg-gray-200';
-  return (
-    <button
-      onClick={onClick}
-      className={`inline-flex h-7 min-w-7 items-center justify-center rounded-full px-2 text-sm font-bold transition ${toneCls}`}
-      title="View component breakdown"
-    >
-      {count}
-    </button>
   );
 }

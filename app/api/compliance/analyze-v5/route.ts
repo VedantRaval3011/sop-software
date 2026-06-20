@@ -7,6 +7,8 @@ import { analyzeSOPComplianceV5, type SopLibraryEntry } from "@/lib/complianceEn
 import { saveComplianceReport } from "@/lib/complianceReportStorage";
 import { extractClauses } from "@/lib/ocrProcessor";
 import { requireAuth } from "@/lib/withAuth";
+import { getComplianceProvider } from "@/lib/llm";
+import { warmupOllamaComplianceModel } from "@/lib/ollama-warmup";
 
 const MAX_CLAUSE_TEXT = 4000;
 
@@ -137,6 +139,10 @@ export async function POST(request: NextRequest) {
       isObsolete: s.isObsolete,
       expiryDate: s.expiryDate ?? null,
     }));
+
+    if (getComplianceProvider() === "ollama") {
+      await warmupOllamaComplianceModel();
+    }
 
     const result = await analyzeSOPComplianceV5({
       sopIdentifier: sop.identifier,

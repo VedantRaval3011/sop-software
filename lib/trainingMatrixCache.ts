@@ -2,7 +2,7 @@ import SystemCache from '@/models/SystemCache';
 
 // Bump the version suffix whenever the payload shape changes so stale snapshots
 // (memory or persisted) are ignored after a deploy.
-const CACHE_KEY = 'training-matrix-overview:v51';
+const CACHE_KEY = 'training-matrix-overview:v57';
 
 export type TrainingMatrixCacheEntry = { computedAt: number; payload: unknown };
 
@@ -72,11 +72,8 @@ export async function invalidateTrainingMatrixCache() {
   // Clear the in-memory copy so we don't keep serving it as "fresh".
   (globalThis as { __tm_overview_cache?: MemoryCacheEntry }).__tm_overview_cache = undefined;
   try {
-    // Mark the durable snapshot STALE (computedAt=0) rather than deleting it. The
-    // next request then still serves this snapshot instantly and triggers a
-    // background recompute — so no user ever blocks on a from-scratch rebuild
-    // after an Update. The snapshot's data is briefly behind until the background
-    // refresh lands; the user who clicked Update gets fresh data via ?refresh=1.
+    // Mark the durable snapshot STALE (computedAt=0). The next overview GET
+    // recomputes synchronously so assigned-SOP counts reflect Manage SOP edits.
     await SystemCache.updateOne({ key: CACHE_KEY }, { $set: { computedAt: 0 } });
   } catch {
     // Best-effort.

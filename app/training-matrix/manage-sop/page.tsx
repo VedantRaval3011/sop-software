@@ -17,6 +17,7 @@ import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
 import * as XLSX from 'xlsx';
 import { useAuthGuard } from '@/hooks/useAuthGuard';
+import { sopCodeMatchesSearch } from '@/lib/sopIdentifierNormalize';
 
 const MONTH_SHORT = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
 const MONTH_FULL = ['JANUARY', 'FEBRUARY', 'MARCH', 'APRIL', 'MAY', 'JUNE', 'JULY', 'AUGUST', 'SEPTEMBER', 'OCTOBER', 'NOVEMBER', 'DECEMBER'];
@@ -109,6 +110,7 @@ function cleanSopName(raw: string): string {
 interface ManageSOPViewResponse {
   sops: Array<{
     sopCode: string;
+    displaySopCode?: string;
     sopName: string;
     gujaratiName?: string;
     isDualLanguage?: boolean;
@@ -142,12 +144,10 @@ interface ManageSOPViewResponse {
   year: number | 'all';
 }
 
-const MANAGE_SOP_VIEW_LOCAL_CACHE_KEY = 'manage_sop_view_cache_v6';
-const ESTIMATED_ROW_HEIGHT = 132;
-const ESTIMATED_ROW_HEIGHT_EMPLOYEE = 160;
+const MANAGE_SOP_VIEW_LOCAL_CACHE_KEY = 'manage_sop_view_cache_v8';
+const TRAINING_MATRIX_OVERVIEW_CACHE_KEY = 'training_matrix_overview_cache_v6';
+const TRAINING_MATRIX_NEEDS_REFRESH_KEY = 'training_matrix_needs_refresh_v1';
 const EMPLOYEE_DISPLAY_COLUMNS = 3;
-const ROW_OVERSCAN = 3;
-const ROW_OVERSCAN_EMPLOYEE = 1;
 
 function chunkIntoColumns<T>(items: T[], columnCount: number): T[][] {
   if (items.length === 0) return Array.from({ length: columnCount }, () => []);
@@ -160,13 +160,28 @@ function chunkIntoColumns<T>(items: T[], columnCount: number): T[][] {
 const desigKeyHelper = (dept: string, abbr: string) => `${dept}|${abbr}`;
 const cellInnerKeyHelper = (dept: string, month: number) => `${dept}|${month}`;
 
+function isValidManageSopViewResponse(parsed: unknown): parsed is ManageSOPViewResponse {
+  if (!parsed || typeof parsed !== 'object') return false;
+  const p = parsed as ManageSOPViewResponse;
+  if (!Array.isArray(p.sops) || p.sops.length === 0) return false;
+  if (!Array.isArray(p.departments) || p.departments.length === 0) return false;
+  // Reject truncated / corrupt snapshots missing per-row dept stats.
+  return p.sops.every(
+    (s) =>
+      typeof s.sopCode === 'string' &&
+      s.sopCode.trim().length > 0 &&
+      Array.isArray(s.deptStats) &&
+      s.deptStats.length > 0,
+  );
+}
+
 function readManageSopLocalCache(): ManageSOPViewResponse | null {
   try {
     if (typeof window === 'undefined') return null;
     const raw = window.localStorage.getItem(MANAGE_SOP_VIEW_LOCAL_CACHE_KEY);
     if (!raw) return null;
-    const parsed = JSON.parse(raw) as ManageSOPViewResponse;
-    if (!parsed || !Array.isArray(parsed.sops) || !Array.isArray(parsed.departments)) return null;
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isValidManageSopViewResponse(parsed)) return null;
     return parsed;
   } catch {
     return null;
@@ -798,8 +813,9 @@ export default function ManageSOPDashboard() {
       try {
         if (typeof window !== 'undefined') {
           localStorage.removeItem(MANAGE_SOP_VIEW_LOCAL_CACHE_KEY);
-          localStorage.removeItem('training_matrix_overview_cache_v5');
+          localStorage.removeItem(TRAINING_MATRIX_OVERVIEW_CACHE_KEY);
           localStorage.removeItem('induction_training_matrix_overview_cache_v5');
+          localStorage.setItem(TRAINING_MATRIX_NEEDS_REFRESH_KEY, String(Date.now()));
         }
       } catch { /* storage unavailable — non-fatal */ }
 
@@ -826,6 +842,24 @@ export default function ManageSOPDashboard() {
         try {
           if (typeof window !== 'undefined') {
             localStorage.setItem(MANAGE_SOP_VIEW_LOCAL_CACHE_KEY, JSON.stringify(fresh));
+          }
+        } catch { /* non-fatal */ }
+
+        // Pre-warm the training-matrix overview cache so assigned-SOP counts match
+        // manage-sops when the user navigates back to the main matrix page.
+        try {
+          const overviewRes = await fetch('/api/training-matrix/overview?refresh=1', {
+            cache: 'no-store',
+          });
+          if (overviewRes.ok && typeof window !== 'undefined') {
+            const overview = await overviewRes.json();
+            if (overview?.success) {
+              localStorage.setItem(
+                TRAINING_MATRIX_OVERVIEW_CACHE_KEY,
+                JSON.stringify({ payload: overview, cachedAt: Date.now() }),
+              );
+              localStorage.removeItem(TRAINING_MATRIX_NEEDS_REFRESH_KEY);
+            }
           }
         } catch { /* non-fatal */ }
 
@@ -1065,15 +1099,35 @@ export default function ManageSOPDashboard() {
 
     const controller = new AbortController();
     const fetchData = async () => {
+      let hadData = !!cached;
       try {
-        if (!viewData && !cached) setLoading(true);
+        if (!cached) setLoading(true);
         else setRefreshing(true);
-        // Always rebuild on load so a reload never reapplies a stale server snapshot
-        // over fresher data written by the last Update.
-        const url = '/api/training-matrix/manage-sop-view?year=all&refresh=1';
-        const res = await fetch(url, { cache: 'no-store', signal: controller.signal });
-        if (!res.ok) throw new Error('Failed to fetch');
-        const data: ManageSOPViewResponse = await res.json();
+
+        // Fast path: serve the server snapshot immediately (no heavy rebuild).
+        const fastRes = await fetch('/api/training-matrix/manage-sop-view?year=all', {
+          cache: 'no-store',
+          signal: controller.signal,
+        });
+        if (fastRes.ok) {
+          const fast = (await fastRes.json()) as ManageSOPViewResponse;
+          if (isValidManageSopViewResponse(fast)) {
+            setViewData(fast);
+            hadData = true;
+            setLoading(false);
+          }
+        }
+
+        // Fresh rebuild so reload never keeps a stale snapshot after an Update.
+        const freshRes = await fetch('/api/training-matrix/manage-sop-view?year=all&refresh=1', {
+          cache: 'no-store',
+          signal: controller.signal,
+        });
+        if (!freshRes.ok) throw new Error('Failed to fetch');
+        const data = (await freshRes.json()) as ManageSOPViewResponse;
+        if (!isValidManageSopViewResponse(data)) {
+          throw new Error('Incomplete SOP data received from server');
+        }
         setViewData(data);
         try {
           if (typeof window !== 'undefined') {
@@ -1085,7 +1139,7 @@ export default function ManageSOPDashboard() {
         setError('');
       } catch (err) {
         if (controller.signal.aborted) return;
-        if (!viewData) {
+        if (!hadData) {
           setError(err instanceof Error ? err.message : 'Unknown error');
         }
         console.error(err);
@@ -1151,7 +1205,8 @@ export default function ManageSOPDashboard() {
 
       if (q) {
         const textMatch =
-          code.toLowerCase().includes(q) || name.toLowerCase().includes(q);
+          sopCodeMatchesSearch(q, code, sop.displaySopCode) ||
+          name.toLowerCase().includes(q);
         if (textMatch) return true;
 
         // Employee-name search should match only when that employee is actually
@@ -1931,8 +1986,7 @@ export default function ManageSOPDashboard() {
               </thead>
 
               <CountsContext.Provider value={countsAPI}>
-              <VirtualizedSopRows
-                scrollRef={tableScrollRef}
+              <SopRowsBody
                 filteredSops={filteredSops}
                 viewMode={viewMode}
                 unassignedSet={unassignedSet}
@@ -2514,11 +2568,11 @@ export default function ManageSOPDashboard() {
   );
 }
 
-// ─── VirtualizedSopRows ───────────────────────────────────────────────────────
-// Scroll-driven windowing lives here so vertical scroll does not re-render the
-// full dashboard (header, modals, stats cards, etc.).
-interface VirtualizedSopRowsProps {
-  scrollRef: React.RefObject<HTMLDivElement | null>;
+// ─── SopRowsBody ─────────────────────────────────────────────────────────────
+// Renders every filtered row in the DOM. SopRow is memoized so scrolling does not
+// re-render the dashboard chrome; table row windowing was removed because spacer
+// `<tr>` heights are unreliable in browsers and caused intermittent blank gaps.
+interface SopRowsBodyProps {
   filteredSops: ManageSOPViewResponse['sops'];
   viewMode: 'designation' | 'employee';
   unassignedSet: Set<string>;
@@ -2546,8 +2600,7 @@ interface VirtualizedSopRowsProps {
   searchQuery: string;
 }
 
-const VirtualizedSopRows = memo(function VirtualizedSopRows({
-  scrollRef,
+const SopRowsBody = memo(function SopRowsBody({
   filteredSops,
   viewMode,
   unassignedSet,
@@ -2573,125 +2626,7 @@ const VirtualizedSopRows = memo(function VirtualizedSopRows({
   toggleMonthCell,
   openCountPopup,
   searchQuery,
-}: VirtualizedSopRowsProps) {
-  const [scrollTop, setScrollTop] = useState(0);
-  const [viewportHeight, setViewportHeight] = useState(720);
-  const scrollRafRef = useRef<number | null>(null);
-  const pendingScrollTopRef = useRef(0);
-  // Measured row heights keyed by index. The fixed ESTIMATED_ROW_HEIGHT is only a
-  // seed — actual rows (7 department sub-rows) are much taller, and a wrong estimate
-  // makes the spacer padding drift out of sync with the browser's real layout,
-  // pushing the rendered window off-screen (the "blank rows" bug). Measuring after
-  // render keeps the offsets exact regardless of how tall a row turns out to be.
-  const rowHeightsRef = useRef<number[]>([]);
-  const [measureTick, setMeasureTick] = useState(0);
-
-  // Reset measurements when the row set or layout mode changes — index→row mapping
-  // (and therefore height) is no longer valid.
-  useLayoutEffect(() => {
-    rowHeightsRef.current = [];
-    setMeasureTick((t) => t + 1);
-  }, [filteredSops, viewMode]);
-
-  useLayoutEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-
-    const syncViewport = () => setViewportHeight(el.clientHeight);
-    syncViewport();
-    setScrollTop(el.scrollTop);
-
-    const onScroll = () => {
-      pendingScrollTopRef.current = el.scrollTop;
-      if (scrollRafRef.current !== null) return;
-      scrollRafRef.current = requestAnimationFrame(() => {
-        scrollRafRef.current = null;
-        setScrollTop(pendingScrollTopRef.current);
-      });
-    };
-
-    el.addEventListener('scroll', onScroll, { passive: true });
-    const ro = new ResizeObserver(syncViewport);
-    ro.observe(el);
-
-    return () => {
-      el.removeEventListener('scroll', onScroll);
-      ro.disconnect();
-      if (scrollRafRef.current !== null) {
-        cancelAnimationFrame(scrollRafRef.current);
-        scrollRafRef.current = null;
-      }
-    };
-  }, [scrollRef, filteredSops.length, viewMode]);
-
-  // Cumulative pixel offsets built from measured heights (estimate for unmeasured
-  // rows). offsets[i] = top of row i; offsets[n] = total content height.
-  const { offsets, totalHeight } = useMemo(() => {
-    const est = viewMode === 'employee' ? ESTIMATED_ROW_HEIGHT_EMPLOYEE : ESTIMATED_ROW_HEIGHT;
-    const n = filteredSops.length;
-    const offs = new Array<number>(n + 1);
-    offs[0] = 0;
-    for (let i = 0; i < n; i++) offs[i + 1] = offs[i] + (rowHeightsRef.current[i] || est);
-    return { offsets: offs, totalHeight: offs[n] };
-    // measureTick changes whenever a measured height updates.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filteredSops.length, viewMode, measureTick]);
-
-  const windowedRange = useMemo(() => {
-    const total = filteredSops.length;
-    if (total === 0) return { start: 0, end: 0, topPad: 0, bottomPad: 0 };
-    const overscan = viewMode === 'employee' ? ROW_OVERSCAN_EMPLOYEE : ROW_OVERSCAN;
-    // Largest index whose top offset is <= scrollTop (first row touching the viewport).
-    let lo = 0;
-    let hi = total;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if (offsets[mid] <= scrollTop) lo = mid + 1;
-      else hi = mid;
-    }
-    const start = Math.max(0, lo - 1 - overscan);
-    // Smallest index whose top offset is >= the viewport bottom.
-    const bottom = scrollTop + viewportHeight;
-    lo = start;
-    hi = total;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if (offsets[mid] < bottom) lo = mid + 1;
-      else hi = mid;
-    }
-    const end = Math.min(total, lo + overscan);
-    return {
-      start,
-      end,
-      topPad: offsets[start],
-      bottomPad: Math.max(0, totalHeight - offsets[end]),
-    };
-  }, [filteredSops.length, scrollTop, viewportHeight, viewMode, offsets, totalHeight]);
-
-  const windowedSops = useMemo(
-    () => filteredSops.slice(windowedRange.start, windowedRange.end),
-    [filteredSops, windowedRange.start, windowedRange.end],
-  );
-
-  // Measure the rows actually in the DOM after each paint and store real heights.
-  // Only triggers a re-render when a height genuinely changed, so it converges.
-  useLayoutEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const rows = el.querySelectorAll<HTMLTableRowElement>('tr[data-row-index]');
-    let changed = false;
-    rows.forEach((r) => {
-      const i = Number(r.dataset.rowIndex);
-      if (!Number.isInteger(i)) return;
-      const h = r.offsetHeight;
-      if (h > 0 && Math.abs((rowHeightsRef.current[i] ?? 0) - h) > 1) {
-        rowHeightsRef.current[i] = h;
-        changed = true;
-      }
-    });
-    if (changed) setMeasureTick((t) => t + 1);
-  });
-
+}: SopRowsBodyProps) {
   if (filteredSops.length === 0) {
     return (
       <tbody>
@@ -2706,13 +2641,7 @@ const VirtualizedSopRows = memo(function VirtualizedSopRows({
 
   return (
     <tbody>
-      {windowedRange.topPad > 0 && (
-        <tr aria-hidden="true" style={{ height: windowedRange.topPad }}>
-          <td colSpan={6} className="p-0 border-0" />
-        </tr>
-      )}
-      {windowedSops.map((sop, localIdx) => {
-        const idx = windowedRange.start + localIdx;
+      {filteredSops.map((sop, idx) => {
         const sopCodeKey = sopCacheKey(sop.sopCode);
         return (
           <SopRow
@@ -2743,11 +2672,6 @@ const VirtualizedSopRows = memo(function VirtualizedSopRows({
           />
         );
       })}
-      {windowedRange.bottomPad > 0 && (
-        <tr aria-hidden="true" style={{ height: windowedRange.bottomPad }}>
-          <td colSpan={6} className="p-0 border-0" />
-        </tr>
-      )}
     </tbody>
   );
 });
@@ -2883,7 +2807,7 @@ const SopRow = memo(function SopRow({
 
       {/* SOP NO */}
       <td className={`w-24 px-3 py-3 font-bold text-blue-600 ${rowBg} border-l border-gray-200 align-top`}>
-        {sop.sopCode || '—'}
+        {sop.displaySopCode || sop.sopCode || '—'}
       </td>
 
       {/* SOP NAME */}

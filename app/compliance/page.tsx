@@ -578,6 +578,12 @@ export default function ComplianceEnginePage() {
   const [applicableFindings, setApplicableFindings] = useState<Set<string>>(new Set());
   const [submittingApplicable, setSubmittingApplicable] = useState(false);
   const [expandedGuideline, setExpandedGuideline] = useState<string | null>(null);
+  const [llmInfo, setLlmInfo] = useState<{
+    provider: 'gemini' | 'ollama';
+    model: string;
+    complianceModel: string;
+    label: string;
+  } | null>(null);
 
   // Upload guidelines modal state
   const [uploadModalOpen, setUploadModalOpen] = useState(false);
@@ -790,7 +796,17 @@ export default function ComplianceEnginePage() {
     } finally { setUploading(false); }
   };
 
-  useEffect(() => { fetchSops(); fetchGuidelines(); fetchReports(); }, []);
+  useEffect(() => {
+    fetchSops();
+    fetchGuidelines();
+    fetchReports();
+    fetch('/api/compliance/config')
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.success && d.llm) setLlmInfo(d.llm);
+      })
+      .catch(() => {});
+  }, []);
 
   const totalClauses = guidelines.reduce((s, g) => s + (g.clauses?.length ?? 0), 0);
 
@@ -914,7 +930,26 @@ export default function ComplianceEnginePage() {
             <h1 className="text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-purple-700 to-purple-500">
               Compliance Intelligence Engine
             </h1>
-            <p className="text-sm text-gray-500 font-medium">Automated Regulatory Compliance Validation</p>
+            <div className="flex flex-wrap items-center gap-2 mt-1">
+              <p className="text-sm text-gray-500 font-medium">Automated Regulatory Compliance Validation</p>
+              {llmInfo && (
+                <span
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-bold uppercase tracking-wide ${
+                    llmInfo.provider === 'ollama'
+                      ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                      : 'bg-purple-50 text-purple-700 border border-purple-200'
+                  }`}
+                  title={`Compliance model: ${llmInfo.complianceModel}`}
+                >
+                  <span
+                    className={`w-1.5 h-1.5 rounded-full ${
+                      llmInfo.provider === 'ollama' ? 'bg-emerald-500' : 'bg-purple-500'
+                    }`}
+                  />
+                  LLM: {llmInfo.label}
+                </span>
+              )}
+            </div>
           </div>
           <button
             onClick={() => router.push('/dashboard')}

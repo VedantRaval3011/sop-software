@@ -2,6 +2,12 @@ import { NextRequest, NextResponse } from 'next/server';
 import bcrypt from 'bcryptjs';
 import { connectDB } from '@/lib/mongodb';
 import { generateUniqueLmsUsername } from '@/lib/lms-credentials';
+import {
+  parseDateOfJoining,
+  resolveInductionTrainingRequired,
+  formatDateOfJoiningInput,
+} from '@/lib/employeeInduction';
+import { invalidateEmployeeAssignmentsCache } from '@/lib/employeeAssignments';
 import Employee from '@/models/Employee';
 
 export const dynamic = 'force-dynamic';
@@ -18,6 +24,24 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
       if (body[k] !== undefined) update[k] = typeof body[k] === 'string' ? body[k].trim() : body[k];
     }
 
+    if (body.dateOfJoining !== undefined) {
+      update.dateOfJoining = parseDateOfJoining(body.dateOfJoining) ?? null;
+    }
+
+    const existing = await Employee.findById(id).select('+lmsPasswordHash');
+    if (!existing) return NextResponse.json({ error: 'Employee not found' }, { status: 404 });
+
+    const nextDoj = body.dateOfJoining !== undefined
+      ? (parseDateOfJoining(body.dateOfJoining) ?? undefined)
+      : existing.dateOfJoining;
+
+    if (body.inductionTrainingRequired !== undefined || body.dateOfJoining !== undefined) {
+      const manual = body.inductionTrainingRequired !== undefined
+        ? body.inductionTrainingRequired === true
+        : existing.inductionTrainingRequired;
+      update.inductionTrainingRequired = resolveInductionTrainingRequired(nextDoj, manual);
+    }
+
     // Optional learning-module password set/reset.
     if (typeof body.password === 'string' && body.password.length > 0) {
       if (body.password.length < 4) {
@@ -25,9 +49,6 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
       }
       update.lmsPasswordHash = await bcrypt.hash(body.password, 12);
     }
-
-    const existing = await Employee.findById(id).select('+lmsPasswordHash');
-    if (!existing) return NextResponse.json({ error: 'Employee not found' }, { status: 404 });
 
     // Ensure every employee has a login handle (covers records created before
     // credentials existed, and any whose name changed without one).
@@ -41,11 +62,21 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
     const employee = await Employee.findByIdAndUpdate(id, { $set: update }, { new: true });
     if (!employee) return NextResponse.json({ error: 'Employee not found' }, { status: 404 });
 
+    invalidateEmployeeAssignmentsCache();
+
     // Never leak the hash; report whether a password is set instead.
     const out = employee.toObject();
     delete out.lmsPasswordHash;
     const hasLmsPassword = !!update.lmsPasswordHash || !!existing.lmsPasswordHash;
-    return NextResponse.json({ employee: { ...out, hasLmsPassword } });
+    return NextResponse.json({
+      employee: {
+        ...out,
+        dateOfJoining: out.dateOfJoining
+          ? formatDateOfJoiningInput(out.dateOfJoining as Date)
+          : undefined,
+        hasLmsPassword,
+      },
+    });
   } catch (err: unknown) {
     return NextResponse.json({ error: err instanceof Error ? err.message : String(err) }, { status: 500 });
   }

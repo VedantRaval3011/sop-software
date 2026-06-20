@@ -6,6 +6,7 @@ import type { EditSOPFormData, EditSOPPayload } from "@/lib/types";
 import { useDashboardStore } from "@/lib/store/dashboard-store";
 import { ExistingMediaList, MediaFilePicker } from "./MediaFilePicker";
 import { Btn } from "./ui";
+import { displaySopCode } from "@/lib/sop-display";
 
 const DEPARTMENTS = [
   "QA",
@@ -184,7 +185,7 @@ export function EditSOPModal({
         const err = await res.json();
         throw new Error(err.error ?? "Failed to save changes");
       }
-      showToast(`SOP ${form.identifier} updated successfully`);
+      showToast(`SOP ${displaySopCode(form.identifier)} updated successfully`);
       onSuccess();
       onClose();
     } catch (err) {
@@ -207,7 +208,7 @@ export function EditSOPModal({
           <div className="flex items-start justify-between gap-3">
             <div>
               <h2 className="text-sm font-bold">Edit SOP Details</h2>
-              <p className="mt-0.5 text-[11px] text-violet-100">{form.identifier || identifier}</p>
+              <p className="mt-0.5 text-[11px] text-violet-100">{displaySopCode(form.identifier || identifier || "")}</p>
             </div>
             <button
               type="button"

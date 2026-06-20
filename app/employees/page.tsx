@@ -4,33 +4,26 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useAuthGuard } from '@/hooks/useAuthGuard';
 import {
+  EmployeeTrainingGrid,
+  buildMonthlyBreakdown,
+  type EmployeeGridRow,
+  type MonthBreakdown,
+  type SopBreakdown,
+} from '@/components/employees/EmployeeTrainingGrid';
+import {
   ArrowLeft, Plus, Search, Pencil, Trash2, X, Check,
-  UserRound, RefreshCw, AlertTriangle, FileText, GraduationCap, KeyRound, Copy,
-  UserX, UserCheck, Loader2, Trophy,
+  UserRound, RefreshCw, AlertTriangle, GraduationCap, KeyRound, Copy,
+  UserX, UserCheck, Loader2, CalendarDays, ShieldCheck,
 } from 'lucide-react';
+import {
+  isWithinInductionWindow,
+  resolveInductionTrainingRequired,
+  formatDateOfJoiningInput,
+  INDUCTION_WINDOW_MONTHS,
+} from '@/lib/employeeInduction';
 
 const DEPARTMENTS = ['QA', 'QC', 'Microbiology', 'Production', 'Store', 'Engineering', 'Personnel'] as const;
 type Dept = (typeof DEPARTMENTS)[number];
-
-const DEPT_COLOR: Record<Dept, string> = {
-  QA:           'bg-indigo-100 text-indigo-700',
-  QC:           'bg-blue-100 text-blue-700',
-  Microbiology: 'bg-emerald-100 text-emerald-700',
-  Production:   'bg-amber-100 text-amber-700',
-  Store:        'bg-red-100 text-red-700',
-  Engineering:  'bg-slate-100 text-slate-700',
-  Personnel:    'bg-pink-100 text-pink-700',
-};
-
-interface SopAssignment {
-  sopCode: string;
-  sopName?: string;
-  month: number;
-  monthName: string;
-  year: number;
-  trainingType: 'induction' | 'training';
-  status?: string;
-}
 
 interface Employee {
   _id: string;
@@ -38,163 +31,33 @@ interface Employee {
   designation: string;
   department: string;
   employeeId?: string;
+  dateOfJoining?: string;
+  inductionTrainingRequired?: boolean;
   isActive: boolean;
   lmsUsername?: string;
   hasLmsPassword?: boolean;
-  assignments?: SopAssignment[];
 }
 
-interface TrainingStatus {
+interface TrainingRecord {
   employeeId: string;
+  employeeName: string;
+  designation: string;
+  department: string;
+  isActive: boolean;
   totalSops: number;
   completedSops: number;
-  certCount: number;
+  partialSops: number;
+  notCompletedSops: number;
   overallPct: number;
-  status: 'completed' | 'in_progress' | 'not_started';
+  monthlyBreakdown: MonthBreakdown[];
+  sops: SopBreakdown[];
 }
 
-function AssignmentsModal({
-  employeeName,
-  assignments,
-  onClose,
-}: {
-  employeeName: string;
-  assignments: SopAssignment[];
-  onClose: () => void;
-}) {
-  const [query, setQuery] = useState('');
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [onClose]);
-
-  const filtered = useMemo(() => {
-    const term = query.trim().toLowerCase();
-    if (!term) return assignments;
-    return assignments.filter(
-      (a) =>
-        a.sopCode.toLowerCase().includes(term) ||
-        (a.sopName || '').toLowerCase().includes(term) ||
-        a.monthName.toLowerCase().includes(term) ||
-        String(a.year).includes(term) ||
-        a.trainingType.toLowerCase().includes(term),
-    );
-  }, [assignments, query]);
-
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
-      onMouseDown={onClose}
-    >
-      <div
-        className="flex max-h-[80vh] w-full max-w-lg flex-col overflow-hidden rounded-2xl bg-white shadow-2xl"
-        onMouseDown={(e) => e.stopPropagation()}
-      >
-        {/* Header */}
-        <div className="flex items-start justify-between border-b border-gray-100 px-5 py-4">
-          <div className="flex items-center gap-2.5">
-            <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-purple-50 text-purple-600">
-              <FileText className="h-4.5 w-4.5" />
-            </div>
-            <div>
-              <h2 className="text-sm font-bold text-gray-800">Assigned SOPs</h2>
-              <p className="text-xs text-gray-400">{employeeName} · {assignments.length} total</p>
-            </div>
-          </div>
-          <button onClick={onClose} className="rounded-lg p-1.5 text-gray-400 hover:bg-gray-100">
-            <X className="h-4 w-4" />
-          </button>
-        </div>
-
-        {/* Search */}
-        <div className="border-b border-gray-100 px-5 py-3">
-          <div className="relative">
-            <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-gray-400" />
-            <input
-              suppressHydrationWarning
-              autoFocus
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search SOP code, name, or month…"
-              className="w-full rounded-lg border border-gray-200 py-2 pl-8 pr-3 text-sm focus:border-purple-300 focus:outline-none"
-            />
-          </div>
-        </div>
-
-        {/* List */}
-        <div className="flex-1 overflow-y-auto px-3 py-2">
-          {filtered.length === 0 ? (
-            <div className="py-12 text-center text-sm text-gray-400">No SOPs match “{query}”.</div>
-          ) : (
-            <div className="flex flex-col gap-0.5">
-              {filtered.map((a) => (
-                <div
-                  key={`${a.sopCode}-${a.month}-${a.year}`}
-                  className="rounded-lg px-2.5 py-2 hover:bg-gray-50"
-                >
-                  <div className="flex items-center gap-1.5 text-sm">
-                    <span className="font-mono font-semibold text-gray-800">{a.sopCode}</span>
-                    <span className="text-gray-300">·</span>
-                    <span className="text-xs text-gray-500">{a.monthName.slice(0, 3)} {a.year}</span>
-                    <span
-                      className={`ml-auto rounded-full px-2 py-0.5 text-[10px] font-semibold ${
-                        a.trainingType === 'induction'
-                          ? 'bg-orange-100 text-orange-700'
-                          : 'bg-sky-100 text-sky-700'
-                      }`}
-                    >
-                      {a.trainingType === 'induction' ? 'Induction' : 'Training'}
-                    </span>
-                  </div>
-                  <div className="mt-0.5 text-xs leading-snug text-gray-500" title={a.sopName || a.sopCode}>
-                    {a.sopName || <span className="italic text-gray-300">No title available</span>}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-
-        {/* Footer */}
-        <div className="border-t border-gray-100 px-5 py-2.5 text-right text-[11px] text-gray-400">
-          {filtered.length} of {assignments.length} shown
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function AssignmentBadge({ employeeName, assignments }: { employeeName: string; assignments: SopAssignment[] }) {
-  const [open, setOpen] = useState(false);
-
-  if (assignments.length === 0) {
-    return <span className="text-xs text-gray-400">No SOPs assigned</span>;
-  }
-
-  return (
-    <>
-      <button
-        suppressHydrationWarning
-        onClick={() => setOpen(true)}
-        className="inline-flex items-center gap-1.5 rounded-lg border border-gray-200 px-2.5 py-1 text-xs font-medium text-gray-600 transition hover:border-purple-300 hover:bg-purple-50 hover:text-purple-700"
-        title={`View ${assignments.length} assigned SOP${assignments.length !== 1 ? 's' : ''}`}
-      >
-        <FileText className="h-3.5 w-3.5 text-gray-400" />
-        <span className="font-semibold">{assignments.length}</span>
-      </button>
-
-      {open && (
-        <AssignmentsModal
-          employeeName={employeeName}
-          assignments={assignments}
-          onClose={() => setOpen(false)}
-        />
-      )}
-    </>
-  );
-}
+const EMPTY_MONTHLY_BREAKDOWN: MonthBreakdown[] = Array.from({ length: 12 }, () => ({
+  completed: 0,
+  partial: 0,
+  notCompleted: 0,
+}));
 
 // ─── Add / Edit modal ─────────────────────────────────────────────────────────
 
@@ -213,11 +76,24 @@ function EmployeeModal({
   const [designation, setDesignation] = useState(initial?.designation || '');
   const [department,  setDepartment]  = useState(initial?.department  || defaultDept || 'QA');
   const [employeeId,  setEmployeeId]  = useState(initial?.employeeId  || '');
+  const [dateOfJoining, setDateOfJoining] = useState(formatDateOfJoiningInput(initial?.dateOfJoining));
+  const [inductionTrainingRequired, setInductionTrainingRequired] = useState(
+    initial?.inductionTrainingRequired ?? false,
+  );
   const [password,    setPassword]    = useState('');
   const [loading,     setLoading]     = useState(false);
   const [error,       setError]       = useState('');
 
   const hasPassword = !!initial?.hasLmsPassword;
+  const tenureRequiresInduction = isWithinInductionWindow(dateOfJoining || undefined);
+  const effectiveInductionRequired = resolveInductionTrainingRequired(
+    dateOfJoining || undefined,
+    inductionTrainingRequired,
+  );
+
+  useEffect(() => {
+    if (tenureRequiresInduction) setInductionTrainingRequired(true);
+  }, [tenureRequiresInduction]);
 
   const handleSave = async () => {
     if (!name.trim() || !designation.trim()) { setError('Name and designation are required.'); return; }
@@ -226,10 +102,19 @@ function EmployeeModal({
     setError('');
     try {
       const isEdit = !!initial?._id;
+      const payload = {
+        name,
+        designation,
+        department,
+        employeeId,
+        dateOfJoining: dateOfJoining || null,
+        inductionTrainingRequired: effectiveInductionRequired,
+        ...(password ? { password } : {}),
+      };
       const res = await fetch(isEdit ? `/api/employees/${initial._id}` : '/api/employees', {
         method:  isEdit ? 'PATCH' : 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, designation, department, employeeId, ...(password ? { password } : {}) }),
+        body: JSON.stringify(payload),
       });
       const json = await res.json();
       if (!res.ok) { setError(json.error || 'Save failed'); return; }
@@ -239,89 +124,134 @@ function EmployeeModal({
     }
   };
 
-  const inputCls = 'w-full rounded-lg border border-gray-200 px-3 py-2 text-sm focus:border-purple-300 focus:outline-none';
+  const inputCls = 'w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-900 placeholder:text-gray-400 focus:border-purple-400 focus:outline-none focus:ring-2 focus:ring-purple-100';
   const labelCls = 'mb-1 block text-xs font-medium text-gray-600';
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-      <div className="w-full max-w-md rounded-2xl bg-white shadow-2xl">
-        <div className="flex items-center justify-between border-b px-5 py-4">
-          <h2 className="font-bold text-gray-800">{initial ? 'Edit Employee' : 'Add Employee'}</h2>
-          <button onClick={onClose} className="rounded-lg p-1.5 hover:bg-gray-100"><X className="h-4 w-4" /></button>
+      <div className="w-full max-w-3xl rounded-2xl bg-white shadow-2xl">
+        <div className="flex items-center justify-between border-b border-gray-100 px-5 py-3.5">
+          <h2 className="text-base font-bold text-gray-900">{initial ? 'Edit Employee' : 'Add Employee'}</h2>
+          <button onClick={onClose} className="rounded-lg p-1.5 text-gray-400 transition hover:bg-gray-100 hover:text-gray-600">
+            <X className="h-4 w-4" />
+          </button>
         </div>
-        <div className="space-y-4 p-5">
+
+        <div className="space-y-4 px-5 py-4">
           {error && (
-            <div className="flex items-center gap-2 rounded-lg bg-red-50 px-3 py-2 text-xs text-red-700">
-              <AlertTriangle className="h-3.5 w-3.5 shrink-0" /> {error}
+            <div className="flex items-center gap-2 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">
+              <AlertTriangle className="h-4 w-4 shrink-0" /> {error}
             </div>
           )}
+
           <div>
             <label className={labelCls}>Full Name *</label>
             <input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Rahul Sharma" className={inputCls} autoFocus />
           </div>
-          <div className="grid grid-cols-2 gap-3">
+
+          <div className="grid grid-cols-3 gap-3">
             <div>
               <label className={labelCls}>Designation *</label>
               <input value={designation} onChange={(e) => setDesignation(e.target.value)} placeholder="e.g. Analyst" className={inputCls} />
             </div>
             <div>
               <label className={labelCls}>Employee ID</label>
-              <input value={employeeId} onChange={(e) => setEmployeeId(e.target.value)} placeholder="optional" className={inputCls} />
+              <input value={employeeId} onChange={(e) => setEmployeeId(e.target.value)} placeholder="Optional" className={inputCls} />
             </div>
-          </div>
-          <div>
-            <label className={labelCls}>Department *</label>
-            <select value={department} onChange={(e) => setDepartment(e.target.value)} className={inputCls}>
-              {DEPARTMENTS.map((d) => <option key={d} value={d}>{d}</option>)}
-            </select>
+            <div>
+              <label className={labelCls}>Department *</label>
+              <select value={department} onChange={(e) => setDepartment(e.target.value)} className={inputCls}>
+                {DEPARTMENTS.map((d) => <option key={d} value={d}>{d}</option>)}
+              </select>
+            </div>
           </div>
 
-          {/* Learning-module credentials */}
-          <div className="rounded-xl border border-gray-100 bg-gray-50/60 p-3">
-            <div className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-gray-600">
-              <GraduationCap className="h-3.5 w-3.5 text-purple-500" /> Learning Module Login
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className={labelCls}>Date of Joining</label>
+              <div className="relative">
+                <CalendarDays className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-gray-400" />
+                <input
+                  type="date"
+                  value={dateOfJoining}
+                  onChange={(e) => setDateOfJoining(e.target.value)}
+                  className={`${inputCls} pl-9`}
+                />
+              </div>
             </div>
-            <div className="space-y-3">
+            <label
+              className={`flex cursor-pointer items-center gap-3 self-end rounded-lg border px-3 py-2 transition ${
+                tenureRequiresInduction
+                  ? 'border-amber-200 bg-amber-50'
+                  : effectiveInductionRequired
+                    ? 'border-purple-200 bg-purple-50/60'
+                    : 'border-gray-200 bg-gray-50/60 hover:border-gray-300'
+              } ${tenureRequiresInduction ? 'cursor-default' : ''}`}
+            >
+              <input
+                type="checkbox"
+                checked={effectiveInductionRequired}
+                disabled={tenureRequiresInduction}
+                onChange={(e) => setInductionTrainingRequired(e.target.checked)}
+                className="h-4 w-4 shrink-0 rounded border-gray-300 text-purple-600 focus:ring-purple-500 disabled:opacity-80"
+              />
+              <span className="min-w-0">
+                <span className="flex items-center gap-1.5 text-sm font-medium text-gray-900">
+                  <ShieldCheck className={`h-3.5 w-3.5 shrink-0 ${tenureRequiresInduction ? 'text-amber-600' : 'text-purple-600'}`} />
+                  Induction training required
+                </span>
+                <span className="mt-0.5 block text-[11px] leading-snug text-gray-500">
+                  {tenureRequiresInduction
+                    ? `Auto-required — joined within ${INDUCTION_WINDOW_MONTHS} months.`
+                    : 'Assigns induction SOPs from the induction matrix.'}
+                </span>
+              </span>
+            </label>
+          </div>
+
+          <div className="rounded-lg border border-gray-200 bg-gray-50/50 p-3">
+            <div className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-gray-700">
+              <GraduationCap className="h-3.5 w-3.5 text-purple-600" />
+              Learning Module Login
+            </div>
+            <div className="grid grid-cols-2 gap-3">
               <div>
                 <label className={labelCls}>Username</label>
                 <input
                   value={initial?.lmsUsername || ''}
                   readOnly
                   disabled
-                  placeholder="Generated automatically on save"
-                  className={`${inputCls} cursor-not-allowed bg-gray-100 font-mono text-gray-500`}
+                  placeholder="Auto-generated on save"
+                  className={`${inputCls} cursor-not-allowed bg-gray-100 font-mono text-xs text-gray-500`}
                 />
-                <p className="mt-1 text-[11px] text-gray-400">
-                  {initial?.lmsUsername
-                    ? 'Auto-generated. Share this with the employee.'
-                    : 'A unique username is created automatically when you save.'}
-                </p>
               </div>
               <div>
                 <label className={labelCls}>
-                  Password {initial ? (hasPassword ? '(set — leave blank to keep)' : '(not set yet)') : '(optional)'}
+                  Password {initial ? (hasPassword ? '(keep if blank)' : '(not set)') : '(optional)'}
                 </label>
                 <input
                   type="password"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   autoComplete="new-password"
-                  placeholder={hasPassword ? '••••••••  enter to reset' : 'Set a password'}
+                  placeholder={hasPassword ? 'New password to reset' : 'Min. 4 characters'}
                   className={inputCls}
                 />
-                <p className="mt-1 text-[11px] text-gray-400">Minimum 4 characters. The employee uses this to sign in to the learning module.</p>
               </div>
             </div>
           </div>
         </div>
-        <div className="flex justify-end gap-2 border-t px-5 py-3">
-          <button onClick={onClose} className="rounded-lg border px-4 py-2 text-sm font-medium text-gray-600 hover:bg-gray-50">Cancel</button>
+
+        <div className="flex justify-end gap-2 border-t border-gray-100 px-5 py-3">
+          <button onClick={onClose} className="rounded-lg border border-gray-200 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50">
+            Cancel
+          </button>
           <button
             onClick={handleSave}
             disabled={loading}
-            className="flex items-center gap-1.5 rounded-lg bg-purple-600 px-4 py-2 text-sm font-medium text-white shadow hover:bg-purple-700 disabled:opacity-50"
+            className="flex items-center gap-1.5 rounded-lg bg-purple-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-purple-700 disabled:opacity-50"
           >
-            <Check className="h-3.5 w-3.5" /> {loading ? 'Saving…' : (initial ? 'Save Changes' : 'Add Employee')}
+            <Check className="h-4 w-4" /> {loading ? 'Saving…' : (initial ? 'Save Changes' : 'Add Employee')}
           </button>
         </div>
       </div>
@@ -495,40 +425,27 @@ export default function EmployeesPage() {
   const [employees,  setEmployees]  = useState<Employee[]>([]);
   const [loading,    setLoading]    = useState(true);
   const [activeDept, setActiveDept] = useState<Dept | 'All'>('All');
+  const [selectedDesignations, setSelectedDesignations] = useState<string[]>([]);
   const [search,     setSearch]     = useState('');
   const [showAdd,    setShowAdd]    = useState(false);
   const [editing,    setEditing]    = useState<Employee | null>(null);
   const [deleting,   setDeleting]   = useState<Employee | null>(null);
   const [togglingId,     setTogglingId]     = useState<string | null>(null);
-  const [trainingMap,    setTrainingMap]    = useState<Map<string, TrainingStatus>>(new Map());
-  const [assignmentsLoading, setAssignmentsLoading] = useState(true);
-  const [trainingLoading,    setTrainingLoading]    = useState(true);
+  const [trainingMap,    setTrainingMap]    = useState<Map<string, TrainingRecord>>(new Map());
+  const [trainingLoading, setTrainingLoading] = useState(true);
   const [generating, setGenerating] = useState(false);
   const [syncResult, setSyncResult] = useState<string | null>(null);
   const [generatedCreds, setGeneratedCreds] = useState<GeneratedCredential[] | null>(null);
 
-  // Heavy fields (assigned SOPs + training progress) are scanned across the
-  // whole training matrix, so we fetch the bare roster first to paint the table
-  // instantly, then stream the slow columns in. Each slow column shows its own
-  // loading state instead of blocking the whole page.
-  const loadAssignments = useCallback(async () => {
-    setAssignmentsLoading(true);
-    try {
-      const res  = await fetch('/api/employees?includeInactive=1&includeAssignments=1');
-      const json = await res.json();
-      if (Array.isArray(json.employees)) setEmployees(json.employees);
-    } finally {
-      setAssignmentsLoading(false);
-    }
-  }, []);
-
-  const loadTraining = useCallback(async () => {
+  const loadTraining = useCallback(async (department?: string) => {
     setTrainingLoading(true);
     try {
-      const res  = await fetch('/api/lms/admin/training-status');
+      const params = new URLSearchParams();
+      if (department && department !== 'All') params.set('department', department);
+      const res  = await fetch(`/api/lms/admin/employee-training?${params}`);
       const json = await res.json();
-      const map = new Map<string, TrainingStatus>();
-      for (const r of (json.records ?? []) as TrainingStatus[]) {
+      const map = new Map<string, TrainingRecord>();
+      for (const r of (json.records ?? []) as TrainingRecord[]) {
         map.set(r.employeeId, r);
       }
       setTrainingMap(map);
@@ -539,20 +456,15 @@ export default function EmployeesPage() {
 
   const load = useCallback(async () => {
     setLoading(true);
-    setAssignmentsLoading(true);
-    setTrainingLoading(true);
     try {
-      // Fast first paint: bare roster, skipping the matrix sync + assignments scan.
       const res  = await fetch('/api/employees?includeInactive=1&skipSync=1');
       const json = await res.json();
       setEmployees(json.employees || []);
     } finally {
       setLoading(false);
     }
-    // Stream in the heavy columns in parallel without blocking the table.
-    void loadAssignments();
-    void loadTraining();
-  }, [loadAssignments, loadTraining]);
+    void loadTraining(activeDept !== 'All' ? activeDept : undefined);
+  }, [loadTraining, activeDept]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -564,26 +476,98 @@ export default function EmployeesPage() {
     return m;
   }, [employees]);
 
-  const visible = useMemo(() => {
+  const designations = useMemo(() => {
+    const pool = activeDept === 'All'
+      ? employees
+      : employees.filter((e) => e.department === activeDept);
+    return [...new Set(pool.map((e) => e.designation).filter(Boolean))].sort((a, b) =>
+      a.localeCompare(b),
+    );
+  }, [employees, activeDept]);
+
+  const countsByDesignation = useMemo(() => {
+    const pool = activeDept === 'All'
+      ? employees
+      : employees.filter((e) => e.department === activeDept);
+    const m: Record<string, number> = {};
+    for (const e of pool) {
+      if (e.designation) m[e.designation] = (m[e.designation] || 0) + 1;
+    }
+    return m;
+  }, [employees, activeDept]);
+
+  useEffect(() => {
+    setSelectedDesignations((prev) => prev.filter((d) => designations.includes(d)));
+  }, [activeDept, designations]);
+
+  const hasActiveFilters =
+    activeDept !== 'All' || selectedDesignations.length > 0 || search.trim() !== '';
+
+  const clearFilters = () => {
+    setActiveDept('All');
+    setSelectedDesignations([]);
+    setSearch('');
+  };
+
+  const toggleDesignation = (designation: string) => {
+    setSelectedDesignations((prev) =>
+      prev.includes(designation)
+        ? prev.filter((d) => d !== designation)
+        : [...prev, designation],
+    );
+  };
+
+  const gridRows = useMemo((): EmployeeGridRow[] => {
     const term = search.trim().toLowerCase();
-    return employees.filter((e) => {
-      if (activeDept !== 'All' && e.department !== activeDept) return false;
-      if (term) {
-        const inCore =
-          e.name.toLowerCase().includes(term) ||
-          e.designation.toLowerCase().includes(term) ||
-          (e.employeeId || '').toLowerCase().includes(term);
-        const inAssignments = (e.assignments || []).some(
-          (a) =>
-            a.sopCode.toLowerCase().includes(term) ||
-            (a.sopName || '').toLowerCase().includes(term) ||
-            a.monthName.toLowerCase().includes(term),
-        );
-        if (!inCore && !inAssignments) return false;
-      }
-      return true;
-    });
-  }, [employees, activeDept, search]);
+    return employees
+      .filter((e) => {
+        if (activeDept !== 'All' && e.department !== activeDept) return false;
+        if (selectedDesignations.length > 0 && !selectedDesignations.includes(e.designation)) return false;
+        if (term) {
+          const inCore =
+            e.name.toLowerCase().includes(term) ||
+            e.designation.toLowerCase().includes(term) ||
+            (e.employeeId || '').toLowerCase().includes(term);
+          if (!inCore) return false;
+        }
+        return true;
+      })
+      .map((emp) => {
+        const t = trainingMap.get(emp._id);
+        if (t) {
+          return {
+            employeeId:       emp._id,
+            employeeName:     emp.name,
+            designation:      emp.designation,
+            department:       emp.department,
+            isActive:         emp.isActive,
+            totalSops:        t.totalSops,
+            completedSops:    t.completedSops,
+            partialSops:      t.partialSops,
+            notCompletedSops: t.notCompletedSops,
+            overallPct:       t.overallPct,
+            monthlyBreakdown: buildMonthlyBreakdown(t.sops),
+            sops:             t.sops,
+            trainingLoaded:   true,
+          };
+        }
+        return {
+          employeeId:       emp._id,
+          employeeName:     emp.name,
+          designation:      emp.designation,
+          department:       emp.department,
+          isActive:         emp.isActive,
+          totalSops:        0,
+          completedSops:    0,
+          partialSops:      0,
+          notCompletedSops: 0,
+          overallPct:       0,
+          monthlyBreakdown: EMPTY_MONTHLY_BREAKDOWN,
+          sops:             [],
+          trainingLoaded:   false,
+        };
+      });
+  }, [employees, activeDept, selectedDesignations, search, trainingMap]);
 
   const handleGenerateLogins = useCallback(async () => {
     setGenerating(true);
@@ -624,20 +608,21 @@ export default function EmployeesPage() {
   const handleSaved = (emp: Employee) => {
     setEmployees((prev) => {
       const idx = prev.findIndex((e) => e._id === emp._id);
-      if (idx >= 0) {
-        return prev.map((e) => (e._id === emp._id ? { ...emp, assignments: e.assignments } : e));
-      }
-      return [{ ...emp, assignments: [] }, ...prev];
+      if (idx >= 0) return prev.map((e) => (e._id === emp._id ? emp : e));
+      return [emp, ...prev];
     });
     setShowAdd(false);
     setEditing(null);
+    void loadTraining(activeDept !== 'All' ? activeDept : undefined);
   };
 
+  const findEmployee = (id: string) => employees.find((e) => e._id === id);
+
   return (
-    <div className="min-h-screen bg-gray-50 text-gray-900">
+    <div className="flex h-screen flex-col overflow-hidden bg-gray-50 text-gray-900">
       {/* Header */}
-      <header className="sticky top-0 z-20 border-b border-gray-200 bg-white/95 backdrop-blur">
-        <div className="mx-auto flex max-w-7xl items-center justify-between px-5 py-3">
+      <header className="shrink-0 border-b border-gray-200 bg-white/95 backdrop-blur">
+        <div className="flex items-center justify-between px-4 py-2.5 sm:px-5">
           <div className="flex items-center gap-3">
             <Link href="/training-matrix" className="flex items-center gap-1 text-xs font-medium text-gray-500 hover:text-gray-800">
               <ArrowLeft className="h-3.5 w-3.5" /> Training Matrix
@@ -650,7 +635,7 @@ export default function EmployeesPage() {
           </div>
           <div className="flex items-center gap-2">
             <button suppressHydrationWarning onClick={load} disabled={loading} className="flex items-center gap-1 rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50">
-              <RefreshCw className={`h-3.5 w-3.5 ${loading || assignmentsLoading || trainingLoading ? 'animate-spin' : ''}`} />
+              <RefreshCw className={`h-3.5 w-3.5 ${loading || trainingLoading ? 'animate-spin' : ''}`} />
             </button>
             <button
               suppressHydrationWarning
@@ -672,22 +657,23 @@ export default function EmployeesPage() {
         </div>
       </header>
 
-      <main className="mx-auto max-w-7xl px-5 py-6">
+      <main className="flex min-h-0 flex-1 flex-col px-4 py-3 sm:px-5">
         {syncResult && (
-          <div className={`mb-4 flex items-center justify-between rounded-lg px-4 py-2.5 text-sm ${syncResult.startsWith('Error') ? 'bg-red-50 text-red-700' : 'bg-green-50 text-green-700'}`}>
+          <div className={`mb-3 flex shrink-0 items-center justify-between rounded-lg px-4 py-2 text-sm ${syncResult.startsWith('Error') ? 'bg-red-50 text-red-700' : 'bg-green-50 text-green-700'}`}>
             <span>{syncResult}</span>
             <button suppressHydrationWarning onClick={() => setSyncResult(null)} className="ml-3 rounded p-0.5 hover:bg-black/10"><X className="h-3.5 w-3.5" /></button>
           </div>
         )}
+
         {/* Department pills */}
-        <div className="mb-4 flex flex-wrap gap-2">
+        <div className="mb-2 flex shrink-0 flex-wrap gap-1.5">
           <button
             suppressHydrationWarning
             onClick={() => setActiveDept('All')}
-            className={`rounded-full px-4 py-1.5 text-xs font-medium transition ${activeDept === 'All' ? 'bg-purple-600 text-white' : 'bg-white border border-gray-200 text-gray-600 hover:bg-gray-50'}`}
+            className={`rounded-full px-3 py-1 text-xs font-medium transition ${activeDept === 'All' ? 'bg-purple-600 text-white' : 'bg-white border border-gray-200 text-gray-600 hover:bg-gray-50'}`}
           >
-            All Departments
-            <span className="ml-1.5 rounded-full bg-purple-100 px-1.5 py-0.5 text-[10px] font-bold text-purple-700">
+            All
+            <span className="ml-1 rounded-full bg-purple-100 px-1.5 py-0.5 text-[10px] font-bold text-purple-700">
               {employees.filter(e => e.isActive).length}
             </span>
           </button>
@@ -696,11 +682,11 @@ export default function EmployeesPage() {
               suppressHydrationWarning
               key={d}
               onClick={() => setActiveDept(d)}
-              className={`rounded-full px-4 py-1.5 text-xs font-medium transition ${activeDept === d ? 'bg-purple-600 text-white' : 'bg-white border border-gray-200 text-gray-600 hover:bg-gray-50'}`}
+              className={`rounded-full px-3 py-1 text-xs font-medium transition ${activeDept === d ? 'bg-purple-600 text-white' : 'bg-white border border-gray-200 text-gray-600 hover:bg-gray-50'}`}
             >
               {d}
               {(countsByDept[d] || 0) > 0 && (
-                <span className="ml-1.5 rounded-full bg-purple-100 px-1.5 py-0.5 text-[10px] font-bold text-purple-700">
+                <span className="ml-1 rounded-full bg-purple-100 px-1.5 py-0.5 text-[10px] font-bold text-purple-700">
                   {countsByDept[d]}
                 </span>
               )}
@@ -708,182 +694,145 @@ export default function EmployeesPage() {
           ))}
         </div>
 
-        {/* Legend */}
-        <div className="mb-3 flex flex-wrap items-center gap-4 text-[11px] text-gray-500">
-          <span className="font-medium text-gray-600">Assigned SOPs show:</span>
-          <span className="inline-flex items-center gap-1.5">
-            <span className="rounded-full bg-sky-100 px-2 py-0.5 text-[10px] font-semibold text-sky-700">Training</span>
-            regular scheduled training
-          </span>
-          <span className="inline-flex items-center gap-1.5">
-            <span className="rounded-full bg-orange-100 px-2 py-0.5 text-[10px] font-semibold text-orange-700">Induction</span>
-            induction training
-          </span>
-        </div>
+        {/* Designation pills — multi-select */}
+        {designations.length > 0 && (
+          <div className="mb-2 flex shrink-0 flex-wrap items-center gap-1.5">
+            <span className="mr-0.5 text-[11px] font-semibold uppercase tracking-wide text-gray-400">
+              Designation
+            </span>
+            {designations.map((d) => {
+              const selected = selectedDesignations.includes(d);
+              return (
+                <button
+                  suppressHydrationWarning
+                  key={d}
+                  onClick={() => toggleDesignation(d)}
+                  className={`rounded-full px-3 py-1 text-xs font-medium transition ${
+                    selected
+                      ? 'bg-sky-600 text-white shadow-sm'
+                      : 'border border-gray-200 bg-white text-gray-600 hover:border-sky-200 hover:bg-sky-50'
+                  }`}
+                >
+                  {d}
+                  <span
+                    className={`ml-1 rounded-full px-1.5 py-0.5 text-[10px] font-bold ${
+                      selected ? 'bg-sky-500 text-white' : 'bg-sky-100 text-sky-700'
+                    }`}
+                  >
+                    {countsByDesignation[d] || 0}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        )}
 
-        {/* Search + count */}
-        <div className="mb-4 flex items-center gap-3">
-          <div className="relative flex-1 max-w-sm">
+        {/* Search + clear */}
+        <div className="mb-2 flex shrink-0 flex-wrap items-center gap-2">
+          <div className="relative min-w-52 flex-1 max-w-sm">
             <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-gray-400" />
             <input
               suppressHydrationWarning
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search name, designation, SOP, or ID…"
-              className="w-full rounded-lg border border-gray-200 py-2 pl-8 pr-3 text-sm focus:border-purple-300 focus:outline-none"
+              placeholder="Search name, designation, or ID…"
+              className="w-full rounded-lg border border-gray-200 bg-white py-1.5 pl-8 pr-8 text-sm focus:border-purple-300 focus:outline-none"
             />
+            {search && (
+              <button
+                suppressHydrationWarning
+                onClick={() => setSearch('')}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-300 hover:text-gray-600"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            )}
           </div>
-          <span className="text-xs text-gray-400">{visible.length} employee{visible.length !== 1 ? 's' : ''}</span>
+
+          {hasActiveFilters && (
+            <button
+              suppressHydrationWarning
+              onClick={clearFilters}
+              className="flex items-center gap-1 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-500 transition hover:bg-gray-50 hover:text-gray-800"
+            >
+              <X className="h-3.5 w-3.5" /> Clear filters
+            </button>
+          )}
+
+          <span className="ml-auto text-xs text-gray-400">
+            {gridRows.length} employee{gridRows.length !== 1 ? 's' : ''}
+          </span>
         </div>
 
-        {/* Table */}
-        <div className="rounded-xl border border-gray-200 bg-white shadow-sm overflow-hidden">
-          {loading ? (
-            <div className="py-20 text-center text-sm text-gray-400">Loading employees…</div>
-          ) : visible.length === 0 ? (
-            <div className="py-20 text-center">
-              <UserRound className="mx-auto mb-3 h-10 w-10 text-gray-200" />
-              <p className="text-sm font-medium text-gray-500">No employees found</p>
-              {activeDept !== 'All' && (
-                <p className="mt-1 text-xs text-gray-400">No employees in {activeDept} yet.</p>
-              )}
+        {/* Training grid — fills remaining viewport */}
+        {!loading && gridRows.length === 0 ? (
+          <div className="flex flex-1 flex-col items-center justify-center rounded-xl border border-gray-200 bg-white py-16">
+            <UserRound className="mb-3 h-10 w-10 text-gray-200" />
+            <p className="text-sm font-medium text-gray-500">No employees found</p>
+            {hasActiveFilters && (
+              <p className="mt-1 text-xs text-gray-400">Try adjusting your filters or search.</p>
+            )}
+            {hasActiveFilters && (
+              <button
+                suppressHydrationWarning
+                onClick={clearFilters}
+                className="mt-3 flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-4 py-2 text-sm font-medium text-gray-600 hover:bg-gray-50"
+              >
+                <X className="h-3.5 w-3.5" /> Clear filters
+              </button>
+            )}
+            {!hasActiveFilters && (
               <button
                 suppressHydrationWarning
                 onClick={() => setShowAdd(true)}
-                className="mt-4 flex items-center gap-1.5 mx-auto rounded-lg bg-purple-600 px-4 py-2 text-sm font-medium text-white hover:bg-purple-700"
+                className="mt-4 flex items-center gap-1.5 rounded-lg bg-purple-600 px-4 py-2 text-sm font-medium text-white hover:bg-purple-700"
               >
                 <Plus className="h-3.5 w-3.5" /> Add first employee
               </button>
-            </div>
-          ) : (
-            <table className="w-full text-left text-sm">
-              <thead className="bg-gray-50 border-b border-gray-200">
-                <tr>
-                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider">Name</th>
-                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider">Designation</th>
-                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider">Department</th>
-                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider">Emp. ID</th>
-                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider">Login</th>
-                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider">Assigned SOPs</th>
-                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider">Training</th>
-                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider">Status</th>
-                  <th className="px-4 py-3 w-20" />
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-gray-100">
-                {visible.map((emp) => (
-                  <tr key={emp._id} className={`hover:bg-gray-50 ${!emp.isActive ? 'opacity-50' : ''}`}>
-                    <td className="px-4 py-3 font-medium text-gray-900">{emp.name}</td>
-                    <td className="px-4 py-3 text-gray-600">{emp.designation}</td>
-                    <td className="px-4 py-3">
-                      <span className={`rounded-full px-2.5 py-0.5 text-xs font-medium ${DEPT_COLOR[emp.department as Dept] || 'bg-gray-100 text-gray-600'}`}>
-                        {emp.department}
-                      </span>
-                    </td>
-                    <td className="px-4 py-3 text-gray-400 text-xs font-mono">{emp.employeeId || '—'}</td>
-                    <td className="px-4 py-3">
-                      {emp.lmsUsername ? (
-                        <div className="flex flex-col gap-0.5">
-                          <span className="font-mono text-xs text-gray-700">{emp.lmsUsername}</span>
-                          <span
-                            className={`inline-flex w-fit items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium ${
-                              emp.hasLmsPassword ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'
-                            }`}
-                            title={emp.hasLmsPassword ? 'Password set' : 'No password yet'}
-                          >
-                            <KeyRound className="h-2.5 w-2.5" />
-                            {emp.hasLmsPassword ? 'Password set' : 'No password'}
-                          </span>
-                        </div>
-                      ) : (
-                        <span className="text-xs text-gray-300">—</span>
-                      )}
-                    </td>
-                    <td className="px-4 py-3 align-top">
-                      {emp.assignments === undefined && assignmentsLoading ? (
-                        <span className="inline-flex items-center gap-1.5 text-xs text-gray-400">
-                          <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading…
-                        </span>
-                      ) : (
-                        <AssignmentBadge employeeName={emp.name} assignments={emp.assignments || []} />
-                      )}
-                    </td>
-                    <td className="px-4 py-3">
-                      {(() => {
-                        if (trainingLoading && !trainingMap.has(emp._id)) {
-                          return (
-                            <span className="inline-flex items-center gap-1.5 text-xs text-gray-400">
-                              <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading…
-                            </span>
-                          );
-                        }
-                        const t = trainingMap.get(emp._id);
-                        if (!t || t.totalSops === 0) return <span className="text-xs text-gray-300">—</span>;
-                        return (
-                          <div className="space-y-1 min-w-[120px]">
-                            <div className="flex items-center gap-1.5">
-                              <div className="h-1.5 w-24 overflow-hidden rounded-full bg-gray-100">
-                                <div
-                                  className={`h-full rounded-full ${t.status === 'completed' ? 'bg-green-500' : 'bg-purple-500'}`}
-                                  style={{ width: `${t.overallPct}%` }}
-                                />
-                              </div>
-                              <span className="text-xs font-semibold text-gray-600">{t.overallPct}%</span>
-                            </div>
-                            <p className="text-[11px] text-gray-400 leading-tight">
-                              {t.completedSops}/{t.totalSops} done
-                              {t.certCount > 0 && (
-                                <span className="ml-1 inline-flex items-center gap-0.5 text-amber-500 font-medium">
-                                  <Trophy className="h-2.5 w-2.5" />{t.certCount}
-                                </span>
-                              )}
-                            </p>
-                          </div>
-                        );
-                      })()}
-                    </td>
-                    <td className="px-4 py-3">
-                      <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${emp.isActive ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-400'}`}>
-                        {emp.isActive ? 'Active' : 'Inactive'}
-                      </span>
-                    </td>
-                    <td className="px-4 py-3">
-                      <div className="flex items-center gap-1">
-                        <button
-                          suppressHydrationWarning
-                          onClick={() => setEditing(emp)}
-                          className="rounded p-1.5 text-gray-400 hover:bg-purple-50 hover:text-purple-600"
-                          title="Edit"
-                        >
-                          <Pencil className="h-3.5 w-3.5" />
-                        </button>
-                        <button
-                          suppressHydrationWarning
-                          onClick={() => toggleActive(emp)}
-                          disabled={togglingId === emp._id}
-                          className={`rounded p-1.5 text-gray-400 ${emp.isActive ? 'hover:bg-red-50 hover:text-red-600' : 'hover:bg-green-50 hover:text-green-600'}`}
-                          title={emp.isActive ? 'Mark as Left' : 'Reactivate'}
-                        >
-                          {togglingId === emp._id
-                            ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                            : emp.isActive ? <UserX className="h-3.5 w-3.5" /> : <UserCheck className="h-3.5 w-3.5" />}
-                        </button>
-                        <button
-                          suppressHydrationWarning
-                          onClick={() => setDeleting(emp)}
-                          className="rounded p-1.5 text-gray-400 hover:bg-red-50 hover:text-red-600"
-                          title="Remove"
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </div>
+            )}
+          </div>
+        ) : (
+          <EmployeeTrainingGrid
+            rows={gridRows}
+            rosterLoading={loading}
+            trainingLoading={trainingLoading}
+            renderActions={(row) => {
+              const emp = findEmployee(row.employeeId);
+              if (!emp) return null;
+              return (
+                <div className="flex items-center gap-0.5">
+                  <button
+                    suppressHydrationWarning
+                    onClick={() => setEditing(emp)}
+                    className="rounded p-1 text-gray-400 hover:bg-purple-50 hover:text-purple-600"
+                    title="Edit"
+                  >
+                    <Pencil className="h-3.5 w-3.5" />
+                  </button>
+                  <button
+                    suppressHydrationWarning
+                    onClick={() => toggleActive(emp)}
+                    disabled={togglingId === emp._id}
+                    className={`rounded p-1 text-gray-400 ${emp.isActive ? 'hover:bg-red-50 hover:text-red-600' : 'hover:bg-green-50 hover:text-green-600'}`}
+                    title={emp.isActive ? 'Mark as Left' : 'Reactivate'}
+                  >
+                    {togglingId === emp._id
+                      ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      : emp.isActive ? <UserX className="h-3.5 w-3.5" /> : <UserCheck className="h-3.5 w-3.5" />}
+                  </button>
+                  <button
+                    suppressHydrationWarning
+                    onClick={() => setDeleting(emp)}
+                    className="rounded p-1 text-gray-400 hover:bg-red-50 hover:text-red-600"
+                    title="Remove"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              );
+            }}
+          />
+        )}
       </main>
 
       {showAdd && (

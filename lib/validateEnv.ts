@@ -1,3 +1,6 @@
+import { getProvider, getComplianceProvider } from "@/lib/llm";
+import { checkOllamaHealth } from "@/lib/ollama";
+
 const REQUIRED = ["MONGODB_URI"] as const;
 
 const OPTIONAL_GROUPS = {
@@ -14,6 +17,10 @@ export function validateEnv(options?: { requireAuth?: boolean; requireBunny?: bo
   const missing: string[] = [];
   for (const key of REQUIRED) {
     if (!process.env[key]) missing.push(key);
+  }
+
+  if (getComplianceProvider() === "gemini" && !process.env.GEMINI_API_KEY) {
+    missing.push("GEMINI_API_KEY");
   }
 
   if (options?.requireAuth) {
@@ -33,6 +40,22 @@ export function validateEnv(options?: { requireAuth?: boolean; requireBunny?: bo
   }
 
   validated = true;
+}
+
+/** Async check that the configured LLM provider is reachable. */
+export async function validateLlmEnv(): Promise<void> {
+  if (getComplianceProvider() === "ollama" || getProvider() === "ollama") {
+    const health = await checkOllamaHealth();
+    if (!health.ok) {
+      throw new Error(health.error ?? "Ollama is not available");
+    }
+  }
+  if (
+    (getComplianceProvider() === "gemini" || getProvider() === "gemini") &&
+    !process.env.GEMINI_API_KEY
+  ) {
+    throw new Error("GEMINI_API_KEY is not configured");
+  }
 }
 
 export function getBunnyConfig() {

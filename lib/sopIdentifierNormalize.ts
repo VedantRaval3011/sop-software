@@ -77,6 +77,26 @@ export function versionArtifactsLookupKey(id: string): string {
 }
 
 /**
+ * Document-level SOP code for UI (no revision suffix).
+ * Zero-pads the document index: QAGE4-11 → QAGE04, QAGE04-11 → QAGE04.
+ * Non-standard identifiers fall back to the base without a trailing `-NN` revision.
+ */
+export function sopBaseDisplayFromIdentifier(id: string): string {
+  const trimmed = String(id || '').trim();
+  if (!trimmed) return '';
+  const nk = normalizeSopIdentifierKey(trimmed.toUpperCase());
+  const m = nk.match(/^([A-Z]{2,6})(\d+)-(\d+)$/);
+  if (m) {
+    return `${m[1]}${String(parseInt(m[2], 10)).padStart(2, '0')}`;
+  }
+  const docOnly = nk.match(/^([A-Z]{2,6})(\d+)$/);
+  if (docOnly) {
+    return `${docOnly[1]}${String(parseInt(docOnly[2], 10)).padStart(2, '0')}`;
+  }
+  return trimmed.toUpperCase().replace(/-\d+$/, '').trim();
+}
+
+/**
  * Format an SOP identifier for display with zero-padded section and document numbers.
  * e.g. BSGE1-5 → BSGE01-05, MAGE1-8 → MAGE01-08, MAGE7-4 → MAGE07-04
  * Falls back to the normalized key if the pattern doesn't match.
@@ -86,6 +106,48 @@ export function formatSopNoDisplay(id: string): string {
   const m = nk.match(/^([A-Z]{2,6})(\d+)-(\d+)$/);
   if (!m) return nk;
   return `${m[1]}${String(parseInt(m[2], 10)).padStart(2, '0')}-${String(parseInt(m[3], 10)).padStart(2, '0')}`;
+}
+
+/**
+ * Registry / dashboard SOP number: zero-pad document index, keep revision as integer
+ * (QCMI1-0 → QCMI01-0, QAGE4-11 → QAGE04-11).
+ */
+export function formatSopCodeDisplay(id: string): string {
+  const nk = normalizeSopIdentifierKey(String(id || '').trim().toUpperCase());
+  const m = nk.match(/^([A-Z]{2,6})(\d+)-(\d+)$/);
+  if (m) {
+    return `${m[1]}${String(parseInt(m[2], 10)).padStart(2, '0')}-${parseInt(m[3], 10)}`;
+  }
+  const docOnly = nk.match(/^([A-Z]{2,6})(\d+)$/);
+  if (docOnly) {
+    return `${docOnly[1]}${String(parseInt(docOnly[2], 10)).padStart(2, '0')}`;
+  }
+  return nk || String(id || '').trim().toUpperCase();
+}
+
+/** True when a search string matches a SOP code (raw, display, or padded variants). */
+export function sopCodeMatchesSearch(
+  query: string,
+  sopCode: string,
+  displaySopCode?: string,
+): boolean {
+  const q = String(query || '').trim().toLowerCase();
+  if (!q) return true;
+  const texts = new Set<string>();
+  for (const raw of [sopCode, displaySopCode || '']) {
+    if (!raw) continue;
+    texts.add(raw.toLowerCase());
+    texts.add(formatSopCodeDisplay(raw).toLowerCase());
+    texts.add(sopBaseDisplayFromIdentifier(raw).toLowerCase());
+    for (const variant of expandSopIdentifierVariants(raw)) {
+      texts.add(formatSopCodeDisplay(variant).toLowerCase());
+      texts.add(sopBaseDisplayFromIdentifier(variant).toLowerCase());
+    }
+  }
+  for (const t of texts) {
+    if (t.includes(q)) return true;
+  }
+  return false;
 }
 
 /**
@@ -110,6 +172,88 @@ export function sopFamilyKeyFromIdentifier(id: string): string | null {
   const m = u.match(/^([A-Z]{2,6})(\d+)-(\d+)$/);
   if (!m) return null;
   return `${m[1].toUpperCase()}:${parseInt(m[2], 10)}`;
+}
+
+function stripRevisionSuffix(code: string): string {
+  return String(code || '').toUpperCase().replace(/-\d+$/, '').trim();
+}
+
+/**
+ * True when two SOP codes refer to the same document family (QAGE4 ≡ QAGE04-11).
+ */
+export function sopFamilyCodesMatch(a: string, b: string): boolean {
+  const au = stripRevisionSuffix(a);
+  const bu = stripRevisionSuffix(b);
+  if (!au || !bu) return false;
+  if (au === bu) return true;
+  for (const va of expandSopIdentifierVariants(au)) {
+    for (const vb of expandSopIdentifierVariants(bu)) {
+      if (stripRevisionSuffix(va) === stripRevisionSuffix(vb)) return true;
+    }
+  }
+  const fka =
+    sopFamilyKeyFromIdentifier(au) || sopFamilyKeyFromIdentifier(`${au}-0`);
+  const fkb =
+    sopFamilyKeyFromIdentifier(bu) || sopFamilyKeyFromIdentifier(`${bu}-0`);
+  return !!(fka && fkb && fka === fkb);
+}
+
+/** Map stripped Excel / matrix codes → canonical DB base keys. */
+export function buildExcelToDbBaseLookup(
+  registry: Array<{ identifier?: string }>,
+): Map<string, string> {
+  const lookup = new Map<string, string>();
+  for (const row of registry) {
+    const identifier = String(row?.identifier || '').trim();
+    if (!identifier) continue;
+    const code = identifier.toUpperCase().replace(/_/g, '-');
+    const hyphenated = code.match(/^([A-Z]{2,}[A-Z0-9]*)-\d+$/);
+    const segmented = code.match(/^([A-Z]{2,}-[A-Z]{2,})-\d+$/);
+    const dbBase = hyphenated?.[1] || segmented?.[1] || stripRevisionSuffix(code);
+    if (!dbBase) continue;
+    for (const variant of expandSopIdentifierVariants(identifier)) {
+      const stripped = stripRevisionSuffix(variant);
+      if (stripped) lookup.set(stripped, dbBase);
+    }
+    const fk = sopFamilyKeyFromIdentifier(identifier);
+    if (fk) lookup.set(`@fk:${fk}`, dbBase);
+  }
+  return lookup;
+}
+
+/** Resolve an Excel / matrix code to its DB registry base key, if any. */
+export function resolveExcelCodeToDbBase(
+  excelCode: string,
+  lookup: Map<string, string>,
+): string | null {
+  const stripped = stripRevisionSuffix(excelCode);
+  if (!stripped) return null;
+  const direct = lookup.get(stripped);
+  if (direct) return direct;
+  for (const variant of expandSopIdentifierVariants(excelCode)) {
+    const hit = lookup.get(stripRevisionSuffix(variant));
+    if (hit) return hit;
+  }
+  const fk =
+    sopFamilyKeyFromIdentifier(stripped) ||
+    sopFamilyKeyFromIdentifier(`${stripped}-0`);
+  if (fk) {
+    const viaFamily = lookup.get(`@fk:${fk}`);
+    if (viaFamily) return viaFamily;
+  }
+  return null;
+}
+
+export function dbBasePresentInExcelCodes(
+  dbBase: string,
+  excelCodes: Set<string>,
+  lookup: Map<string, string>,
+): boolean {
+  if (excelCodes.has(dbBase)) return true;
+  for (const c of excelCodes) {
+    if (resolveExcelCodeToDbBase(c, lookup) === dbBase) return true;
+  }
+  return false;
 }
 
 /** Common OCR / typing swaps on the letter prefix (MAGF… vs MAGE… in URLs vs DB). */

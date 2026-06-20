@@ -3,6 +3,7 @@
 import { Fragment, createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useAuthGuard } from '@/hooks/useAuthGuard';
+import { sopFamilyCodesMatch } from '@/lib/sopIdentifierNormalize';
 
 function stripVersion(code: string): string {
   return String(code || '').toUpperCase().replace(/-\d+$/, '').trim();
@@ -27,7 +28,16 @@ function monthMatchesActive(month: string, activeMonth: string): boolean {
 function sopCodesMatch(a: string, b: string): boolean {
   const au = String(a || '').toUpperCase();
   const bu = String(b || '').toUpperCase();
-  return au === bu || stripVersion(au) === stripVersion(bu);
+  if (au === bu || stripVersion(au) === stripVersion(bu)) return true;
+  return sopFamilyCodesMatch(a, b);
+}
+
+function excelCodeInKnownDbBuckets(excelBase: string, known: Set<string>): boolean {
+  if (known.has(excelBase)) return true;
+  for (const dbBase of known) {
+    if (sopFamilyCodesMatch(excelBase, dbBase)) return true;
+  }
+  return false;
 }
 
 function trainingStatusForSop(
@@ -702,6 +712,7 @@ interface TotalCardData {
   fullyTrained: number;
   incomplete: number;
   departmentCount: number;
+  uploadedDepartmentCount?: number;
   totalDepartments: number;
   missingFromExcelList: Array<{ sopCode: string; title: string; department: string }>;
   trainersMissingList: Array<{ sopCode: string; month: string; department: string }>;
@@ -3677,7 +3688,7 @@ export default function InductionTrainingMatrixPage() {
                 // filter only applies when drilling into a specific DB-owner dept.
                 if (opts.dbDept && opts.dbDept !== 'All') {
                   if (opts.dbDept === 'NA') {
-                    if (codesInKnownDeptBuckets!.has(base)) continue;
+                    if (excelCodeInKnownDbBuckets(base, codesInKnownDeptBuckets!)) continue;
                   } else {
                     if (!registryDbCodes!.has(base)) continue;
                     const targetDbCodes = new Set(
@@ -4470,19 +4481,15 @@ export default function InductionTrainingMatrixPage() {
     const totalRepeat2List = Array.from(_allRepeat2.values());
     const totalRepeatOnceList = Array.from(_allRepeatOnce.values());
 
-    // Aggregate Excel SOP Dept Split across all uploaded depts (found only — missing is global).
-    const totalExcelDeptFoundByDept: Record<string, number> = {};
-    let totalExcelDeptUnknownFound = 0;
+    const totalExcelDeptAssignedByMatrix: Record<string, number> = {};
     let totalExcelDeptTotal = 0;
     for (const dept of departments) {
       const deptData = data?.perDept?.[dept] as any;
       if (!deptData?.uploaded || !deptData.excelDeptSplit) continue;
       const split = deptData.excelDeptSplit;
-      totalExcelDeptTotal += split.total ?? 0;
-      totalExcelDeptUnknownFound += split.unknownFound ?? 0;
-      for (const d of departments) {
-        totalExcelDeptFoundByDept[d] = (totalExcelDeptFoundByDept[d] || 0) + (split.foundByDept?.[d] || 0);
-      }
+      const assigned = split.total ?? 0;
+      totalExcelDeptAssignedByMatrix[dept] = assigned;
+      totalExcelDeptTotal += assigned;
     }
     const totalExcelDeptMissingByDept = (t as any).excelDeptSplit?.missingByDept || {};
     const totalExcelDeptUnknownMissing = (t as any).excelDeptSplit?.unknownMissing ?? 0;
@@ -4499,7 +4506,10 @@ export default function InductionTrainingMatrixPage() {
     const totalExpiryNear = t.nearExpiryCount ?? t.dueSoon30Count ?? 0;
     const totalExpiryNoDate = t.noDateCount ?? 0;
 
-    const totalSopsMonthSum = MONTHS.reduce((sum, m) => sum + (totalMonthCounts[m] ?? 0), 0);
+    const totalMonthSum = MONTHS.reduce((sum, m) => sum + (totalMonthCounts[m] ?? 0), 0);
+    const uploadedDeptCount =
+      t.uploadedDepartmentCount ??
+      departments.filter((d) => (data?.perDept?.[d] as DeptCardData | undefined)?.uploaded).length;
 
     return (
       <CardShell accent={getDeptAccent('Total')} icon={TotalIcon} title="Total">
@@ -4631,25 +4641,21 @@ export default function InductionTrainingMatrixPage() {
               </div>
             </div>
             <DeptStrip
-              foundCounts={{
-                ...totalExcelDeptFoundByDept,
-                ...(totalExcelDeptUnknownFound > 0 ? { NA: totalExcelDeptUnknownFound } : {}),
-              }}
+              foundCounts={totalExcelDeptAssignedByMatrix}
               missingCounts={{
                 ...totalExcelDeptMissingByDept,
                 ...(totalExcelDeptUnknownMissing > 0 ? { NA: totalExcelDeptUnknownMissing } : {}),
               }}
               order={
-                totalExcelDeptUnknownFound > 0 || totalExcelDeptUnknownMissing > 0
+                totalExcelDeptUnknownMissing > 0
                   ? [...departments, 'NA']
                   : departments
               }
-              onSelectFound={(dbDept) =>
+              onSelectFound={(matrixDept) =>
                 applySummaryCapsuleFilter({
-                  dept: 'All',
-                  dbDept: dbDept === 'NA' ? 'NA' : dbDept,
+                  dept: matrixDept,
                   type: 'found_any',
-                  title: `Total · Found (DB Dept: ${dbDept})`,
+                  title: `Total · Assigned SOPs (${matrixDept} matrix)`,
                 })
               }
               onSelectMissing={(dbDept) =>
@@ -4899,10 +4905,10 @@ export default function InductionTrainingMatrixPage() {
         </SummaryTopic>
         <SummaryTopic>
         <SopsMonthHeaderRow
-          monthSum={totalSopsMonthSum}
-          deptNumerator={t.departmentCount}
+          monthSum={totalMonthSum}
+          deptNumerator={uploadedDeptCount}
           deptDenominator={t.totalDepartments}
-          title="Sum of monthly SOP counts (this card). Dept: uploads / configured departments."
+          title="Sum of monthly assigned SOP counts. Dept: matrix uploads / configured departments."
         />
         <MonthStrip
           monthCounts={totalMonthCounts}
@@ -4924,7 +4930,8 @@ export default function InductionTrainingMatrixPage() {
   };
 
   const renderDeptCard = (dept: Dept, d: DeptCardData) => {
-    const deptMonthSum = MONTHS.reduce((sum, m) => sum + (d.monthCounts?.[m] ?? 0), 0);
+    const deptMonthCountsMap = data?.monthCountsByDept?.[dept] ?? d.monthCounts ?? {};
+    const deptMonthSum = MONTHS.reduce((sum, m) => sum + (deptMonthCountsMap[m] ?? 0), 0);
     const deptTrainerBuckets = resolveTrainerBucketCounts(d);
     const Icon = getDeptIcon(dept);
     const globalMissingCount = data?.totalCard?.missingSopCount ?? 0;
@@ -5346,12 +5353,12 @@ export default function InductionTrainingMatrixPage() {
         <SummaryTopic>
         <SopsMonthHeaderRow
           monthSum={deptMonthSum}
-          deptNumerator={data?.totalCard?.departmentCount ?? 0}
+          deptNumerator={d.uploaded ? 1 : 0}
           deptDenominator={data?.totalCard?.totalDepartments ?? DEFAULT_DEPARTMENTS.length}
-          title="Sum of monthly SOP counts (this department). Dept: uploads / configured departments."
+          title="Sum of monthly assigned SOP counts for this department matrix."
         />
         <MonthStrip
-          monthCounts={d.monthCounts}
+          monthCounts={deptMonthCountsMap}
           onSelectMonth={(m) => {
             setViewMode('sop');
             setGroupBy('department');

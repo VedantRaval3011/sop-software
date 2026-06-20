@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { CheckCircle2, Loader2, XCircle } from "lucide-react";
 import { bustDashboardCache } from "@/lib/cache";
 import { useDashboardStore } from "@/lib/store/dashboard-store";
+import { displaySopCode } from "@/lib/sop-display";
 
 const STAGE_KEYS = [
   "mcq_generating",
@@ -102,7 +103,7 @@ export function PipelineDock({ onComplete }: { onComplete?: () => void }) {
           return (
             <div key={job.id} className="rounded border border-slate-100 p-2">
               <div className="flex items-center justify-between text-[10px]">
-                <span className="font-semibold">{job.identifier}</span>
+                <span className="font-semibold">{displaySopCode(job.identifier)}</span>
                 <span className="text-slate-400">{job.language}</span>
                 {status === "running" && <Loader2 className="h-3 w-3 animate-spin text-sky-500" />}
                 {status === "done" && <CheckCircle2 className="h-3 w-3 text-emerald-500" />}
