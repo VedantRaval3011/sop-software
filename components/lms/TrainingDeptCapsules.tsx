@@ -44,14 +44,14 @@ function MetricRow({
 function TriColumns({
   cols, onClick,
 }: {
-  cols: { label: string; value: number; cls?: string; title?: string }[];
+  cols: { label: string; value: number; cls?: string; title?: string; onClick?: () => void }[];
   onClick?: () => void;
 }) {
   return (
     <div className="flex w-full gap-0.5">
       {cols.map((c) => (
         <div key={c.label} className="min-w-0 flex-1" title={c.title}>
-          <MetricRow label={c.label} value={c.value} valueClass={c.cls} onClick={onClick} />
+          <MetricRow label={c.label} value={c.value} valueClass={c.cls} onClick={c.onClick ?? onClick} />
         </div>
       ))}
     </div>
@@ -60,7 +60,8 @@ function TriColumns({
 
 /* ─── Done / Partial / Not block (label row + tri-column counts) ─────────────── */
 function StatusBlock({
-  label, total, done, partial, notDone, onClick,
+  label, total, done, partial, notDone,
+  onTotalClick, onDoneClick, onPartialClick, onNotClick, onClick,
   doneTitle = "Completed", partialTitle = "Partially completed", notTitle = "Not completed",
 }: {
   label: ReactNode;
@@ -68,6 +69,10 @@ function StatusBlock({
   done: number;
   partial: number;
   notDone: number;
+  onTotalClick?: () => void;
+  onDoneClick?: () => void;
+  onPartialClick?: () => void;
+  onNotClick?: () => void;
   onClick?: () => void;
   doneTitle?: string;
   partialTitle?: string;
@@ -75,30 +80,38 @@ function StatusBlock({
 }) {
   return (
     <>
-      <MetricRow label={label} value={total} onClick={onClick} />
+      <MetricRow label={label} value={total} onClick={onTotalClick ?? onClick} />
       <TriColumns
         cols={[
-          { label: "Done",    value: done,    cls: done > 0 ? "text-emerald-700" : "text-gray-700",    title: doneTitle },
-          { label: "Partial", value: partial, cls: partial > 0 ? "text-amber-600" : "text-gray-700", title: partialTitle },
-          { label: "Not",     value: notDone, cls: notDone > 0 ? "text-red-600" : "text-gray-700",   title: notTitle },
+          { label: "Done",    value: done,    cls: done > 0 ? "text-emerald-700" : "text-gray-700",    title: doneTitle,    onClick: onDoneClick ?? onClick },
+          { label: "Partial", value: partial, cls: partial > 0 ? "text-amber-600" : "text-gray-700", title: partialTitle, onClick: onPartialClick ?? onClick },
+          { label: "Not",     value: notDone, cls: notDone > 0 ? "text-red-600" : "text-gray-700",   title: notTitle,     onClick: onNotClick ?? onClick },
         ]}
-        onClick={onClick}
       />
     </>
   );
 }
 
 /* ─── Individual department card (memoized) ───────────────────────────────── */
+export type SopCapsuleFilter = "all" | "completed" | "partial" | "not_completed";
+export type EmpCapsuleStatus = "all" | "completed" | "in_progress" | "not_started";
+export type EmpCapsuleKind = "overall" | "slides" | "videos" | "mcq" | "training" | "induction";
+export type EmpCapsuleFilter = { kind: EmpCapsuleKind; status: EmpCapsuleStatus };
+
 const DepartmentCard = memo(function DepartmentCard({
-  cap, isSelected, onSelect,
+  cap, isSelected, onSelect, onSopFilter, onEmpFilter,
 }: {
   cap: TrainingDeptCapsule;
   isSelected: boolean;
   onSelect: (department: string) => void;
+  onSopFilter?: (department: string, status: SopCapsuleFilter) => void;
+  onEmpFilter?: (department: string, filter: EmpCapsuleFilter) => void;
 }) {
   const isTotal = cap.department === "Total";
   const dept = cap.department;
   const select = () => onSelect(dept);
+  const emp = (kind: EmpCapsuleKind, status: EmpCapsuleStatus) =>
+    () => onEmpFilter?.(dept, { kind, status });
 
   return (
     <div className={`flex w-full min-w-0 flex-col rounded-[10px] border px-2 py-1.5 text-left shadow-sm ${
@@ -130,14 +143,17 @@ const DepartmentCard = memo(function DepartmentCard({
 
       {/* Metrics */}
       <div className="flex flex-col gap-0 border-t border-transparent pt-0.5">
-        <MetricRow label="SOPs" value={cap.totalSops} onClick={select} isActive={isSelected} />
+        <MetricRow
+          label="SOPs"
+          value={cap.totalSops}
+          onClick={() => onSopFilter?.(dept, "all")}
+        />
         <TriColumns
           cols={[
-            { label: "Done",    value: cap.sopCompleted, cls: cap.sopCompleted > 0 ? "text-emerald-700" : "text-gray-700", title: "Completed" },
-            { label: "Partial", value: cap.sopPartial,   cls: cap.sopPartial > 0 ? "text-amber-600" : "text-gray-700",    title: "Partially completed" },
-            { label: "Not",     value: cap.sopNot,       cls: cap.sopNot > 0 ? "text-red-600" : "text-gray-700",          title: "Not completed" },
+            { label: "Done",    value: cap.sopCompleted, cls: cap.sopCompleted > 0 ? "text-emerald-700" : "text-gray-700", title: "Completed", onClick: () => onSopFilter?.(dept, "completed") },
+            { label: "Partial", value: cap.sopPartial,   cls: cap.sopPartial > 0 ? "text-amber-600" : "text-gray-700",    title: "Partially completed", onClick: () => onSopFilter?.(dept, "partial") },
+            { label: "Not",     value: cap.sopNot,       cls: cap.sopNot > 0 ? "text-red-600" : "text-gray-700",          title: "Not completed", onClick: () => onSopFilter?.(dept, "not_completed") },
           ]}
-          onClick={select}
         />
 
         <div className="h-1" />
@@ -148,7 +164,10 @@ const DepartmentCard = memo(function DepartmentCard({
           done={cap.empCompleted}
           partial={cap.empPartial}
           notDone={cap.empNot}
-          onClick={select}
+          onTotalClick={emp("overall", "all")}
+          onDoneClick={emp("overall", "completed")}
+          onPartialClick={emp("overall", "in_progress")}
+          onNotClick={emp("overall", "not_started")}
           doneTitle="Completed all training"
           partialTitle="Partially completed"
           notTitle="Not started"
@@ -162,7 +181,10 @@ const DepartmentCard = memo(function DepartmentCard({
           done={cap.slidesCompleted}
           partial={cap.slidesPartial}
           notDone={cap.slidesNot}
-          onClick={select}
+          onTotalClick={emp("slides", "all")}
+          onDoneClick={emp("slides", "completed")}
+          onPartialClick={emp("slides", "in_progress")}
+          onNotClick={emp("slides", "not_started")}
         />
 
         <div className="h-1" />
@@ -173,7 +195,10 @@ const DepartmentCard = memo(function DepartmentCard({
           done={cap.videosCompleted}
           partial={cap.videosPartial}
           notDone={cap.videosNot}
-          onClick={select}
+          onTotalClick={emp("videos", "all")}
+          onDoneClick={emp("videos", "completed")}
+          onPartialClick={emp("videos", "in_progress")}
+          onNotClick={emp("videos", "not_started")}
         />
 
         <div className="h-1" />
@@ -184,17 +209,19 @@ const DepartmentCard = memo(function DepartmentCard({
           done={cap.mcqCompleted}
           partial={cap.mcqPartial}
           notDone={cap.mcqNot}
-          onClick={select}
+          onTotalClick={emp("mcq", "all")}
+          onDoneClick={emp("mcq", "completed")}
+          onPartialClick={emp("mcq", "in_progress")}
+          onNotClick={emp("mcq", "not_started")}
         />
 
         <div className="h-1" />
 
         <TriColumns
           cols={[
-            { label: "Training",  value: cap.empTraining,  cls: cap.empTraining > 0 ? "text-blue-600" : "text-gray-700",   title: "Employees with regular training SOPs" },
-            { label: "Induction", value: cap.empInduction, cls: cap.empInduction > 0 ? "text-orange-500" : "text-gray-700", title: "Employees with induction training SOPs" },
+            { label: "Training",  value: cap.empTraining,  cls: cap.empTraining > 0 ? "text-blue-600" : "text-gray-700",   title: "Employees with regular training SOPs", onClick: emp("training", "all") },
+            { label: "Induction", value: cap.empInduction, cls: cap.empInduction > 0 ? "text-orange-500" : "text-gray-700", title: "Employees with induction training SOPs", onClick: emp("induction", "all") },
           ]}
-          onClick={select}
         />
       </div>
     </div>
@@ -203,12 +230,14 @@ const DepartmentCard = memo(function DepartmentCard({
 
 /* ─── Main export ─────────────────────────────────────────────────────────── */
 export function TrainingDeptCapsules({
-  capsules, selected, onSelect,
+  capsules, selected, onSelect, onSopFilter, onEmpFilter,
 }: {
   capsules: TrainingDeptCapsule[];
   /** Currently active department, or "All" / undefined when none. */
   selected: string;
   onSelect: (department: string) => void;
+  onSopFilter?: (department: string, status: SopCapsuleFilter) => void;
+  onEmpFilter?: (department: string, filter: EmpCapsuleFilter) => void;
 }) {
   const [sectionOpen, setSectionOpen] = useState(true);
   const deptCount = capsules.filter((c) => c.department !== "Total").length;
@@ -253,6 +282,8 @@ export function TrainingDeptCapsules({
                   cap={cap}
                   isSelected={cap.department === "Total" ? selected === "All" : selected === cap.department}
                   onSelect={onSelect}
+                  onSopFilter={onSopFilter}
+                  onEmpFilter={onEmpFilter}
                 />
               ))}
             </div>

@@ -7,7 +7,7 @@ import { useRouter } from 'next/navigation';
 import {
   ArrowLeft, Loader2, RefreshCw, Search, ChevronDown, X,
 } from 'lucide-react';
-import { TrainingDeptCapsules, type TrainingDeptCapsule } from '@/components/lms/TrainingDeptCapsules';
+import { TrainingDeptCapsules, type TrainingDeptCapsule, type SopCapsuleFilter, type EmpCapsuleFilter } from '@/components/lms/TrainingDeptCapsules';
 import {
   EmployeeTrainingGrid,
   buildMonthlyBreakdown,
@@ -63,6 +63,7 @@ interface EmployeeTrainingRecord {
   notCompletedSops: number;
   overallPct: number;
   monthlyCounts: number[];
+  monthlyBreakdown?: MonthBreakdown[];
   sops: SopBreakdown[];
   hasTraining: boolean;
   hasInduction: boolean;
@@ -79,6 +80,27 @@ function employeeStatus(r: EmployeeTrainingRecord): EmpStatus {
   if (r.totalSops > 0 && r.completedSops === r.totalSops) return 'completed';
   if (r.completedSops === 0 && r.partialSops === 0) return 'not_started';
   return 'in_progress';
+}
+
+const DEFAULT_EMP_FILTER: EmpCapsuleFilter = { kind: 'overall', status: 'all' };
+
+function matchesEmpFilter(r: EmployeeTrainingRecord, filter: EmpCapsuleFilter): boolean {
+  switch (filter.kind) {
+    case 'overall':
+      return filter.status === 'all' || employeeStatus(r) === filter.status;
+    case 'slides':
+    case 'videos':
+    case 'mcq':
+      return filter.status === 'all' || employeeComponentStatus(r, filter.kind) === filter.status;
+    case 'training':
+      return r.hasTraining;
+    case 'induction':
+      return r.hasInduction;
+  }
+}
+
+function isDefaultEmpFilter(filter: EmpCapsuleFilter): boolean {
+  return filter.kind === 'overall' && filter.status === 'all';
 }
 
 // ─── Department summary capsules ──────────────────────────────────────────────
@@ -135,13 +157,20 @@ function addToDeptAcc(acc: DeptAcc, r: EmployeeTrainingRecord) {
   bumpComponentRollup(acc.mcq, employeeComponentStatus(r, 'mcq'));
 }
 
+function sopRowStatus(row: SopTrainingRow): SopStatus {
+  if (row.assigned > 0 && row.completed === row.assigned) return 'completed';
+  if (row.assigned > 0 && (row.completed > 0 || row.partial > 0)) return 'partial';
+  return 'not_completed';
+}
+
 function countRegistrySopStatus(rows: SopTrainingRow[]) {
   let sopCompleted = 0;
   let sopPartial = 0;
   let sopNot = 0;
   for (const row of rows) {
-    if (row.assigned > 0 && row.completed === row.assigned) sopCompleted++;
-    else if (row.assigned > 0 && (row.completed > 0 || row.partial > 0)) sopPartial++;
+    const status = sopRowStatus(row);
+    if (status === 'completed') sopCompleted++;
+    else if (status === 'partial') sopPartial++;
     else sopNot++;
   }
   return { sopCompleted, sopPartial, sopNot };
@@ -383,7 +412,8 @@ export default function EmployeeTrainingDashboardPage() {
   const [loading, setLoading] = useState(true);
   const [dept,    setDept]    = useState('All');
   const [search,  setSearch]  = useState('');
-  const [filter,  setFilter]  = useState<'all' | EmpStatus>('all');
+  const [empFilter, setEmpFilter] = useState<EmpCapsuleFilter>(DEFAULT_EMP_FILTER);
+  const [sopFilter, setSopFilter] = useState<'all' | SopStatus>('all');
   const [viewMode, setViewMode] = useState<ViewMode>('employee');
   const [sopDrill, setSopDrill] = useState<SopGridDrill | null>(null);
 
@@ -403,25 +433,26 @@ export default function EmployeeTrainingDashboardPage() {
       setLoading(true);
     }
     try {
-      const [trainingRes, statsRes, registryRes] = await Promise.all([
-        fetch('/api/lms/admin/employee-training', { cache: 'no-store' }),
-        fetch('/api/sops/stats', { cache: 'no-store' }),
-        fetch('/api/sops?all=1', { cache: 'no-store' }),
-      ]);
+      const trainingRes = await fetch('/api/lms/admin/employee-training', { cache: 'no-store' });
       if (trainingRes.ok) {
         const json = await trainingRes.json();
         const recs = json.records || [];
         setRecords(recs);
         writeLmsClientCache(field, { records: recs });
       }
+    } finally {
+      setLoading(false);
+    }
+    void Promise.all([
+      fetch('/api/sops/stats', { cache: 'no-store' }),
+      fetch('/api/sops?all=1', { cache: 'no-store' }),
+    ]).then(async ([statsRes, registryRes]) => {
       if (statsRes.ok) setSopStats(await statsRes.json());
       if (registryRes.ok) {
         const json = await registryRes.json();
         setRegistry((json.items || []).filter((r: RegistrySOP) => !r.isObsolete));
       }
-    } finally {
-      setLoading(false);
-    }
+    });
   }, []);
 
   useEffect(() => { load(); }, [load]);
@@ -432,7 +463,7 @@ export default function EmployeeTrainingDashboardPage() {
       .filter((r) => {
         if (dept !== 'All' && (r.department || 'Unknown') !== dept) return false;
         if (q && !`${r.employeeName} ${r.designation} ${r.department}`.toLowerCase().includes(q)) return false;
-        if (filter !== 'all') return employeeStatus(r) === filter;
+        if (!matchesEmpFilter(r, empFilter)) return false;
         return true;
       })
       .map((r) => ({
@@ -446,22 +477,23 @@ export default function EmployeeTrainingDashboardPage() {
         partialSops:      r.partialSops,
         notCompletedSops: r.notCompletedSops,
         overallPct:       r.overallPct,
-        monthlyBreakdown: buildMonthlyBreakdown(r.sops),
+        monthlyBreakdown: r.monthlyBreakdown ?? buildMonthlyBreakdown(r.sops),
         sops:             r.sops,
         trainingLoaded:   true,
       }));
-  }, [records, dept, search, filter]);
+  }, [records, dept, search, empFilter]);
 
   const trainingSopRows = useMemo(() => buildSopTrainingRows(records, 'All'), [records]);
 
   const sopRows = useMemo((): SopGridRow[] => {
     const q = search.trim().toLowerCase();
     return buildRegistrySopRows(registry, trainingSopRows, dept).filter((row) => {
+      if (sopFilter !== 'all' && sopRowStatus(row) !== sopFilter) return false;
       if (!q) return true;
       const hay = `${row.sopName} ${row.sopNameGujarati || ''} ${row.sopCode} ${row.department}`.toLowerCase();
       return hay.includes(q);
     });
-  }, [registry, trainingSopRows, dept, search]);
+  }, [registry, trainingSopRows, dept, search, sopFilter]);
 
   // Employee metrics from training records; SOP totals from the dashboard registry
   // (/api/sops/stats + /api/sops?all=1 — same source as the main SOP dashboard).
@@ -504,6 +536,20 @@ export default function EmployeeTrainingDashboardPage() {
   const handleSelectDept = (department: string) =>
     setDept((prev) => (prev === department ? 'All' : department));
 
+  const handleSopCapsuleFilter = useCallback((department: string, status: SopCapsuleFilter) => {
+    setDept(department === 'Total' ? 'All' : department);
+    setSopFilter(status);
+    setEmpFilter(DEFAULT_EMP_FILTER);
+    setViewMode('sop');
+  }, []);
+
+  const handleEmpCapsuleFilter = useCallback((department: string, filter: EmpCapsuleFilter) => {
+    setDept(department === 'Total' ? 'All' : department);
+    setEmpFilter(filter);
+    setSopFilter('all');
+    setViewMode('employee');
+  }, []);
+
   if (authStatus === 'loading') {
     return <div className="flex min-h-screen items-center justify-center"><Loader2 className="h-8 w-8 animate-spin text-purple-400" /></div>;
   }
@@ -514,7 +560,7 @@ export default function EmployeeTrainingDashboardPage() {
         <div className="mx-auto flex w-full max-w-[1920px] items-center justify-between px-2 py-3 sm:px-4">
           <div className="flex items-center gap-3">
             <Link href="/lms/admin" className="flex items-center gap-1 text-xs font-medium text-gray-500 hover:text-gray-800">
-              <ArrowLeft className="h-3.5 w-3.5" /> Training Status
+              <ArrowLeft className="h-3.5 w-3.5" /> LMS Settings
             </Link>
             <div className="h-4 w-px bg-gray-200" />
             <h1 className="text-sm font-bold tracking-tight">Employee Training Dashboard</h1>
@@ -527,11 +573,13 @@ export default function EmployeeTrainingDashboardPage() {
 
       <main className="mx-auto w-full max-w-[1920px] px-2 py-6 sm:px-4 space-y-5">
         {/* Department summary capsules */}
-        {!loading && registry.length > 0 && (
+        {!loading && records.length > 0 && (
           <TrainingDeptCapsules
             capsules={capsules}
             selected={dept}
             onSelect={handleSelectDept}
+            onSopFilter={handleSopCapsuleFilter}
+            onEmpFilter={handleEmpCapsuleFilter}
           />
         )}
 
@@ -580,9 +628,9 @@ export default function EmployeeTrainingDashboardPage() {
             <ChevronDown className="pointer-events-none absolute right-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-gray-400" />
           </div>
 
-          {(filter !== 'all' || search || dept !== 'All') && (
+          {(!isDefaultEmpFilter(empFilter) || sopFilter !== 'all' || search || dept !== 'All') && (
             <button
-              onClick={() => { setFilter('all'); setSearch(''); setDept('All'); }}
+              onClick={() => { setEmpFilter(DEFAULT_EMP_FILTER); setSopFilter('all'); setSearch(''); setDept('All'); }}
               className="flex items-center gap-1 rounded-lg border border-gray-200 bg-white px-3 py-2 text-xs font-medium text-gray-500 hover:bg-gray-50 hover:text-gray-800"
             >
               <X className="h-3.5 w-3.5" /> Clear filters

@@ -1,6 +1,6 @@
 'use client';
 
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
   ArrowDown, ArrowUp, ChevronsUpDown, CheckCircle2, Circle, FileText,
   ListChecks, Loader2, MinusCircle, Presentation, Search, Video, X, Eye, EyeOff,
@@ -504,6 +504,133 @@ function DrillDownModal({ drill, onClose }: { drill: DrillState; onClose: () => 
   );
 }
 
+const EmployeeTrainingRow = memo(function EmployeeTrainingRow({
+  row,
+  statLoading,
+  visibleMonthIndices,
+  lastVisibleMonth,
+  showActions,
+  stickyEmpCell,
+  stickyActCell,
+  onDrill,
+  renderActions,
+}: {
+  row: EmployeeGridRow;
+  statLoading: boolean;
+  visibleMonthIndices: number[];
+  lastVisibleMonth: number;
+  showActions: boolean;
+  stickyEmpCell: string;
+  stickyActCell: string;
+  onDrill: (drill: DrillState) => void;
+  renderActions?: (row: EmployeeGridRow) => ReactNode;
+}) {
+  const empStatus = employeeStatus(row);
+
+  return (
+    <tr className={`group hover:bg-gray-50 ${!row.isActive ? 'opacity-60' : ''}`}>
+      <td className={`${stickyEmpCell} px-2 py-1.5`}>
+        <div className="flex items-center gap-1.5 min-w-0">
+          <div className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[10px] font-bold ${row.isActive ? 'bg-purple-100 text-purple-700' : 'bg-gray-100 text-gray-400'}`}>
+            {row.employeeName.charAt(0)}
+          </div>
+          <p className="min-w-0 font-semibold text-gray-900 leading-tight text-xs line-clamp-2" title={row.employeeName}>
+            {row.employeeName}
+            {!row.isActive && (
+              <span className="ml-1 rounded-full bg-red-100 px-1 py-px text-[9px] font-semibold text-red-600">Left</span>
+            )}
+          </p>
+        </div>
+      </td>
+      <DeptFieldCell value={row.designation} department={row.department} />
+      <DeptFieldCell value={row.department} department={row.department} />
+      <td className="px-0.5 py-1.5 text-center">
+        {statLoading ? (
+          <StatSkeleton />
+        ) : row.totalSops > 0 ? (
+          <button
+            type="button"
+            onClick={() => onDrill({ kind: 'all', record: row })}
+            className="font-semibold text-gray-700 underline-offset-2 transition hover:text-purple-700 hover:underline"
+            title="View all assigned SOPs"
+          >
+            {row.totalSops}
+          </button>
+        ) : (
+          <span className="font-semibold text-gray-300">0</span>
+        )}
+      </td>
+      <td className="px-0.5 py-1.5 text-center">
+        <CountCell
+          count={row.completedSops}
+          tone="green"
+          loading={statLoading}
+          onClick={() => !statLoading && row.completedSops > 0 && onDrill({ kind: 'status', record: row, status: 'completed' })}
+        />
+      </td>
+      <td className="px-0.5 py-1.5 text-center">
+        <CountCell
+          count={row.partialSops}
+          tone="amber"
+          loading={statLoading}
+          onClick={() => !statLoading && row.partialSops > 0 && onDrill({ kind: 'status', record: row, status: 'partial' })}
+        />
+      </td>
+      <td className="px-0.5 py-1.5 text-center">
+        <CountCell
+          count={row.notCompletedSops}
+          tone="gray"
+          loading={statLoading}
+          onClick={() => !statLoading && row.notCompletedSops > 0 && onDrill({ kind: 'status', record: row, status: 'not_completed' })}
+        />
+      </td>
+      {visibleMonthIndices.map((i) => {
+        const b = row.monthlyBreakdown[i];
+        return (
+          <Fragment key={i}>
+            <MonthStatusCell
+              count={b.completed}
+              monthIndex={i}
+              status="completed"
+              loading={statLoading}
+              onDrill={(status) => onDrill({ kind: 'month', record: row, month: i + 1, status })}
+            />
+            <MonthStatusCell
+              count={b.partial}
+              monthIndex={i}
+              status="partial"
+              loading={statLoading}
+              onDrill={(status) => onDrill({ kind: 'month', record: row, month: i + 1, status })}
+            />
+            <MonthStatusCell
+              count={b.notCompleted}
+              monthIndex={i}
+              status="not_completed"
+              loading={statLoading}
+              onDrill={(status) => onDrill({ kind: 'month', record: row, month: i + 1, status })}
+              extraClass={i === lastVisibleMonth ? 'pr-2' : undefined}
+            />
+          </Fragment>
+        );
+      })}
+      <td className="overflow-hidden border-l border-gray-200 pl-3 pr-2 py-1.5">
+        {statLoading ? (
+          <StatSkeleton />
+        ) : row.totalSops === 0 ? (
+          <span className="text-[10px] text-gray-400 italic">No SOPs</span>
+        ) : (
+          <OverallProgressCell pct={row.overallPct} complete={empStatus === 'completed'} />
+        )}
+      </td>
+      {showActions && (
+        <td className={`${stickyActCell} px-1 py-1.5`}>
+          {renderActions?.(row)}
+        </td>
+      )}
+    </tr>
+  );
+});
+
 export function EmployeeTrainingGrid({
   rows,
   trainingLoading,
@@ -526,6 +653,8 @@ export function EmployeeTrainingGrid({
   const onSort = useCallback((key: string) => {
     setSort((prev) => nextSort(prev, key, key === 'name' || key === 'designation' || key === 'department' ? 'asc' : 'desc'));
   }, []);
+
+  const onDrill = useCallback((next: DrillState) => setDrill(next), []);
 
   const currentMonthIndex = new Date().getMonth();
   const visibleMonthIndices = useMemo(
@@ -703,112 +832,20 @@ export function EmployeeTrainingGrid({
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-100">
-              {displayed.map((r) => {
-                const empStatus = employeeStatus(r);
-                const statLoading = trainingLoading || !r.trainingLoaded;
-                return (
-                  <tr key={r.employeeId} className={`group hover:bg-gray-50 ${!r.isActive ? 'opacity-60' : ''}`}>
-                    <td className={`${stickyEmpCell} px-2 py-1.5`}>
-                      <div className="flex items-center gap-1.5 min-w-0">
-                        <div className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[10px] font-bold ${r.isActive ? 'bg-purple-100 text-purple-700' : 'bg-gray-100 text-gray-400'}`}>
-                          {r.employeeName.charAt(0)}
-                        </div>
-                        <p className="min-w-0 font-semibold text-gray-900 leading-tight text-xs line-clamp-2" title={r.employeeName}>
-                          {r.employeeName}
-                          {!r.isActive && (
-                            <span className="ml-1 rounded-full bg-red-100 px-1 py-px text-[9px] font-semibold text-red-600">Left</span>
-                          )}
-                        </p>
-                      </div>
-                    </td>
-                    <DeptFieldCell value={r.designation} department={r.department} />
-                    <DeptFieldCell value={r.department} department={r.department} />
-                    <td className="px-0.5 py-1.5 text-center">
-                      {statLoading ? (
-                        <StatSkeleton />
-                      ) : r.totalSops > 0 ? (
-                        <button
-                          type="button"
-                          onClick={() => setDrill({ kind: 'all', record: r })}
-                          className="font-semibold text-gray-700 underline-offset-2 transition hover:text-purple-700 hover:underline"
-                          title="View all assigned SOPs"
-                        >
-                          {r.totalSops}
-                        </button>
-                      ) : (
-                        <span className="font-semibold text-gray-300">0</span>
-                      )}
-                    </td>
-                    <td className="px-0.5 py-1.5 text-center">
-                      <CountCell
-                        count={r.completedSops}
-                        tone="green"
-                        loading={statLoading}
-                        onClick={() => !statLoading && r.completedSops > 0 && setDrill({ kind: 'status', record: r, status: 'completed' })}
-                      />
-                    </td>
-                    <td className="px-0.5 py-1.5 text-center">
-                      <CountCell
-                        count={r.partialSops}
-                        tone="amber"
-                        loading={statLoading}
-                        onClick={() => !statLoading && r.partialSops > 0 && setDrill({ kind: 'status', record: r, status: 'partial' })}
-                      />
-                    </td>
-                    <td className="px-0.5 py-1.5 text-center">
-                      <CountCell
-                        count={r.notCompletedSops}
-                        tone="gray"
-                        loading={statLoading}
-                        onClick={() => !statLoading && r.notCompletedSops > 0 && setDrill({ kind: 'status', record: r, status: 'not_completed' })}
-                      />
-                    </td>
-                    {visibleMonthIndices.map((i) => {
-                      const b = r.monthlyBreakdown[i];
-                      return (
-                        <Fragment key={i}>
-                          <MonthStatusCell
-                            count={b.completed}
-                            monthIndex={i}
-                            status="completed"
-                            loading={statLoading}
-                            onDrill={(status) => setDrill({ kind: 'month', record: r, month: i + 1, status })}
-                          />
-                          <MonthStatusCell
-                            count={b.partial}
-                            monthIndex={i}
-                            status="partial"
-                            loading={statLoading}
-                            onDrill={(status) => setDrill({ kind: 'month', record: r, month: i + 1, status })}
-                          />
-                          <MonthStatusCell
-                            count={b.notCompleted}
-                            monthIndex={i}
-                            status="not_completed"
-                            loading={statLoading}
-                            onDrill={(status) => setDrill({ kind: 'month', record: r, month: i + 1, status })}
-                            extraClass={i === lastVisibleMonth ? 'pr-2' : undefined}
-                          />
-                        </Fragment>
-                      );
-                    })}
-                    <td className="overflow-hidden border-l border-gray-200 pl-3 pr-2 py-1.5">
-                      {statLoading ? (
-                        <StatSkeleton />
-                      ) : r.totalSops === 0 ? (
-                        <span className="text-[10px] text-gray-400 italic">No SOPs</span>
-                      ) : (
-                        <OverallProgressCell pct={r.overallPct} complete={empStatus === 'completed'} />
-                      )}
-                    </td>
-                    {showActions && (
-                      <td className={`${stickyActCell} px-1 py-1.5`}>
-                        {renderActions?.(r)}
-                      </td>
-                    )}
-                  </tr>
-                );
-              })}
+              {displayed.map((r) => (
+                <EmployeeTrainingRow
+                  key={r.employeeId}
+                  row={r}
+                  statLoading={trainingLoading || !r.trainingLoaded}
+                  visibleMonthIndices={visibleMonthIndices}
+                  lastVisibleMonth={lastVisibleMonth}
+                  showActions={showActions}
+                  stickyEmpCell={stickyEmpCell}
+                  stickyActCell={stickyActCell}
+                  onDrill={onDrill}
+                  renderActions={renderActions}
+                />
+              ))}
               {hasMore && (
                 <tr ref={sentinelRef}>
                   <td colSpan={tableColSpan} className="px-4 py-4 text-center">

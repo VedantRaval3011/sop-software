@@ -98,6 +98,14 @@ export function invalidateLmsAdminCaches() {
   invalidateLmsServerPrefix('lms:admin:');
 }
 
+export function peekLmsServerCache<T>(key: string): T | null {
+  return serverGet<T>(key);
+}
+
+export function primeLmsServerCache<T>(key: string, value: T, ttlMs: number) {
+  serverSet(key, value, ttlMs);
+}
+
 /**
  * Returns a cached value or builds it via `build`. Concurrent misses share one
  * in-flight promise so parallel page loads don't hammer the database.

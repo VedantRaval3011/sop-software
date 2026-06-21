@@ -6,6 +6,7 @@ import {
   GraduationCap, LogOut, Search, PlayCircle, BookOpen, Clock,
   CheckCircle2, AlertCircle, ChevronRight, Loader2, RefreshCw,
   FileText, ClipboardList, TrendingUp, Award,
+  ArrowDown, ArrowUp, ChevronsUpDown,
 } from 'lucide-react';
 import {
   clearLmsClientCache,
@@ -14,12 +15,16 @@ import {
   readLmsClientCache,
   writeLmsClientCache,
 } from '@/lib/lmsCache';
+import { hasGujaratiScript, isPlaceholderSopName, isInvalidSopAssignmentCode } from '@/lib/sop-name-resolution';
+import { getDeptLabelClasses, normalizeDepartment } from '@/lib/department-colors';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 interface SopAssignment {
   sopCode: string;
   sopName?: string;
+  sopNameGujarati?: string;
+  sopDepartment?: string;
   month: number;
   monthName: string;
   year: number;
@@ -53,6 +58,9 @@ interface ProgressRecord {
 }
 
 type FilterTab = 'all' | 'in_progress' | 'completed' | 'overdue' | 'not_started';
+type SortKey = 'sopCode' | 'sopName' | 'department' | 'type' | 'status' | 'due' | 'progress';
+type SortDir = 'asc' | 'desc';
+interface SortState { key: SortKey; dir: SortDir; }
 
 interface DashboardCache {
   assignments: SopAssignment[];
@@ -62,10 +70,28 @@ interface DashboardCache {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-function isOverdue(a: SopAssignment): boolean {
+function currentMonthStart(): Date {
   const now = new Date();
-  const trainingMonth = new Date(a.year, a.month - 1, 1);
-  return trainingMonth < new Date(now.getFullYear(), now.getMonth(), 1);
+  return new Date(now.getFullYear(), now.getMonth(), 1);
+}
+
+function assignmentMonthStart(a: SopAssignment): Date {
+  return new Date(a.year, a.month - 1, 1);
+}
+
+/** Scheduled for a month after the current calendar month. */
+function isFutureScheduled(a: SopAssignment): boolean {
+  return assignmentMonthStart(a) > currentMonthStart();
+}
+
+/** Due now — scheduled for the current month or earlier. */
+function isDue(a: SopAssignment): boolean {
+  return assignmentMonthStart(a) <= currentMonthStart();
+}
+
+function isOverdue(a: SopAssignment): boolean {
+  if (!isDue(a)) return false;
+  return assignmentMonthStart(a) < currentMonthStart();
 }
 
 function statusLabel(s: FilterTab): string {
@@ -76,8 +102,51 @@ function statusLabel(s: FilterTab): string {
   return 'All';
 }
 
+function validAssignments(list: SopAssignment[]): SopAssignment[] {
+  return list.filter((a) => !isInvalidSopAssignmentCode(a.sopCode));
+}
+
+function stripVersion(code: string): string {
+  return String(code || '').toUpperCase().replace(/-\d+$/, '').trim();
+}
+
+function displayTrainingName(a: SopAssignment): { english: string; gujarati?: string } {
+  let english = a.sopName || a.sopCode;
+  let gujarati = a.sopNameGujarati;
+  if (hasGujaratiScript(english) && !gujarati) {
+    gujarati = english;
+    english = a.sopCode;
+  }
+  if (isPlaceholderSopName(english, a.sopCode)) {
+    english = gujarati || a.sopCode;
+  }
+  return { english, gujarati: gujarati && gujarati !== english ? gujarati : undefined };
+}
+
+function statusSortRank(
+  status: ProgressRecord['status'],
+  overdue: boolean,
+  scheduled: boolean,
+): number {
+  if (status === 'completed') return 0;
+  if (status === 'in_progress') return 1;
+  if (overdue) return 2;
+  if (scheduled) return 4;
+  return 3;
+}
+
+function nextSort(prev: SortState, key: SortKey): SortState {
+  if (prev.key === key) return { key, dir: prev.dir === 'asc' ? 'desc' : 'asc' };
+  const ascKeys: SortKey[] = ['sopCode', 'sopName', 'department', 'type', 'status', 'due'];
+  return { key, dir: ascKeys.includes(key) ? 'asc' : 'desc' };
+}
+
 function ProgressBar({ pct, color = 'purple' }: { pct: number; color?: string }) {
-  const bg = color === 'green' ? 'bg-green-500' : color === 'amber' ? 'bg-amber-500' : 'bg-purple-500';
+  const bg =
+    color === 'green' ? 'bg-green-500'
+    : color === 'amber' ? 'bg-amber-500'
+    : color === 'sky' ? 'bg-sky-500'
+    : 'bg-purple-500';
   return (
     <div className="h-1.5 w-full overflow-hidden rounded-full bg-gray-100">
       <div className={`h-full rounded-full transition-all duration-500 ${bg}`} style={{ width: `${pct}%` }} />
@@ -85,87 +154,276 @@ function ProgressBar({ pct, color = 'purple' }: { pct: number; color?: string })
   );
 }
 
-// ─── Training card ────────────────────────────────────────────────────────────
-
-function TrainingCard({
-  assignment,
-  progress,
-  onStart,
+function StatusIcon({
+  status,
+  overdue,
+  scheduled,
 }: {
-  assignment: SopAssignment;
-  progress?: ProgressRecord;
-  onStart: (sopCode: string) => void;
+  status: ProgressRecord['status'];
+  overdue: boolean;
+  scheduled: boolean;
 }) {
-  const pct = progress?.overallPercentage ?? 0;
-  const status = progress?.status ?? 'not_started';
-  const overdue = isOverdue(assignment) && status !== 'completed';
+  return (
+    <div className={`mx-auto flex h-8 w-8 items-center justify-center rounded-lg ${
+      status === 'completed' ? 'bg-green-50' : overdue ? 'bg-red-50' : scheduled ? 'bg-sky-50' : 'bg-purple-50'
+    }`}>
+      {status === 'completed'
+        ? <CheckCircle2 className="h-4 w-4 text-green-600" />
+        : status === 'in_progress'
+        ? <PlayCircle className="h-4 w-4 text-purple-600" />
+        : overdue
+        ? <AlertCircle className="h-4 w-4 text-red-500" />
+        : scheduled
+        ? <Clock className="h-4 w-4 text-sky-500" />
+        : <BookOpen className="h-4 w-4 text-purple-400" />}
+    </div>
+  );
+}
+
+function SortHeader({
+  label, sortKey, sort, onSort, align = 'left',
+}: {
+  label: string;
+  sortKey: SortKey;
+  sort: SortState;
+  onSort: (key: SortKey) => void;
+  align?: 'left' | 'right' | 'center';
+}) {
+  const active = sort.key === sortKey;
+  return (
+    <th
+      onClick={() => onSort(sortKey)}
+      className={`cursor-pointer select-none px-3 py-2.5 text-[11px] font-semibold uppercase tracking-wider transition hover:text-gray-700 ${
+        active ? 'text-gray-700' : 'text-gray-500'
+      } ${align === 'right' ? 'text-right' : align === 'center' ? 'text-center' : 'text-left'}`}
+    >
+      <span className={`inline-flex items-center gap-0.5 ${align === 'right' ? 'w-full justify-end' : align === 'center' ? 'w-full justify-center' : ''}`}>
+        {label}
+        {active
+          ? (sort.dir === 'asc' ? <ArrowUp className="h-2.5 w-2.5 shrink-0" /> : <ArrowDown className="h-2.5 w-2.5 shrink-0" />)
+          : <ChevronsUpDown className="h-2.5 w-2.5 shrink-0 opacity-30" />}
+      </span>
+    </th>
+  );
+}
+
+function TrainingNameCell({ assignment }: { assignment: SopAssignment }) {
+  const { english, gujarati } = displayTrainingName(assignment);
+  return (
+    <div className="min-w-0">
+      <p className="truncate font-medium text-gray-800" title={english}>{english}</p>
+      {gujarati && (
+        <p className="truncate text-[11px] font-medium text-indigo-700" title={gujarati}>{gujarati}</p>
+      )}
+    </div>
+  );
+}
+
+function DepartmentCell({ department }: { department?: string }) {
+  const dept = department?.trim() ? normalizeDepartment(department) : '—';
+  const labelCls = department?.trim() ? getDeptLabelClasses(dept) : 'bg-gray-100 text-gray-500';
+  return (
+    <span className={`inline-block rounded px-1.5 py-0.5 text-[10px] font-semibold ${labelCls}`} title={dept}>
+      {dept}
+    </span>
+  );
+}
+
+function trainingStatusLabel(
+  status: ProgressRecord['status'],
+  overdue: boolean,
+  scheduled: boolean,
+): string {
+  if (status === 'completed') return 'Completed';
+  if (status === 'in_progress') return 'In Progress';
+  if (scheduled) return 'Scheduled';
+  if (overdue) return 'Overdue';
+  return 'Not Started';
+}
+
+function TrainingTable({
+  rows,
+  progressMap,
+  certMap,
+  onStart,
+  onCertificate,
+}: {
+  rows: SopAssignment[];
+  progressMap: Map<string, ProgressRecord>;
+  certMap: Map<string, CertRecord>;
+  onStart: (sopCode: string) => void;
+  onCertificate: (sopCode: string) => void;
+}) {
+  const [sort, setSort] = useState<SortState>({ key: 'sopCode', dir: 'asc' });
+
+  const sortedRows = useMemo(() => {
+    const list = [...rows];
+    const dir = sort.dir === 'asc' ? 1 : -1;
+    list.sort((a, b) => {
+      const pa = progressMap.get(a.sopCode);
+      const pb = progressMap.get(b.sopCode);
+      const sa = pa?.status ?? 'not_started';
+      const sb = pb?.status ?? 'not_started';
+      const oa = isOverdue(a) && sa !== 'completed';
+      const ob = isOverdue(b) && sb !== 'completed';
+      const saSched = isFutureScheduled(a) && sa !== 'completed';
+      const sbSched = isFutureScheduled(b) && sb !== 'completed';
+
+      let cmp = 0;
+      switch (sort.key) {
+        case 'sopCode':
+          cmp = a.sopCode.localeCompare(b.sopCode);
+          break;
+        case 'sopName':
+          cmp = displayTrainingName(a).english.localeCompare(displayTrainingName(b).english);
+          break;
+        case 'department':
+          cmp = (a.sopDepartment || '').localeCompare(b.sopDepartment || '');
+          break;
+        case 'type':
+          cmp = a.trainingType.localeCompare(b.trainingType);
+          break;
+        case 'status':
+          cmp = statusSortRank(sa, oa, saSched) - statusSortRank(sb, ob, sbSched);
+          break;
+        case 'due':
+          cmp = a.year !== b.year ? a.year - b.year : a.month - b.month;
+          break;
+        case 'progress':
+          cmp = (pa?.overallPercentage ?? 0) - (pb?.overallPercentage ?? 0);
+          break;
+      }
+      return cmp * dir;
+    });
+    return list;
+  }, [rows, progressMap, sort]);
 
   return (
-    <div
-      className={`group flex items-center gap-4 rounded-xl border bg-white px-4 py-3.5 shadow-sm transition hover:shadow-md ${
-        overdue ? 'border-red-200' : 'border-gray-200 hover:border-purple-200'
-      }`}
-    >
-      {/* Icon */}
-      <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg ${
-        status === 'completed' ? 'bg-green-50' : overdue ? 'bg-red-50' : 'bg-purple-50'
-      }`}>
-        {status === 'completed'
-          ? <CheckCircle2 className="h-5 w-5 text-green-600" />
-          : status === 'in_progress'
-          ? <PlayCircle className="h-5 w-5 text-purple-600" />
-          : overdue
-          ? <AlertCircle className="h-5 w-5 text-red-500" />
-          : <BookOpen className="h-5 w-5 text-purple-400" />}
-      </div>
+    <div className="overflow-hidden rounded-xl border border-gray-200 bg-white shadow-sm">
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[1050px] border-collapse text-sm">
+          <thead>
+            <tr className="border-b border-gray-200 bg-gray-50">
+              <th className="w-12 px-3 py-2.5 text-center text-[11px] font-semibold uppercase tracking-wider text-gray-500" />
+              <SortHeader label="SOP Code" sortKey="sopCode" sort={sort} onSort={(k) => setSort((p) => nextSort(p, k))} />
+              <SortHeader label="Training Name" sortKey="sopName" sort={sort} onSort={(k) => setSort((p) => nextSort(p, k))} />
+              <SortHeader label="Dept" sortKey="department" sort={sort} onSort={(k) => setSort((p) => nextSort(p, k))} />
+              <SortHeader label="Type" sortKey="type" sort={sort} onSort={(k) => setSort((p) => nextSort(p, k))} />
+              <SortHeader label="Status" sortKey="status" sort={sort} onSort={(k) => setSort((p) => nextSort(p, k))} />
+              <SortHeader label="Due" sortKey="due" sort={sort} onSort={(k) => setSort((p) => nextSort(p, k))} />
+              <SortHeader label="Progress" sortKey="progress" sort={sort} onSort={(k) => setSort((p) => nextSort(p, k))} />
+              <th className="w-36 px-3 py-2.5 text-right text-[11px] font-semibold uppercase tracking-wider text-gray-500">Action</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-100">
+            {sortedRows.map((assignment) => {
+              const progress = progressMap.get(assignment.sopCode);
+              const pct = progress?.overallPercentage ?? 0;
+              const status = progress?.status ?? 'not_started';
+              const scheduled = isFutureScheduled(assignment) && status !== 'completed';
+              const overdue = isOverdue(assignment) && status !== 'completed';
+              const cert = certMap.get(assignment.sopCode) || certMap.get(stripVersion(assignment.sopCode));
+              const showCertificate = status === 'completed' && Boolean(cert);
 
-      {/* Info */}
-      <div className="flex flex-1 flex-col gap-1 overflow-hidden">
-        <div className="flex items-center gap-2">
-          <span className="font-mono text-xs font-bold text-gray-700">{assignment.sopCode}</span>
-          <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
-            assignment.trainingType === 'induction'
-              ? 'bg-orange-100 text-orange-700'
-              : 'bg-sky-100 text-sky-700'
-          }`}>
-            {assignment.trainingType === 'induction' ? 'Induction' : 'Training'}
-          </span>
-          {overdue && (
-            <span className="rounded-full bg-red-100 px-2 py-0.5 text-[10px] font-semibold text-red-700">
-              Overdue
-            </span>
-          )}
-        </div>
-        <p className="truncate text-sm font-medium text-gray-800" title={assignment.sopName}>
-          {assignment.sopName || assignment.sopCode}
-        </p>
-        <div className="flex items-center gap-3">
-          <ProgressBar pct={pct} color={status === 'completed' ? 'green' : overdue ? 'amber' : 'purple'} />
-          <span className="w-10 shrink-0 text-right text-[11px] font-semibold text-gray-400">{pct}%</span>
-        </div>
-        <p className="text-[11px] text-gray-400">
-          {assignment.monthName.slice(0, 3)} {assignment.year}
-          {progress?.lastAccessedAt && status === 'in_progress' && (
-            <> · Last opened {new Date(progress.lastAccessedAt).toLocaleDateString()}</>
-          )}
-          {status === 'completed' && progress?.completedAt && (
-            <> · Completed {new Date(progress.completedAt).toLocaleDateString()}</>
-          )}
-        </p>
+              return (
+                <tr
+                  key={`${assignment.sopCode}-${assignment.month}-${assignment.year}`}
+                  className={`transition hover:bg-gray-50/80 ${overdue ? 'bg-red-50/40' : scheduled ? 'bg-sky-50/30' : ''}`}
+                >
+                  <td className="px-3 py-2.5">
+                    <StatusIcon status={status} overdue={overdue} scheduled={scheduled} />
+                  </td>
+                  <td className="whitespace-nowrap px-3 py-2.5 font-mono text-xs font-bold text-gray-700">
+                    {assignment.sopCode}
+                  </td>
+                  <td className="max-w-[260px] px-3 py-2.5">
+                    <TrainingNameCell assignment={assignment} />
+                    {progress?.lastAccessedAt && status === 'in_progress' && (
+                      <p className="mt-0.5 truncate text-[11px] text-gray-400">
+                        Last opened {new Date(progress.lastAccessedAt).toLocaleDateString()}
+                      </p>
+                    )}
+                    {status === 'completed' && progress?.completedAt && (
+                      <p className="mt-0.5 truncate text-[11px] text-gray-400">
+                        Completed {new Date(progress.completedAt).toLocaleDateString()}
+                      </p>
+                    )}
+                  </td>
+                  <td className="whitespace-nowrap px-3 py-2.5">
+                    <DepartmentCell department={assignment.sopDepartment} />
+                  </td>
+                  <td className="whitespace-nowrap px-3 py-2.5">
+                    <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                      assignment.trainingType === 'induction'
+                        ? 'bg-orange-100 text-orange-700'
+                        : 'bg-sky-100 text-sky-700'
+                    }`}>
+                      {assignment.trainingType === 'induction' ? 'Induction' : 'Training'}
+                    </span>
+                  </td>
+                  <td className="whitespace-nowrap px-3 py-2.5">
+                    <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                      status === 'completed'
+                        ? 'bg-green-100 text-green-700'
+                        : status === 'in_progress'
+                        ? 'bg-purple-100 text-purple-700'
+                        : scheduled
+                        ? 'bg-sky-100 text-sky-700'
+                        : overdue
+                        ? 'bg-red-100 text-red-700'
+                        : 'bg-gray-100 text-gray-600'
+                    }`}>
+                      {trainingStatusLabel(status, overdue, scheduled)}
+                    </span>
+                  </td>
+                  <td className="whitespace-nowrap px-3 py-2.5">
+                    <span className={`text-xs ${scheduled ? 'text-gray-400' : 'text-gray-500'}`}>
+                      {assignment.monthName.slice(0, 3)} {assignment.year}
+                    </span>
+                    {scheduled && (
+                      <p className="text-[10px] font-medium text-sky-600">Upcoming</p>
+                    )}
+                  </td>
+                  <td className="px-3 py-2.5">
+                    <div className="flex items-center gap-2">
+                      <ProgressBar
+                        pct={pct}
+                        color={status === 'completed' ? 'green' : overdue ? 'amber' : scheduled ? 'sky' : 'purple'}
+                      />
+                      <span className="w-9 shrink-0 text-right text-[11px] font-semibold text-gray-400">{pct}%</span>
+                    </div>
+                  </td>
+                  <td className="px-3 py-2.5 text-right">
+                    <div className="flex items-center justify-end gap-1.5">
+                      {showCertificate && (
+                        <button
+                          onClick={() => onCertificate(cert!.sopCode)}
+                          className="inline-flex items-center gap-1 rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-1.5 text-xs font-semibold text-amber-700 transition hover:bg-amber-100"
+                          title="View certificate"
+                        >
+                          <Award className="h-3.5 w-3.5" />
+                          Certificate
+                        </button>
+                      )}
+                      <button
+                        onClick={() => onStart(assignment.sopCode)}
+                        className={`inline-flex items-center gap-1 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${
+                          status === 'completed'
+                            ? 'bg-gray-100 text-gray-500 hover:bg-gray-200'
+                            : 'bg-purple-600 text-white shadow hover:bg-purple-700'
+                        }`}
+                      >
+                        {status === 'completed' ? 'Review' : status === 'in_progress' ? 'Continue' : 'Start'}
+                        <ChevronRight className="h-3 w-3" />
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
       </div>
-
-      {/* Action */}
-      <button
-        onClick={() => onStart(assignment.sopCode)}
-        className={`flex shrink-0 items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-semibold transition ${
-          status === 'completed'
-            ? 'bg-gray-100 text-gray-500 hover:bg-gray-200'
-            : 'bg-purple-600 text-white shadow hover:bg-purple-700'
-        }`}
-      >
-        {status === 'completed' ? 'Review' : status === 'in_progress' ? 'Continue' : 'Start'}
-        <ChevronRight className="h-3 w-3" />
-      </button>
     </div>
   );
 }
@@ -363,7 +621,7 @@ function Dashboard({ employee, onLogout }: { employee: Employee; onLogout: () =>
   const load = useCallback(async (force = false) => {
     const cached = !force ? readLmsClientCache<DashboardCache>(lmsClientFields.dashboard) : null;
     if (cached?.value) {
-      setAssignments(cached.value.assignments || []);
+      setAssignments(validAssignments(cached.value.assignments || []));
       const map = new Map<string, ProgressRecord>();
       for (const p of cached.value.progress || []) map.set(p.sopCode, p);
       setProgressMap(map);
@@ -383,7 +641,7 @@ function Dashboard({ employee, onLogout }: { employee: Employee; onLogout: () =>
       const meData    = await meRes.json();
       const progData  = await progressRes.json();
       const certData  = certRes.ok ? await certRes.json() : { certificates: [] };
-      const assignments = meData.assignments || [];
+      const assignments = validAssignments(meData.assignments || []);
       const progress = (progData.progress || []) as ProgressRecord[];
       const certificates = certData.certificates || [];
       setAssignments(assignments);
@@ -409,20 +667,37 @@ function Dashboard({ employee, onLogout }: { employee: Employee; onLogout: () =>
     router.push(`/lms/journey/${sopCode}`);
   }, [router]);
 
+  const handleCertificate = useCallback((sopCode: string) => {
+    router.push(`/lms/certificate/${sopCode}`);
+  }, [router]);
+
+  const certMap = useMemo(() => {
+    const m = new Map<string, CertRecord>();
+    for (const c of certificates) {
+      m.set(c.sopCode, c);
+      m.set(stripVersion(c.sopCode), c);
+    }
+    return m;
+  }, [certificates]);
+
   const filtered = useMemo(() => {
     let list = assignments;
     if (filter === 'in_progress')  list = list.filter((a) => progressMap.get(a.sopCode)?.status === 'in_progress');
     if (filter === 'completed')    list = list.filter((a) => progressMap.get(a.sopCode)?.status === 'completed');
-    if (filter === 'not_started')  list = list.filter((a) => !progressMap.get(a.sopCode) || progressMap.get(a.sopCode)?.status === 'not_started');
+    if (filter === 'not_started')  list = list.filter((a) => isDue(a) && (!progressMap.get(a.sopCode) || progressMap.get(a.sopCode)?.status === 'not_started'));
     if (filter === 'overdue')      list = list.filter((a) => isOverdue(a) && progressMap.get(a.sopCode)?.status !== 'completed');
     if (search.trim()) {
       const term = search.trim().toLowerCase();
-      list = list.filter(
-        (a) =>
+      list = list.filter((a) => {
+        const { english, gujarati } = displayTrainingName(a);
+        return (
           a.sopCode.toLowerCase().includes(term) ||
-          (a.sopName || '').toLowerCase().includes(term) ||
-          a.monthName.toLowerCase().includes(term),
-      );
+          english.toLowerCase().includes(term) ||
+          (gujarati || '').toLowerCase().includes(term) ||
+          (a.sopDepartment || '').toLowerCase().includes(term) ||
+          a.monthName.toLowerCase().includes(term)
+        );
+      });
     }
     return list;
   }, [assignments, progressMap, filter, search]);
@@ -431,7 +706,7 @@ function Dashboard({ employee, onLogout }: { employee: Employee; onLogout: () =>
     all:         assignments.length,
     in_progress: assignments.filter((a) => progressMap.get(a.sopCode)?.status === 'in_progress').length,
     completed:   assignments.filter((a) => progressMap.get(a.sopCode)?.status === 'completed').length,
-    not_started: assignments.filter((a) => !progressMap.get(a.sopCode) || progressMap.get(a.sopCode)?.status === 'not_started').length,
+    not_started: assignments.filter((a) => isDue(a) && (!progressMap.get(a.sopCode) || progressMap.get(a.sopCode)?.status === 'not_started')).length,
     overdue:     assignments.filter((a) => isOverdue(a) && progressMap.get(a.sopCode)?.status !== 'completed').length,
   }), [assignments, progressMap]);
 
@@ -566,16 +841,13 @@ function Dashboard({ employee, onLogout }: { employee: Employee; onLogout: () =>
                   </p>
                 </div>
               ) : (
-                <div className="grid gap-2 xl:grid-cols-2">
-                  {filtered.map((a) => (
-                    <TrainingCard
-                      key={`${a.sopCode}-${a.month}-${a.year}`}
-                      assignment={a}
-                      progress={progressMap.get(a.sopCode)}
-                      onStart={handleOpen}
-                    />
-                  ))}
-                </div>
+                <TrainingTable
+                  rows={filtered}
+                  progressMap={progressMap}
+                  certMap={certMap}
+                  onStart={handleOpen}
+                  onCertificate={handleCertificate}
+                />
               )}
 
               <div className="mt-3 text-center text-xs text-gray-400">

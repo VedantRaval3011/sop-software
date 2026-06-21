@@ -4,7 +4,16 @@ import InductionTrainingMatrixRecord from '@/models/InductionTrainingMatrixRecor
 import InductionTrainingMatrixUpload from '@/models/InductionTrainingMatrixUpload';
 import Employee from '@/models/Employee';
 import SOP, { type ISOP } from '@/models/SOP';
-import { resolveSopFamilyNames, isPlaceholderSopName } from '@/lib/sop-name-resolution';
+import MatrixSOPAssignment from '@/models/MatrixSOPAssignment';
+import { getGroupedRegistryRows } from '@/lib/dashboardRegistrySource';
+import { normalizeDepartment } from '@/lib/department-colors';
+import {
+  resolveSopFamilyNames,
+  isPlaceholderSopName,
+  hasGujaratiScript,
+  cleanSopDisplayName,
+  isInvalidSopAssignmentCode,
+} from '@/lib/sop-name-resolution';
 
 const MONTH_NAMES = [
   '',
@@ -25,6 +34,8 @@ const MONTH_NAMES = [
 export interface EmployeeSopAssignment {
   sopCode: string;
   sopName?: string;
+  sopNameGujarati?: string;
+  sopDepartment?: string;
   month: number;
   monthName: string;
   year: number;
@@ -71,11 +82,101 @@ export function inferTrainingType(rawSymbol: string): 'induction' | 'training' {
   return 'training';
 }
 
-/** Build a base-SOP-code → display-name map from the SOP collection. */
-async function buildSopNameMap(): Promise<Map<string, string>> {
-  const sops = await SOP.find({ isObsolete: { $ne: true } })
-    .select('name identifier sopBaseId language')
-    .lean();
+interface SopLookup {
+  families: Map<string, ISOP[]>;
+  registryByBase: Map<string, { name: string; nameGujarati?: string; department: string }>;
+  matrixByDeptCode: Map<string, { sopName: string; department: string }>;
+  matrixByCode: Map<string, { sopName: string; department: string }>;
+  recordNameByBase: Map<string, string>;
+}
+
+function deptLookupKey(dept: string, base: string): string {
+  return `${normalizeDepartment(dept).toLowerCase()}||${base.toUpperCase()}`;
+}
+
+function pickRecordName(
+  code: string,
+  candidates: Array<string | undefined>,
+): string | undefined {
+  for (const raw of candidates) {
+    const cleaned = raw ? cleanSopDisplayName(raw) : '';
+    if (cleaned && !isPlaceholderSopName(cleaned, code) && !hasGujaratiScript(cleaned)) {
+      return cleaned;
+    }
+  }
+  return undefined;
+}
+
+function pickSopDepartment(records: ISOP[]): string | undefined {
+  if (!records.length) return undefined;
+  const en = records.find(
+    (r) => r.language !== 'Gujarati' && r.department && r.department !== 'General',
+  );
+  if (en?.department) return en.department;
+  const any = records.find((r) => r.department && r.department !== 'General');
+  return any?.department || records[0]?.department;
+}
+
+function enrichAssignment(
+  assignment: EmployeeSopAssignment,
+  employeeDept: string,
+  lookup: SopLookup,
+): void {
+  const base = stripVersion(assignment.sopCode);
+  const registry = lookup.registryByBase.get(base);
+  const family = lookup.families.get(base) || [];
+  const matrix =
+    lookup.matrixByDeptCode.get(deptLookupKey(employeeDept, base)) ||
+    lookup.matrixByCode.get(base);
+  const matrixName = matrix?.sopName || assignment.sopName;
+  const resolved = resolveSopFamilyNames(
+    family,
+    assignment.sopCode,
+    registry?.name || matrixName,
+  );
+
+  const english =
+    pickRecordName(assignment.sopCode, [
+      registry?.name,
+      lookup.recordNameByBase.get(base),
+      resolved.englishName,
+      matrix?.sopName,
+      assignment.sopName,
+    ]) ||
+    resolved.gujaratiName ||
+    registry?.nameGujarati ||
+    assignment.sopCode;
+
+  assignment.sopName = english;
+  const gujarati =
+    registry?.nameGujarati ||
+    resolved.gujaratiName;
+  if (gujarati && gujarati !== english) {
+    assignment.sopNameGujarati = gujarati;
+  }
+  assignment.sopDepartment = normalizeDepartment(
+    registry?.department ||
+    pickSopDepartment(family) ||
+    matrix?.department ||
+    employeeDept,
+  );
+}
+
+/** Build SOP family index + matrix assignment lookups for name/dept resolution. */
+async function buildSopLookup(): Promise<SopLookup> {
+  const [sops, registryRows, matrixRows, matrixRecordNames] = await Promise.all([
+    SOP.find({ isObsolete: { $ne: true } })
+      .select('name identifier sopBaseId language department')
+      .lean(),
+    getGroupedRegistryRows(),
+    MatrixSOPAssignment.find({ isActive: true })
+      .select('department sopCode sopName')
+      .lean(),
+    TrainingMatrixRecord.aggregate<{ _id: string; names: string[] }>([
+      { $match: { status: { $ne: 'na' }, sopName: { $exists: true, $ne: '' } } },
+      { $group: { _id: { $toUpper: '$sopCode' }, names: { $addToSet: '$sopName' } } },
+    ]),
+  ]);
 
   const families = new Map<string, ISOP[]>();
   for (const s of sops as unknown as ISOP[]) {
@@ -85,14 +186,54 @@ async function buildSopNameMap(): Promise<Map<string, string>> {
     families.get(base)!.push(s);
   }
 
-  const map = new Map<string, string>();
-  for (const [base, records] of families) {
-    const { englishName } = resolveSopFamilyNames(records, base);
-    if (englishName && englishName.toUpperCase() !== base) {
-      map.set(base, englishName);
-    }
+  const registryByBase = new Map<string, { name: string; nameGujarati?: string; department: string }>();
+  for (const row of registryRows) {
+    if (row.isObsolete) continue;
+    const base = stripVersion(row.identifier).toUpperCase();
+    if (!base || registryByBase.has(base)) continue;
+    registryByBase.set(base, {
+      name: row.name,
+      nameGujarati: row.nameGujarati,
+      department: row.department,
+    });
   }
-  return map;
+
+  const recordNameByBase = new Map<string, string>();
+  for (const row of matrixRecordNames) {
+    const base = stripVersion(row._id).toUpperCase();
+    if (!base) continue;
+    const name = pickRecordName(base, row.names);
+    if (name) recordNameByBase.set(base, name);
+  }
+
+  const matrixByDeptCode = new Map<string, { sopName: string; department: string }>();
+  const matrixByCode = new Map<string, { sopName: string; department: string }>();
+  const preferMatrixEntry = (
+    existing: { sopName: string; department: string } | undefined,
+    candidate: { sopName: string; department: string },
+    base: string,
+  ) => {
+    if (!existing) return candidate;
+    const existingOk = !isPlaceholderSopName(existing.sopName, base);
+    const candidateOk = !isPlaceholderSopName(candidate.sopName, base);
+    if (!existingOk && candidateOk) return candidate;
+    return existing;
+  };
+
+  for (const row of matrixRows as Array<{ department: string; sopCode: string; sopName: string }>) {
+    const base = stripVersion(row.sopCode);
+    const dept = normalizeDepartment(String(row.department || '').trim());
+    if (!base || !dept) continue;
+    const entry = { sopName: row.sopName, department: dept };
+    const deptKey = deptLookupKey(dept, base);
+    matrixByDeptCode.set(
+      deptKey,
+      preferMatrixEntry(matrixByDeptCode.get(deptKey), entry, base),
+    );
+    matrixByCode.set(base, preferMatrixEntry(matrixByCode.get(base), entry, base));
+  }
+
+  return { families, registryByBase, matrixByDeptCode, matrixByCode, recordNameByBase };
 }
 
 // Building the assignments map scans the whole training-matrix + SOP
@@ -143,9 +284,10 @@ export function getEmployeeAssignmentsMap(
 async function computeEmployeeAssignmentsMap(): Promise<Map<string, EmployeeSopAssignment[]>> {
   // empKey → (sopCode → kept assignment). One entry per SOP per employee.
   const byEmp = new Map<string, Map<string, EmployeeSopAssignment>>();
-  const nameByBase = await buildSopNameMap();
+  const lookup = await buildSopLookup();
 
   const add = (department: string, name: string, assignment: EmployeeSopAssignment) => {
+    if (isInvalidSopAssignmentCode(assignment.sopCode)) return;
     const key = empKey(department, name);
     if (!byEmp.has(key)) byEmp.set(key, new Map());
     const bySop = byEmp.get(key)!;
@@ -173,7 +315,7 @@ async function computeEmployeeAssignmentsMap(): Promise<Map<string, EmployeeSopA
   }>) {
     const name = String(r.employeeName || '').trim();
     const department = String(r.department || '').trim();
-    if (!name || !department || !r.sopCode) continue;
+    if (!name || !department || !r.sopCode || isInvalidSopAssignmentCode(r.sopCode)) continue;
     add(department, name, {
       sopCode: r.sopCode,
       sopName: r.sopName,
@@ -217,7 +359,9 @@ async function computeEmployeeAssignmentsMap(): Promise<Map<string, EmployeeSopA
   for (const [dept, { year, snapshot }] of latestByDept) {
     const baseToSchedule = new Map<string, { month: number; monthName: string; rawCode: string }>();
     for (const [rawKey, monthName] of Object.entries(snapshot.sopMonthMap || {})) {
+      if (isInvalidSopAssignmentCode(rawKey)) continue;
       const base = stripVersion(rawKey);
+      if (isInvalidSopAssignmentCode(base)) continue;
       const month = monthNameToNum(monthName);
       if (!base || !month) continue;
       if (!baseToSchedule.has(base)) {
@@ -229,7 +373,7 @@ async function computeEmployeeAssignmentsMap(): Promise<Map<string, EmployeeSopA
       const name = String(emp.name || '').trim();
       if (!name || !emp.training) continue;
       for (const [sopCode, assigned] of Object.entries(emp.training)) {
-        if (!assigned) continue;
+        if (!assigned || isInvalidSopAssignmentCode(sopCode)) continue;
         const sched = baseToSchedule.get(stripVersion(sopCode));
         if (!sched) continue;
         add(dept, name, {
@@ -245,16 +389,16 @@ async function computeEmployeeAssignmentsMap(): Promise<Map<string, EmployeeSopA
 
   // Materialize the deduped per-employee maps into the array shape callers expect.
   const map = new Map<string, EmployeeSopAssignment[]>();
-  for (const [key, bySop] of byEmp) map.set(key, [...bySop.values()]);
+  for (const [key, bySop] of byEmp) {
+    map.set(
+      key,
+      [...bySop.values()].filter((a) => !isInvalidSopAssignmentCode(a.sopCode)),
+    );
+  }
 
-  for (const list of map.values()) {
-    // Fill in / improve display names from the SOP collection.
-    for (const a of list) {
-      const resolved = nameByBase.get(stripVersion(a.sopCode));
-      if (!a.sopName || isPlaceholderSopName(a.sopName, a.sopCode)) {
-        if (resolved) a.sopName = resolved;
-      }
-    }
+  for (const [key, list] of map) {
+    const employeeDept = key.split('||')[0] || '';
+    for (const a of list) enrichAssignment(a, employeeDept, lookup);
     list.sort((a, b) => {
       if (a.year !== b.year) return b.year - a.year;
       if (a.month !== b.month) return a.month - b.month;
@@ -262,14 +406,14 @@ async function computeEmployeeAssignmentsMap(): Promise<Map<string, EmployeeSopA
     });
   }
 
-  await mergeInductionAssignments(map, nameByBase);
+  await mergeInductionAssignments(map, lookup);
 
   return map;
 }
 
 async function mergeInductionAssignments(
   map: Map<string, EmployeeSopAssignment[]>,
-  nameByBase: Map<string, string>,
+  lookup: SopLookup,
 ): Promise<void> {
   const flagged = await Employee.find({ inductionTrainingRequired: true, isActive: true })
     .select('name department designation dateOfJoining')
@@ -278,6 +422,7 @@ async function mergeInductionAssignments(
   if (flagged.length === 0) return;
 
   const add = (department: string, name: string, assignment: EmployeeSopAssignment) => {
+    if (isInvalidSopAssignmentCode(assignment.sopCode)) return;
     const key = empKey(department, name);
     if (!map.has(key)) map.set(key, []);
     const list = map.get(key)!;
@@ -314,6 +459,7 @@ async function mergeInductionAssignments(
   }>) {
     const key = empKey(r.department, r.employeeName);
     if (!flaggedKeys.has(key)) continue;
+    if (isInvalidSopAssignmentCode(r.sopCode)) continue;
     add(r.department, r.employeeName, {
       sopCode: r.sopCode,
       sopName: r.sopName,
@@ -358,16 +504,25 @@ async function mergeInductionAssignments(
     if (!snap?.snapshot.sopMonthMap) continue;
 
     for (const [rawKey, monthName] of Object.entries(snap.snapshot.sopMonthMap)) {
+      if (isInvalidSopAssignmentCode(rawKey)) continue;
       const month = monthNameToNum(monthName);
       if (!month) continue;
       add(emp.department, emp.name, {
         sopCode: rawKey,
-        sopName: nameByBase.get(stripVersion(rawKey)),
         month,
         monthName,
         year: snap.year,
         trainingType: 'induction',
       });
+    }
+  }
+
+  for (const [key, list] of map) {
+    const employeeDept = key.split('||')[0] || '';
+    const filtered = list.filter((a) => !isInvalidSopAssignmentCode(a.sopCode));
+    map.set(key, filtered);
+    for (const a of filtered) {
+      if (a.trainingType === 'induction') enrichAssignment(a, employeeDept, lookup);
     }
   }
 }

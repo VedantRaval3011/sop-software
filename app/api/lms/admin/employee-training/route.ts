@@ -13,7 +13,7 @@ import SOP from '@/models/SOP';
 import LearningProgress from '@/models/lms/LearningProgress';
 import TrainingMatrixUpload from '@/models/TrainingMatrixUpload';
 import { getEmployeeAssignmentsMap } from '@/lib/employeeAssignments';
-import { getJourneyContent } from '@/lib/lmsJourneyContent';
+import { getJourneyContentBatch } from '@/lib/lmsJourneyContent';
 import {
   hasGujaratiScript,
   isInvalidSopAssignmentCode,
@@ -121,6 +121,8 @@ export interface EmployeeTrainingRecord {
   overallPct: number;
   /** Count of assigned SOPs per month, index 0 = Jan … 11 = Dec. */
   monthlyCounts: number[];
+  /** Status breakdown per month for the employee grid. */
+  monthlyBreakdown: Array<{ completed: number; partial: number; notCompleted: number }>;
   sops: SopBreakdown[];
   /** Employee has at least one regular training SOP assigned. */
   hasTraining: boolean;
@@ -151,6 +153,24 @@ function componentStatus(
   if (done === 0) return 'not_completed';
   if (done === present.length) return 'completed';
   return 'partial';
+}
+
+function buildMonthlyBreakdown(sops: SopBreakdown[]) {
+  const breakdown = Array.from({ length: 12 }, () => ({
+    completed: 0,
+    partial: 0,
+    notCompleted: 0,
+  }));
+  for (const sop of sops) {
+    for (const m of sop.months) {
+      const idx = m - 1;
+      if (idx < 0 || idx > 11) continue;
+      if (sop.status === 'completed') breakdown[idx].completed++;
+      else if (sop.status === 'partial') breakdown[idx].partial++;
+      else breakdown[idx].notCompleted++;
+    }
+  }
+  return breakdown;
 }
 
 // GET /api/lms/admin/employee-training?department=QA
@@ -200,26 +220,17 @@ export async function GET(req: NextRequest) {
           const assignments = assignmentsMap.get(empKey(emp.department, emp.name)) ?? [];
           for (const a of assignments) uniqueSopCodes.add(a.sopCode);
         }
-        const contentEntries = await Promise.all(
-          [...uniqueSopCodes].map(
-            async (code) => [code, await getJourneyContent(code)] as const,
-          ),
-        );
+        const contentByCode = await getJourneyContentBatch(uniqueSopCodes);
         const availableByCode = new Map<string, string[]>(
-          contentEntries.map(([code, content]) => [code, content.availableStepIds]),
+          [...contentByCode.entries()].map(([code, content]) => [code, content.availableStepIds]),
         );
-        // The SOP collection holds the authoritative display name; prefer it over
-        // the matrix assignment's name (which is often just the code).
         const nameByCode = new Map<string, string>(
-          contentEntries
+          [...contentByCode.entries()]
             .filter(([, content]) => content.sop?.name)
             .map(([code, content]) => [code, content.sop!.name]),
         );
-        // Canonical registry identity (sopBaseId) per assignment code. Distinct
-        // SOP roll-ups dedupe on this so versions / code-format variants of the
-        // same SOP count once, and codes with no matching SOP are left out.
         const keyByCode = new Map<string, string>(
-          contentEntries
+          [...contentByCode.entries()]
             .filter(([, content]) => content.sop)
             .map(([code, content]) => [
               code,
@@ -352,6 +363,7 @@ export async function GET(req: NextRequest) {
             notCompletedSops,
             overallPct,
             monthlyCounts,
+            monthlyBreakdown: buildMonthlyBreakdown(sops),
             sops,
             hasTraining:  assignments.some((a) => a.trainingType === 'training'),
             hasInduction: assignments.some((a) => a.trainingType === 'induction'),
