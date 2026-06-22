@@ -6,9 +6,10 @@ import {
   ArrowLeft, Check, ChevronLeft, ChevronRight, PlayCircle,
   FileText, BookOpen, ClipboardList, Lock, Loader2, AlertCircle,
   Volume2, Trophy, X, Award, RefreshCw, Clock,
+  Maximize2, ExternalLink, Download,
 } from 'lucide-react';
 import type { JourneyStep } from '@/app/api/lms/journey/[sopCode]/route';
-import { buildOfficeOnlineEmbedUrl, buildPreviewHref } from '@/lib/file-urls';
+import { buildOfficeOnlineEmbedUrl } from '@/lib/file-urls';
 import {
   invalidateLmsClientFields,
   lmsClientFields,
@@ -38,6 +39,8 @@ interface QuizSettings {
   timeLimitMinutes: number;
   shuffleOptions: boolean;
   showAnswersAfterTrial: boolean;
+  maxAttempts: number;       // total exam attempts before answers are revealed (0 = unlimited)
+  examQuestionCount: number; // full-exam question count, used to pace the timer
 }
 
 interface JourneyData {
@@ -290,7 +293,21 @@ function PdfStep({
   onComplete: () => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [fullscreen, setFullscreen] = useState(false);
   const [acknowledged, setAcknowledged] = useState(step.completed);
+
+  // While the immersive reader is open, lock background scroll and allow ESC to exit.
+  useEffect(() => {
+    if (!fullscreen) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setFullscreen(false); };
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    window.addEventListener('keydown', onKey);
+    return () => {
+      document.body.style.overflow = prevOverflow;
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [fullscreen]);
 
   if (!step.url) {
     return (
@@ -302,31 +319,41 @@ function PdfStep({
 
   const isDocx = step.fileType === 'docx' || step.url.toLowerCase().endsWith('.docx');
   const origin = typeof window !== 'undefined' ? window.location.origin : '';
-  // Office Online requires a publicly accessible URL routed through the file proxy.
+  // PDFs render through the same preview route the dashboard uses, so the inline
+  // and full-screen previews look identical to the dashboard. DOCX uses Office Online.
   const viewerSrc = isDocx
     ? buildOfficeOnlineEmbedUrl(step.url, origin)
-    : buildPreviewHref(step.url);
+    : `/api/sops/preview?path=${encodeURIComponent(step.url)}&type=pdf`;
+
+  const reviewed = acknowledged || step.completed;
+  const markReviewed = () => { setAcknowledged(true); onComplete(); };
 
   return (
     <div className="flex flex-1 flex-col gap-3">
-      {/* Show document button — prevents auto-download on page load */}
+      {/* Landing card — prevents auto-download on page load */}
       {!open && (
-        <div className="flex flex-1 flex-col items-center justify-center gap-4 rounded-xl border border-gray-200 bg-gray-50 py-16">
-          <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-white shadow-md">
+        <div className="flex flex-1 flex-col items-center justify-center gap-5 rounded-2xl border border-gray-200 bg-linear-to-b from-gray-50 to-white py-16">
+          <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-white shadow-md ring-1 ring-gray-100">
             <BookOpen className="h-8 w-8 text-purple-500" />
           </div>
           <div className="text-center">
-            <p className="font-semibold text-gray-700">SOP Document</p>
+            <p className="text-base font-semibold text-gray-700">SOP Document</p>
             <p className="mt-0.5 text-xs text-gray-400">
-              {isDocx ? 'Word document' : 'PDF'} · Click to open
+              {isDocx ? 'Word document' : 'PDF'} · Read it in the viewer or fullscreen
             </p>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center justify-center gap-2">
             <button
               onClick={() => setOpen(true)}
               className="flex items-center gap-2 rounded-lg bg-purple-600 px-5 py-2.5 text-sm font-medium text-white shadow hover:bg-purple-700"
             >
               <BookOpen className="h-4 w-4" /> View Document
+            </button>
+            <button
+              onClick={() => { setOpen(true); setFullscreen(true); }}
+              className="flex items-center gap-2 rounded-lg border border-purple-200 bg-purple-50 px-4 py-2.5 text-sm font-medium text-purple-700 hover:bg-purple-100"
+            >
+              <Maximize2 className="h-4 w-4" /> Read Fullscreen
             </button>
             <a
               href={step.url}
@@ -334,7 +361,7 @@ function PdfStep({
               rel="noopener noreferrer"
               className="flex items-center gap-2 rounded-lg border border-gray-200 bg-white px-4 py-2.5 text-sm font-medium text-gray-600 hover:bg-gray-50"
             >
-              Open in new tab
+              <ExternalLink className="h-4 w-4" /> Open in new tab
             </a>
           </div>
           {step.completed ? (
@@ -343,7 +370,7 @@ function PdfStep({
             </span>
           ) : (
             <button
-              onClick={() => { setAcknowledged(true); onComplete(); }}
+              onClick={markReviewed}
               className="flex items-center gap-1.5 text-xs font-medium text-gray-500 hover:text-green-600"
             >
               <Check className="h-3.5 w-3.5" /> Mark as Read (without opening)
@@ -354,44 +381,110 @@ function PdfStep({
 
       {open && (
         <>
-          <div className="flex items-center justify-between">
+          {/* Inline viewer toolbar */}
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <button
               onClick={() => setOpen(false)}
-              className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-gray-700"
+              className="flex items-center gap-1.5 rounded-lg px-2 py-1 text-xs font-medium text-gray-500 hover:bg-gray-100 hover:text-gray-700"
             >
-              ← Hide document
+              <ChevronLeft className="h-3.5 w-3.5" /> Hide document
             </button>
-            <a
-              href={step.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-xs text-purple-600 hover:underline"
-            >
-              Open in new tab
-            </a>
+            <div className="flex items-center gap-1.5">
+              <button
+                onClick={() => setFullscreen(true)}
+                className="flex items-center gap-1.5 rounded-lg border border-purple-200 bg-purple-50 px-3 py-1.5 text-xs font-semibold text-purple-700 hover:bg-purple-100"
+              >
+                <Maximize2 className="h-3.5 w-3.5" /> Fullscreen
+              </button>
+              <a
+                href={step.url}
+                download
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50"
+              >
+                <Download className="h-3.5 w-3.5" /> Download
+              </a>
+              <a
+                href={step.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50"
+              >
+                <ExternalLink className="h-3.5 w-3.5" /> New tab
+              </a>
+            </div>
           </div>
-          <div className="flex-1 overflow-hidden rounded-xl border border-gray-200 shadow-sm" style={{ minHeight: '62vh' }}>
+
+          {/* Inline viewer — clean white frame, edge-to-edge like the dashboard preview */}
+          <div className="flex-1 overflow-hidden rounded-xl border border-gray-200 bg-white shadow-sm h-[70vh] sm:h-[76vh] lg:h-[80vh]">
             <iframe
               src={viewerSrc}
-              className="h-full w-full"
-              style={{ minHeight: '62vh' }}
+              className="h-full w-full border-0"
               title="SOP Document"
             />
           </div>
-          {!acknowledged && (
+
+          {!reviewed ? (
             <button
-              onClick={() => { setAcknowledged(true); onComplete(); }}
+              onClick={markReviewed}
               className="flex items-center justify-center gap-2 rounded-lg bg-purple-600 py-2.5 text-sm font-medium text-white hover:bg-purple-700"
             >
               <Check className="h-4 w-4" /> Confirm I have read this document
             </button>
-          )}
-          {(acknowledged || step.completed) && (
+          ) : (
             <div className="flex items-center gap-2 rounded-lg bg-green-50 px-3 py-2 text-xs text-green-700">
               <Check className="h-3.5 w-3.5" /> Document reviewed. You can re-open it anytime.
             </div>
           )}
         </>
+      )}
+
+      {/* Immersive full-screen reader */}
+      {fullscreen && (
+        <div className="fixed inset-0 z-50 flex flex-col bg-[#e5e7eb]">
+          {/* Header chrome */}
+          <div className="sticky top-0 z-10 flex shrink-0 items-center justify-between gap-3 border-b border-gray-200 bg-white px-3 py-2 shadow-sm sm:px-4">
+            <span className="flex min-w-0 items-center gap-2 text-sm font-semibold text-gray-700">
+              <FileText className="h-4 w-4 shrink-0 text-purple-600" />
+              <span className="truncate">{step.label || 'SOP Document'}</span>
+            </span>
+            <div className="flex items-center gap-2">
+              {!reviewed && (
+                <button
+                  onClick={markReviewed}
+                  className="inline-flex items-center gap-1.5 rounded-md bg-purple-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-purple-700"
+                >
+                  <Check className="h-3.5 w-3.5" /> <span className="hidden sm:inline">Mark as read</span>
+                </button>
+              )}
+              <a
+                href={step.url}
+                download
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 rounded-md border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50"
+              >
+                <Download className="h-3.5 w-3.5" /> <span className="hidden sm:inline">Download</span>
+              </a>
+              <button
+                onClick={() => setFullscreen(false)}
+                className="inline-flex items-center justify-center rounded-md p-1.5 text-gray-400 hover:bg-gray-100 hover:text-gray-700"
+                title="Close (Esc)"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+          </div>
+          {/* Document fills the rest of the screen, centered like the dashboard */}
+          <div className="min-h-0 flex-1 p-2 sm:p-3">
+            <iframe
+              src={viewerSrc}
+              className="mx-auto h-full min-h-[480px] w-full max-w-[1200px] rounded-lg border border-gray-200 bg-white shadow-md"
+              title="SOP Document (full screen)"
+            />
+          </div>
+        </div>
       )}
     </div>
   );
@@ -429,6 +522,25 @@ function formatTime(seconds: number): string {
 
 const MAX_TAB_VIOLATIONS = 2; // warnings before auto-submit
 
+// Default pacing when no admin time limit is set — the exam timer is always on.
+const SECONDS_PER_QUESTION = 45;
+
+/** Seconds allotted for a quiz of `questionCount` questions. Honors an explicit
+ *  admin time limit (scaled per-question so retests get proportional time), else
+ *  falls back to the per-question default so every test is timed. */
+function timerSecondsFor(settings: QuizSettings | null, questionCount: number): number {
+  if (questionCount <= 0) return 0;
+  const configured = settings?.timeLimitMinutes ?? 0;
+  if (configured > 0) {
+    const fullCount = settings?.examQuestionCount && settings.examQuestionCount > 0
+      ? settings.examQuestionCount
+      : questionCount;
+    const perQuestion = (configured * 60) / fullCount;
+    return Math.max(30, Math.ceil(perQuestion * questionCount));
+  }
+  return questionCount * SECONDS_PER_QUESTION;
+}
+
 function QuizStep({
   sopCode,
   step,
@@ -451,6 +563,14 @@ function QuizStep({
   const [error, setError] = useState('');
   const submitRef = useRef<(() => void) | null>(null);
 
+  // Retest: after a failed exam the learner re-attempts ONLY the questions they
+  // missed, and must answer all of them correctly (100%) to pass.
+  const [isRetest, setIsRetest] = useState(false);
+  const [retestQueue, setRetestQueue] = useState<PreparedQuestion[]>([]);
+  // Exam/retest attempts used this session — drives the attempt allocation and
+  // gates when correct answers are finally revealed. (Demo attempts don't count.)
+  const [examAttempts, setExamAttempts] = useState(0);
+
   // Tab-switch violation tracking (exam only)
   const violationsRef = useRef(0);
   const [violations, setViolations] = useState(0);
@@ -462,6 +582,9 @@ function QuizStep({
     setAnswers({});
     setScore(0);
     setError('');
+    setIsRetest(false);
+    setRetestQueue([]);
+    setExamAttempts(0);
     try {
       const res = await fetch(`/api/lms/quiz/${sopCode}?mode=${m}`);
       const data = await res.json() as {
@@ -481,13 +604,14 @@ function QuizStep({
 
   useEffect(() => { fetchQuestions(mode); }, [fetchQuestions, mode]);
 
-  // Countdown timer for exam mode
+  // Countdown timer — always enabled for exams and retests (paced per question).
   useEffect(() => {
-    if (mode !== 'exam' || phase !== 'answering' || !settings || settings.timeLimitMinutes <= 0) {
+    if (mode !== 'exam' || phase !== 'answering' || questions.length === 0) {
       setTimeLeft(null);
       return;
     }
-    const secs = settings.timeLimitMinutes * 60;
+    const secs = timerSecondsFor(settings, questions.length);
+    if (secs <= 0) { setTimeLeft(null); return; }
     setTimeLeft(secs);
     const interval = setInterval(() => {
       setTimeLeft((prev) => {
@@ -500,7 +624,7 @@ function QuizStep({
       });
     }, 1000);
     return () => clearInterval(interval);
-  }, [mode, phase, settings]);
+  }, [mode, phase, settings, questions.length]);
 
   // Notify parent when exam is active (to lock sidebar navigation)
   useEffect(() => {
@@ -543,22 +667,28 @@ function QuizStep({
 
   const handleSubmit = useCallback(() => {
     let correct = 0;
+    const wrong: PreparedQuestion[] = [];
     for (const q of questions) {
       if (answers[q._id] === q.correctAnswer) correct++;
+      else wrong.push(q);
     }
     const pct = questions.length > 0 ? Math.round((correct / questions.length) * 100) : 0;
     const newAttempts = localAttempts + 1;
     setScore(pct);
     setLocalAttempts(newAttempts);
+    setRetestQueue(wrong);
     setPhase('review');
 
     if (mode === 'trial') {
       onComplete(pct, false, true, newAttempts);
     } else {
-      const passed = pct >= (settings?.passingScore ?? 70);
+      // A retest must be answered perfectly; the main exam uses the configured score.
+      const required = isRetest ? 100 : (settings?.passingScore ?? 80);
+      const passed = pct >= required;
+      setExamAttempts((n) => n + 1);
       onComplete(pct, passed, false, newAttempts);
     }
-  }, [questions, answers, localAttempts, mode, settings, onComplete]);
+  }, [questions, answers, localAttempts, mode, isRetest, settings, onComplete]);
 
   // Keep ref in sync so timer can auto-submit
   useEffect(() => { submitRef.current = handleSubmit; }, [handleSubmit]);
@@ -570,8 +700,15 @@ function QuizStep({
     fetchQuestions('exam');
   };
 
-  const retryExam = () => {
-    fetchQuestions('exam');
+  // Re-attempt only the questions missed in the previous attempt. Each retest
+  // narrows to whatever is still wrong, and requires every answer to be correct.
+  const startRetest = () => {
+    setQuestions(retestQueue);
+    setAnswers({});
+    setScore(0);
+    setError('');
+    setIsRetest(true);
+    setPhase('answering');
   };
 
   // ── Already passed (step.completed) — show summary ──────────────────────────
@@ -701,16 +838,16 @@ function QuizStep({
                     <span className="mt-0.5 h-4 w-4 shrink-0 rounded-full bg-purple-100 text-center text-[10px] font-bold leading-4 text-purple-700">2</span>
                     You have <strong>{MAX_TAB_VIOLATIONS} warnings</strong> before your exam is auto-submitted.
                   </li>
-                  {settings?.timeLimitMinutes ? (
-                    <li className="flex items-start gap-2">
-                      <span className="mt-0.5 h-4 w-4 shrink-0 rounded-full bg-purple-100 text-center text-[10px] font-bold leading-4 text-purple-700">3</span>
-                      You have <strong>{settings.timeLimitMinutes} minutes</strong> to complete the exam.
-                    </li>
-                  ) : null}
                   <li className="flex items-start gap-2">
-                    <span className={`mt-0.5 h-4 w-4 shrink-0 rounded-full bg-purple-100 text-center text-[10px] font-bold leading-4 text-purple-700`}>
-                      {settings?.timeLimitMinutes ? '4' : '3'}
-                    </span>
+                    <span className="mt-0.5 h-4 w-4 shrink-0 rounded-full bg-purple-100 text-center text-[10px] font-bold leading-4 text-purple-700">3</span>
+                    The exam is <strong>timed</strong> — you have about{' '}
+                    <strong>
+                      {Math.max(1, Math.round(timerSecondsFor(settings, settings?.examQuestionCount ?? 20) / 60))} minutes
+                    </strong>{' '}
+                    to complete it.
+                  </li>
+                  <li className="flex items-start gap-2">
+                    <span className="mt-0.5 h-4 w-4 shrink-0 rounded-full bg-purple-100 text-center text-[10px] font-bold leading-4 text-purple-700">4</span>
                     You must score the required passing marks to complete this training.
                   </li>
                 </ul>
@@ -738,59 +875,122 @@ function QuizStep({
 
   // ── Review after exam ──────────────────────────────────────────────────────
   if (phase === 'review' && mode === 'exam') {
-    const passingScore = settings?.passingScore ?? 70;
+    const passingScore = isRetest ? 100 : (settings?.passingScore ?? 80);
     const passed = score >= passingScore;
+    const missedCount = retestQueue.length;
+    const maxAttempts = settings?.maxAttempts ?? 0;          // 0 = unlimited
+    const attemptsExhausted = maxAttempts > 0 && examAttempts >= maxAttempts;
+    const attemptsLeft = maxAttempts > 0 ? Math.max(0, maxAttempts - examAttempts) : null;
+    const canRetest = !passed && missedCount > 0 && !attemptsExhausted;
+    // Correct answers stay hidden through every retry — revealed only once the
+    // learner passes or has used up all allocated attempts without passing.
+    const revealAnswers = passed || attemptsExhausted;
     return (
       <div className="flex flex-1 flex-col items-center gap-5 py-6">
-        <div className={`flex h-20 w-20 items-center justify-center rounded-full ${passed ? 'bg-green-100' : 'bg-red-100'}`}>
-          {passed
-            ? <Trophy className="h-10 w-10 text-green-600" />
-            : <X className="h-10 w-10 text-red-500" />}
-        </div>
-        <div className="text-center">
-          <p className="text-3xl font-bold text-gray-800">{score}%</p>
-          <p className={`mt-1 text-sm font-semibold ${passed ? 'text-green-600' : 'text-red-600'}`}>
-            {passed ? 'Congratulations — you passed!' : `Did not pass — minimum is ${passingScore}%`}
+        {/* Prominent score hero */}
+        <div className={`flex w-full max-w-md flex-col items-center gap-4 rounded-3xl border px-8 py-10 text-center shadow-sm ${
+          passed
+            ? 'border-green-200 bg-linear-to-b from-green-50 to-white'
+            : 'border-red-200 bg-linear-to-b from-red-50 to-white'
+        }`}>
+          <div className={`flex h-16 w-16 items-center justify-center rounded-full ${passed ? 'bg-green-100' : 'bg-red-100'}`}>
+            {passed
+              ? <Trophy className="h-8 w-8 text-green-600" />
+              : <X className="h-8 w-8 text-red-500" />}
+          </div>
+          <p className={`flex items-start justify-center font-black leading-none tracking-tight tabular-nums ${passed ? 'text-green-600' : 'text-red-600'}`}>
+            <span className="text-7xl sm:text-8xl">{score}</span>
+            <span className="mt-1 text-3xl font-extrabold sm:text-4xl">%</span>
           </p>
-          <p className="mt-0.5 text-xs text-gray-400">
+          <p className={`text-base font-bold ${passed ? 'text-green-700' : 'text-red-700'}`}>
+            {passed
+              ? 'Congratulations — you passed!'
+              : isRetest
+              ? 'Retest not complete — every question must be correct'
+              : `Did not pass — minimum is ${passingScore}%`}
+          </p>
+          <span className="inline-flex items-center rounded-full bg-white px-3.5 py-1 text-xs font-semibold text-gray-600 shadow-sm ring-1 ring-inset ring-gray-200">
             {questions.filter((q) => answers[q._id] === q.correctAnswer).length} of {questions.length} correct
-          </p>
+          </span>
         </div>
 
-        {/* Answer review for exam too */}
-        <div className="w-full max-w-2xl space-y-3">
-          {questions.map((q, i) => {
-            const given = answers[q._id];
-            const isRight = given === q.correctAnswer;
-            const correctText = q.displayOptions.find((o) => o.label === q.correctAnswer)?.text ?? q.correctAnswer;
-            const givenText = q.displayOptions.find((o) => o.label === given)?.text;
-            return (
-              <div
-                key={q._id}
-                className={`rounded-xl border p-3 text-sm ${isRight ? 'border-green-200 bg-green-50' : 'border-red-200 bg-red-50'}`}
-              >
-                <p className="font-medium text-gray-800">{i + 1}. {q.question}</p>
-                <p className={`mt-1 text-xs ${isRight ? 'text-green-700' : 'text-red-700'}`}>
-                  {isRight
-                    ? `Correct: ${correctText}`
-                    : <>Your answer: {givenText || '—'} · Correct: {correctText}</>
-                  }
-                </p>
-                {!isRight && q.explanation && (
-                  <p className="mt-1 text-xs text-gray-500">{q.explanation}</p>
-                )}
-              </div>
-            );
-          })}
-        </div>
+        {/* Answers stay hidden while retries remain */}
+        {!revealAnswers && (
+          <div className="flex w-full max-w-md items-start gap-3 rounded-xl border border-gray-200 bg-gray-50 p-4">
+            <Lock className="mt-0.5 h-4 w-4 shrink-0 text-gray-400" />
+            <p className="text-xs text-gray-500">
+              The correct answers stay hidden while you still have attempts left, so your retest
+              is a fair test of what you&apos;ve learned. They&apos;ll be shown only if you use all
+              attempts without passing.
+            </p>
+          </div>
+        )}
 
-        {!passed && (
-          <button
-            onClick={retryExam}
-            className="flex items-center gap-1.5 rounded-lg border border-gray-200 px-5 py-2.5 text-sm font-medium text-gray-600 hover:bg-gray-50"
-          >
-            <RefreshCw className="h-3.5 w-3.5" /> Retry Exam
-          </button>
+        {/* Answer review — only once revealed */}
+        {revealAnswers && (
+          <div className="w-full max-w-2xl space-y-3">
+            {questions.map((q, i) => {
+              const given = answers[q._id];
+              const isRight = given === q.correctAnswer;
+              const correctText = q.displayOptions.find((o) => o.label === q.correctAnswer)?.text ?? q.correctAnswer;
+              const givenText = q.displayOptions.find((o) => o.label === given)?.text;
+              return (
+                <div
+                  key={q._id}
+                  className={`rounded-xl border p-3 text-sm ${isRight ? 'border-green-200 bg-green-50' : 'border-red-200 bg-red-50'}`}
+                >
+                  <p className="font-medium text-gray-800">{i + 1}. {q.question}</p>
+                  <p className={`mt-1 text-xs ${isRight ? 'text-green-700' : 'text-red-700'}`}>
+                    {isRight
+                      ? `Correct: ${correctText}`
+                      : <>Your answer: {givenText || '—'} · Correct: {correctText}</>
+                    }
+                  </p>
+                  {!isRight && q.explanation && (
+                    <p className="mt-1 text-xs text-gray-500">{q.explanation}</p>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {canRetest && (
+          <div className="flex w-full max-w-2xl flex-col items-center gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4 text-center">
+            <p className="text-sm font-semibold text-amber-800">
+              {isRetest
+                ? `Almost there — ${missedCount} question${missedCount !== 1 ? 's' : ''} still need a correct answer.`
+                : `No need to redo the whole exam — just the ${missedCount} question${missedCount !== 1 ? 's' : ''} you missed.`}
+            </p>
+            <p className="text-xs text-amber-700">
+              This retest includes <strong>only your incorrect questions</strong> and requires
+              <strong> 100%</strong> — answer them all correctly to complete the assessment.
+            </p>
+            <button
+              onClick={startRetest}
+              className="flex items-center gap-1.5 rounded-lg bg-purple-600 px-5 py-2.5 text-sm font-semibold text-white shadow hover:bg-purple-700"
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+              Start Retest · {missedCount} question{missedCount !== 1 ? 's' : ''}
+            </button>
+            {attemptsLeft !== null && (
+              <p className="text-[11px] font-medium text-amber-600">
+                {attemptsLeft} attempt{attemptsLeft !== 1 ? 's' : ''} remaining
+              </p>
+            )}
+          </div>
+        )}
+
+        {attemptsExhausted && !passed && (
+          <div className="flex w-full max-w-2xl flex-col items-center gap-2 rounded-xl border border-red-200 bg-red-50 p-4 text-center">
+            <p className="text-sm font-semibold text-red-800">
+              You&apos;ve used all {maxAttempts} attempt{maxAttempts !== 1 ? 's' : ''}.
+            </p>
+            <p className="text-xs text-red-700">
+              The correct answers and explanations for the questions you missed are shown above.
+              Please review them and contact your trainer to be re-assigned this assessment.
+            </p>
+          </div>
         )}
       </div>
     );
@@ -798,7 +998,7 @@ function QuizStep({
 
   // ── Answering phase ────────────────────────────────────────────────────────
   const allAnswered = questions.length > 0 && questions.every((q) => answers[q._id]);
-  const passingScore = settings?.passingScore ?? 70;
+  const passingScore = isRetest ? 100 : (settings?.passingScore ?? 80);
 
   return (
     <div className="flex flex-1 flex-col gap-4">
@@ -830,11 +1030,15 @@ function QuizStep({
       <div className={`flex items-center justify-between rounded-lg px-3 py-2 text-xs font-medium ${
         mode === 'trial'
           ? 'border border-blue-200 bg-blue-50 text-blue-700'
+          : isRetest
+          ? 'border border-amber-200 bg-amber-50 text-amber-700'
           : 'border border-purple-200 bg-purple-50 text-purple-700'
       }`}>
         <span>
           {mode === 'trial'
             ? `Demo Assessment — ${questions.length} sample questions · No pass/fail`
+            : isRetest
+            ? `Retest — ${questions.length} missed question${questions.length !== 1 ? 's' : ''} · Must answer all correctly (100%)`
             : `Exam — ${questions.length} questions · Pass: ${passingScore}%`}
         </span>
         <div className="flex items-center gap-3">
@@ -884,7 +1088,7 @@ function QuizStep({
         className="flex items-center justify-center gap-2 rounded-lg bg-purple-600 py-3 text-sm font-medium text-white shadow hover:bg-purple-700 disabled:cursor-not-allowed disabled:opacity-50"
       >
         <ClipboardList className="h-4 w-4" />
-        {mode === 'trial' ? 'Submit Demo' : 'Submit Exam'}
+        {mode === 'trial' ? 'Submit Demo' : isRetest ? 'Submit Retest' : 'Submit Exam'}
       </button>
     </div>
   );

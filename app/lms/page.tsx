@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   GraduationCap, LogOut, Search, PlayCircle, BookOpen, Clock,
@@ -247,12 +247,14 @@ function TrainingTable({
   certMap,
   onStart,
   onCertificate,
+  onPrefetch,
 }: {
   rows: SopAssignment[];
   progressMap: Map<string, ProgressRecord>;
   certMap: Map<string, CertRecord>;
   onStart: (sopCode: string) => void;
   onCertificate: (sopCode: string) => void;
+  onPrefetch?: (sopCode: string) => void;
 }) {
   const [sort, setSort] = useState<SortState>({ key: 'sopCode', dir: 'asc' });
 
@@ -328,6 +330,8 @@ function TrainingTable({
               return (
                 <tr
                   key={`${assignment.sopCode}-${assignment.month}-${assignment.year}`}
+                  onMouseEnter={() => onPrefetch?.(assignment.sopCode)}
+                  onFocus={() => onPrefetch?.(assignment.sopCode)}
                   className={`transition hover:bg-gray-50/80 ${overdue ? 'bg-red-50/40' : scheduled ? 'bg-sky-50/30' : ''}`}
                 >
                   <td className="px-3 py-2.5">
@@ -434,10 +438,12 @@ function ContinueLearning({
   assignments,
   progressMap,
   onOpen,
+  onPrefetch,
 }: {
   assignments: SopAssignment[];
   progressMap: Map<string, ProgressRecord>;
   onOpen: (sopCode: string) => void;
+  onPrefetch?: (sopCode: string) => void;
 }) {
   const inProgress = assignments
     .filter((a) => progressMap.get(a.sopCode)?.status === 'in_progress')
@@ -463,6 +469,8 @@ function ContinueLearning({
             <button
               key={a.sopCode}
               onClick={() => onOpen(a.sopCode)}
+              onMouseEnter={() => onPrefetch?.(a.sopCode)}
+              onFocus={() => onPrefetch?.(a.sopCode)}
               className="group relative overflow-hidden rounded-xl border border-purple-200 bg-linear-to-br from-purple-50 to-white p-4 text-left shadow-sm transition hover:shadow-md hover:border-purple-400"
             >
               <div className="mb-2 flex items-start justify-between gap-2">
@@ -671,6 +679,25 @@ function Dashboard({ employee, onLogout }: { employee: Employee; onLogout: () =>
     router.push(`/lms/certificate/${sopCode}`);
   }, [router]);
 
+  // Warm the journey cache on hover/focus so clicking "Start"/"Continue" paints
+  // the journey page instantly instead of waiting on the fetch. Purely additive:
+  // it writes the same client-cache field the journey page already reads, and
+  // each SOP is fetched at most once per session.
+  const prefetched = useRef<Set<string>>(new Set());
+  const prefetchJourney = useCallback((sopCode: string) => {
+    if (!sopCode || prefetched.current.has(sopCode)) return;
+    const field = lmsClientFields.journey(sopCode);
+    const cached = readLmsClientCache(field);
+    if (cached && Date.now() - cached.cachedAt <= LMS_CLIENT_FRESH_MS) return;
+    prefetched.current.add(sopCode);
+    fetch(`/api/lms/journey/${sopCode}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((json) => {
+        if (json && !json.error) writeLmsClientCache(field, json);
+      })
+      .catch(() => { prefetched.current.delete(sopCode); });
+  }, []);
+
   const certMap = useMemo(() => {
     const m = new Map<string, CertRecord>();
     for (const c of certificates) {
@@ -753,7 +780,7 @@ function Dashboard({ employee, onLogout }: { employee: Employee; onLogout: () =>
             <StatsRow assignments={assignments} progressMap={progressMap} />
 
             {/* Continue learning */}
-            <ContinueLearning assignments={assignments} progressMap={progressMap} onOpen={handleOpen} />
+            <ContinueLearning assignments={assignments} progressMap={progressMap} onOpen={handleOpen} onPrefetch={prefetchJourney} />
 
             {/* Certificates */}
             {certificates.length > 0 && (
@@ -847,6 +874,7 @@ function Dashboard({ employee, onLogout }: { employee: Employee; onLogout: () =>
                   certMap={certMap}
                   onStart={handleOpen}
                   onCertificate={handleCertificate}
+                  onPrefetch={prefetchJourney}
                 />
               )}
 

@@ -1,9 +1,9 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import {
   AlertCircle, Award, Check, ClipboardList, Eye, Hash, Loader2, Plus,
-  RotateCcw, Save, Shuffle, Timer, Trash2,
+  RotateCcw, Save, Shuffle, Timer, Trash2, type LucideIcon,
 } from 'lucide-react';
 import {
   lmsClientFields,
@@ -43,7 +43,7 @@ export interface ExamSettings {
 export const EXAM_SETTINGS_DEFAULT: ExamSettings = {
   examQuestionCount: 20,
   trialQuestionCount: 5,
-  passingScore: 70,
+  passingScore: 80,
   passingScoreRules: [],
   timeLimitMinutes: 0,
   shuffleQuestions: true,
@@ -53,6 +53,32 @@ export const EXAM_SETTINGS_DEFAULT: ExamSettings = {
   maxAttempts: 0,
 };
 
+/** A titled, bordered card that groups related settings rows vertically. */
+function SettingsCard({
+  icon: Icon, title, subtitle, children, bodyClassName,
+}: {
+  icon: LucideIcon;
+  title: string;
+  subtitle?: string;
+  children: ReactNode;
+  bodyClassName?: string;
+}) {
+  return (
+    <section className="overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-sm">
+      <div className="flex items-center gap-3 border-b border-gray-100 px-5 py-4">
+        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-purple-50 text-purple-600">
+          <Icon className="h-4.5 w-4.5" />
+        </div>
+        <div className="min-w-0">
+          <h2 className="text-sm font-bold text-gray-800">{title}</h2>
+          {subtitle && <p className="mt-0.5 text-xs text-gray-400">{subtitle}</p>}
+        </div>
+      </div>
+      <div className={bodyClassName ?? 'divide-y divide-gray-100'}>{children}</div>
+    </section>
+  );
+}
+
 function NumberInput({
   label, description, value, onChange, min, max, unit,
 }: {
@@ -60,12 +86,12 @@ function NumberInput({
   onChange: (v: number) => void; min: number; max?: number; unit?: string;
 }) {
   return (
-    <div className="flex items-start justify-between gap-4 rounded-xl border border-gray-200 bg-white p-4">
-      <div className="flex-1">
+    <div className="flex items-center justify-between gap-4 px-5 py-4">
+      <div className="min-w-0 flex-1">
         <p className="text-sm font-semibold text-gray-800">{label}</p>
-        <p className="mt-0.5 text-xs text-gray-400">{description}</p>
+        <p className="mt-0.5 text-xs leading-relaxed text-gray-400">{description}</p>
       </div>
-      <div className="flex items-center gap-2">
+      <div className="flex shrink-0 items-center rounded-lg border border-gray-200 transition focus-within:border-purple-300 focus-within:ring-2 focus-within:ring-purple-100">
         <input
           type="number"
           min={min}
@@ -75,9 +101,9 @@ function NumberInput({
             const v = Number(e.target.value);
             if (!isNaN(v) && v >= min && (!max || v <= max)) onChange(v);
           }}
-          className="w-24 rounded-lg border border-gray-200 px-3 py-2 text-center text-sm font-semibold focus:border-purple-300 focus:outline-none"
+          className={`w-14 bg-transparent py-2 text-center text-sm font-bold text-gray-800 focus:outline-none ${unit ? 'pl-3' : 'px-3'}`}
         />
-        {unit && <span className="text-xs text-gray-400 shrink-0">{unit}</span>}
+        {unit && <span className="pr-3 text-xs font-medium text-gray-400">{unit}</span>}
       </div>
     </div>
   );
@@ -89,20 +115,22 @@ function Toggle({
   label: string; description: string; checked: boolean; onChange: (v: boolean) => void;
 }) {
   return (
-    <div className="flex items-start justify-between gap-4 rounded-xl border border-gray-200 bg-white p-4">
-      <div className="flex-1">
+    <div className="flex items-center justify-between gap-4 px-5 py-4">
+      <div className="min-w-0 flex-1">
         <p className="text-sm font-semibold text-gray-800">{label}</p>
-        <p className="mt-0.5 text-xs text-gray-400">{description}</p>
+        <p className="mt-0.5 text-xs leading-relaxed text-gray-400">{description}</p>
       </div>
       <button
         type="button"
+        role="switch"
+        aria-checked={checked}
         onClick={() => onChange(!checked)}
-        className={`relative inline-flex h-6 w-11 shrink-0 rounded-full border-2 border-transparent transition-colors focus:outline-none ${
+        className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full border-2 border-transparent transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-purple-300 ${
           checked ? 'bg-purple-600' : 'bg-gray-200'
         }`}
       >
         <span
-          className={`inline-block h-5 w-5 rounded-full bg-white shadow ring-0 transition-transform ${
+          className={`inline-block h-5 w-5 rounded-full bg-white shadow transition-transform ${
             checked ? 'translate-x-5' : 'translate-x-0'
           }`}
         />
@@ -111,7 +139,7 @@ function Toggle({
   );
 }
 
-const selectCls = 'rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs focus:border-purple-300 focus:outline-none';
+const selectCls = 'w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-xs text-gray-700 transition focus:border-purple-300 focus:outline-none focus:ring-2 focus:ring-purple-100';
 
 function PassingScoreRulesSection({
   rules, defaultScore, onChange,
@@ -198,53 +226,59 @@ function PassingScoreRulesSection({
   };
 
   return (
-    <section>
-      <div className="mb-3 flex items-center gap-2">
-        <Award className="h-4 w-4 text-purple-600" />
-        <h2 className="text-sm font-bold text-gray-800">Passing Score by Department / Designation</h2>
-      </div>
-
-      <div className="rounded-xl border border-gray-200 bg-white overflow-hidden">
-        {rules.length === 0 ? (
-          <div className="px-4 py-6 text-center text-xs text-gray-400">
-            No rules yet — the default score ({defaultScore}%) applies to everyone.
-          </div>
-        ) : (
+    <SettingsCard
+      icon={Award}
+      title="Passing Score by Department / Designation"
+      subtitle="Override the default score for specific people, departments, or roles."
+      bodyClassName=""
+    >
+      {rules.length === 0 ? (
+        <div className="px-5 py-8 text-center text-xs text-gray-400">
+          No rules yet — the default score ({defaultScore}%) applies to everyone.
+        </div>
+      ) : (
+        <div className="overflow-x-auto">
           <table className="w-full text-xs">
-            <thead className="border-b border-gray-100 bg-gray-50">
+            <thead className="border-b border-gray-100 bg-gray-50/70">
               <tr>
-                <th className="px-4 py-2 text-left font-semibold text-gray-500">Employee</th>
-                <th className="px-4 py-2 text-left font-semibold text-gray-500">Department</th>
-                <th className="px-4 py-2 text-left font-semibold text-gray-500">Designation</th>
-                <th className="px-4 py-2 text-center font-semibold text-gray-500">Pass %</th>
-                <th className="px-4 py-2" />
+                <th className="px-5 py-2.5 text-left font-semibold uppercase tracking-wider text-gray-500">Employee</th>
+                <th className="px-4 py-2.5 text-left font-semibold uppercase tracking-wider text-gray-500">Department</th>
+                <th className="px-4 py-2.5 text-left font-semibold uppercase tracking-wider text-gray-500">Designation</th>
+                <th className="px-4 py-2.5 text-center font-semibold uppercase tracking-wider text-gray-500">Pass %</th>
+                <th className="px-5 py-2.5" />
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-100">
               {rules.map((r, i) => (
-                <tr key={i} className="hover:bg-gray-50">
-                  <td className="px-4 py-2 text-gray-700">
+                <tr key={i} className="transition hover:bg-gray-50">
+                  <td className="whitespace-nowrap px-5 py-3 text-gray-700">
                     {r.employeeName
-                      ? <span className="font-medium text-purple-700">{r.employeeName}</span>
+                      ? <span className="font-semibold text-purple-700">{r.employeeName}</span>
                       : <span className="italic text-gray-400">Any</span>}
                   </td>
-                  <td className="px-4 py-2 font-medium text-gray-700">
+                  <td className="whitespace-nowrap px-4 py-3 font-medium text-gray-700">
                     {r.department || <span className="italic text-gray-400">Any</span>}
                   </td>
-                  <td className="px-4 py-2 text-gray-600">
+                  <td className="whitespace-nowrap px-4 py-3 text-gray-600">
                     {r.designation || <span className="italic text-gray-400">Any</span>}
                   </td>
-                  <td className="px-4 py-2 text-center">
-                    <input
-                      type="number" min={1} max={100}
-                      value={r.passingScore}
-                      onChange={(e) => updateScore(i, e.target.value)}
-                      className="w-16 rounded border border-gray-200 px-2 py-1 text-center text-xs font-semibold focus:border-purple-300 focus:outline-none"
-                    />
-                    <span className="ml-1 text-gray-400">%</span>
+                  <td className="px-4 py-3 text-center">
+                    <span className="inline-flex items-center rounded-lg border border-gray-200 transition focus-within:border-purple-300 focus-within:ring-2 focus-within:ring-purple-100">
+                      <input
+                        type="number" min={1} max={100}
+                        value={r.passingScore}
+                        onChange={(e) => updateScore(i, e.target.value)}
+                        className="w-12 bg-transparent py-1.5 pl-2 text-center text-xs font-bold text-gray-800 focus:outline-none"
+                      />
+                      <span className="pr-2 text-gray-400">%</span>
+                    </span>
                   </td>
-                  <td className="px-4 py-2 text-right">
-                    <button onClick={() => removeRule(i)} className="text-gray-300 hover:text-red-500">
+                  <td className="px-5 py-3 text-right">
+                    <button
+                      onClick={() => removeRule(i)}
+                      className="rounded-md p-1.5 text-gray-300 transition hover:bg-red-50 hover:text-red-500"
+                      title="Remove rule"
+                    >
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>
                   </td>
@@ -252,66 +286,74 @@ function PassingScoreRulesSection({
               ))}
             </tbody>
           </table>
-        )}
+        </div>
+      )}
 
-        <div className="border-t border-gray-100 bg-gray-50/60 px-4 py-3">
-          <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-gray-400">Add Rule</p>
-          {metaLoading ? (
-            <p className="text-xs text-gray-400">Loading employee data…</p>
-          ) : (
-            <div className="flex flex-wrap items-end gap-2">
-              <div className="flex flex-col gap-1">
-                <label className="text-[10px] text-gray-400">Employee (optional)</label>
-                <select value={empId} onChange={(e) => handleEmpChange(e.target.value)} className={selectCls} style={{ minWidth: 160 }}>
-                  <option value="">— Any employee —</option>
-                  {employees.map((e) => (
-                    <option key={e.id} value={e.id}>{e.name}</option>
-                  ))}
-                </select>
-              </div>
-              <div className="flex flex-col gap-1">
-                <label className="text-[10px] text-gray-400">Department (blank = any)</label>
-                <select value={dept} onChange={(e) => setDept(e.target.value)} className={selectCls} style={{ minWidth: 130 }}>
-                  <option value="">— Any —</option>
-                  {departments.map((d) => (
-                    <option key={d} value={d}>{d}</option>
-                  ))}
-                </select>
-              </div>
-              <div className="flex flex-col gap-1">
-                <label className="text-[10px] text-gray-400">Designation (blank = any)</label>
-                <select value={desig} onChange={(e) => setDesig(e.target.value)} className={selectCls} style={{ minWidth: 130 }}>
-                  <option value="">— Any —</option>
-                  {designations.map((d) => (
-                    <option key={d} value={d}>{d}</option>
-                  ))}
-                </select>
-              </div>
-              <div className="flex flex-col gap-1">
-                <label className="text-[10px] text-gray-400">Pass %</label>
-                <input
-                  type="number" min={1} max={100}
-                  value={score}
-                  onChange={(e) => setScore(e.target.value)}
-                  placeholder="80"
-                  className={`w-20 ${selectCls}`}
-                />
-              </div>
+      <div className="border-t border-gray-100 bg-gray-50/50 px-5 py-4">
+        <p className="mb-3 text-[11px] font-bold uppercase tracking-wider text-gray-400">Add Rule</p>
+        {metaLoading ? (
+          <p className="flex items-center gap-2 text-xs text-gray-400">
+            <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading employee data…
+          </p>
+        ) : (
+          <div className="grid grid-cols-1 items-end gap-3 sm:grid-cols-2 lg:grid-cols-12">
+            <div className="lg:col-span-3">
+              <label className="mb-1 block text-[10px] font-medium uppercase tracking-wide text-gray-400">Employee (optional)</label>
+              <select value={empId} onChange={(e) => handleEmpChange(e.target.value)} className={selectCls}>
+                <option value="">— Any employee —</option>
+                {employees.map((e) => (
+                  <option key={e.id} value={e.id}>{e.name}</option>
+                ))}
+              </select>
+            </div>
+            <div className="lg:col-span-3">
+              <label className="mb-1 block text-[10px] font-medium uppercase tracking-wide text-gray-400">Department</label>
+              <select value={dept} onChange={(e) => setDept(e.target.value)} className={selectCls}>
+                <option value="">— Any —</option>
+                {departments.map((d) => (
+                  <option key={d} value={d}>{d}</option>
+                ))}
+              </select>
+            </div>
+            <div className="lg:col-span-3">
+              <label className="mb-1 block text-[10px] font-medium uppercase tracking-wide text-gray-400">Designation</label>
+              <select value={desig} onChange={(e) => setDesig(e.target.value)} className={selectCls}>
+                <option value="">— Any —</option>
+                {designations.map((d) => (
+                  <option key={d} value={d}>{d}</option>
+                ))}
+              </select>
+            </div>
+            <div className="lg:col-span-1">
+              <label className="mb-1 block text-[10px] font-medium uppercase tracking-wide text-gray-400">Pass %</label>
+              <input
+                type="number" min={1} max={100}
+                value={score}
+                onChange={(e) => setScore(e.target.value)}
+                placeholder="80"
+                className={selectCls}
+              />
+            </div>
+            <div className="lg:col-span-2">
               <button
                 onClick={addRule}
-                className="flex items-center gap-1.5 rounded-lg bg-purple-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-purple-700"
+                className="flex w-full items-center justify-center gap-1.5 rounded-lg bg-purple-600 px-3 py-2 text-xs font-semibold text-white shadow-sm transition hover:bg-purple-700"
               >
-                <Plus className="h-3 w-3" /> Add
+                <Plus className="h-3.5 w-3.5" /> Add Rule
               </button>
             </div>
-          )}
-          {addErr && <p className="mt-1.5 text-[11px] text-red-600">{addErr}</p>}
-          <p className="mt-2 text-[11px] text-gray-400">
-            Match priority: Employee &gt; Dept + Designation &gt; Dept only &gt; Designation only &gt; Default ({defaultScore}%)
+          </div>
+        )}
+        {addErr && (
+          <p className="mt-2 flex items-center gap-1.5 text-[11px] font-medium text-red-600">
+            <AlertCircle className="h-3.5 w-3.5" /> {addErr}
           </p>
-        </div>
+        )}
+        <p className="mt-3 text-[11px] leading-relaxed text-gray-400">
+          Match priority: Employee &gt; Dept + Designation &gt; Dept only &gt; Designation only &gt; Default ({defaultScore}%)
+        </p>
       </div>
-    </section>
+    </SettingsCard>
   );
 }
 
@@ -381,68 +423,67 @@ export function ExamSettingsForm({
   error: string;
 }) {
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       {error && (
-        <div className="flex items-center gap-2 rounded-lg bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="flex items-center gap-2 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
           <AlertCircle className="h-4 w-4 shrink-0" /> {error}
         </div>
       )}
 
-      <div className="rounded-xl border border-purple-200 bg-purple-50 p-4">
-        <p className="text-xs font-semibold text-purple-700">How the quiz works</p>
-        <div className="mt-2 grid gap-3 text-sm text-purple-800 sm:grid-cols-2">
-          <span><strong>1st attempt:</strong> Demo Assessment — {settings.trialQuestionCount} questions, no pass/fail{settings.showAnswersAfterTrial ? ', answers shown after' : ''}</span>
-          <span><strong>2nd attempt+:</strong> Exam — {settings.examQuestionCount} questions, must score ≥{settings.passingScore}%{settings.timeLimitMinutes > 0 ? `, ${settings.timeLimitMinutes} min limit` : ', no time limit'}</span>
+      {/* How the quiz works */}
+      <div className="overflow-hidden rounded-2xl border border-purple-200 bg-linear-to-br from-purple-50 to-white p-5 shadow-sm">
+        <p className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider text-purple-600">
+          <ClipboardList className="h-3.5 w-3.5" /> How the quiz works
+        </p>
+        <div className="mt-3 grid gap-3 sm:grid-cols-2">
+          <div className="flex items-start gap-3 rounded-xl border border-purple-100 bg-white/70 p-3.5">
+            <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-purple-600 text-[11px] font-bold text-white">1</span>
+            <p className="text-sm leading-relaxed text-gray-700">
+              <span className="font-semibold text-gray-900">Demo Assessment</span> — {settings.trialQuestionCount} questions, no pass/fail{settings.showAnswersAfterTrial ? ', answers shown after' : ''}.
+            </p>
+          </div>
+          <div className="flex items-start gap-3 rounded-xl border border-purple-100 bg-white/70 p-3.5">
+            <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-purple-600 text-[11px] font-bold text-white">2</span>
+            <p className="text-sm leading-relaxed text-gray-700">
+              <span className="font-semibold text-gray-900">Exam (2nd attempt+)</span> — {settings.examQuestionCount} questions, must score ≥{settings.passingScore}%{settings.timeLimitMinutes > 0 ? `, ${settings.timeLimitMinutes} min limit` : ', no time limit'}.
+            </p>
+          </div>
         </div>
       </div>
 
-      <div className="grid gap-6 lg:grid-cols-2">
-        <section>
-          <div className="mb-3 flex items-center gap-2">
-            <Hash className="h-4 w-4 text-purple-600" />
-            <h2 className="text-sm font-bold text-gray-800">Question Count</h2>
-          </div>
-          <div className="space-y-2">
-            <NumberInput
-              label="Demo Assessment Questions"
-              description="Questions shown on the first attempt (demo — no pass/fail, answers revealed after)."
-              value={settings.trialQuestionCount}
-              onChange={(v) => set('trialQuestionCount', v)}
-              min={1} max={50}
-            />
-            <NumberInput
-              label="Exam Questions"
-              description="Questions shown on the 2nd attempt onwards (formal exam)."
-              value={settings.examQuestionCount}
-              onChange={(v) => set('examQuestionCount', v)}
-              min={1} max={200}
-            />
-          </div>
-        </section>
+      <SettingsCard icon={Hash} title="Question Count" subtitle="How many questions appear in each stage.">
+        <NumberInput
+          label="Demo Assessment Questions"
+          description="Questions shown on the first attempt (demo — no pass/fail, answers revealed after)."
+          value={settings.trialQuestionCount}
+          onChange={(v) => set('trialQuestionCount', v)}
+          min={1} max={50}
+        />
+        <NumberInput
+          label="Exam Questions"
+          description="Questions shown on the 2nd attempt onwards (formal exam)."
+          value={settings.examQuestionCount}
+          onChange={(v) => set('examQuestionCount', v)}
+          min={1} max={200}
+        />
+      </SettingsCard>
 
-        <section>
-          <div className="mb-3 flex items-center gap-2">
-            <ClipboardList className="h-4 w-4 text-purple-600" />
-            <h2 className="text-sm font-bold text-gray-800">Pass Criteria</h2>
-          </div>
-          <div className="space-y-2">
-            <NumberInput
-              label="Default Passing Score"
-              description="Global fallback — applies when no department/designation rule matches."
-              value={settings.passingScore}
-              onChange={(v) => set('passingScore', v)}
-              min={1} max={100} unit="%"
-            />
-            <NumberInput
-              label="Maximum Attempts"
-              description="Max number of exam attempts allowed (0 = unlimited)."
-              value={settings.maxAttempts}
-              onChange={(v) => set('maxAttempts', v)}
-              min={0} unit="attempts"
-            />
-          </div>
-        </section>
-      </div>
+      <SettingsCard icon={ClipboardList} title="Pass Criteria" subtitle="The score needed to pass and how many attempts are allowed.">
+        <NumberInput
+          label="Default Passing Score"
+          description="Global fallback — applies when no department/designation rule matches."
+          value={settings.passingScore}
+          onChange={(v) => set('passingScore', v)}
+          min={1} max={100} unit="%"
+        />
+        <NumberInput
+          label="Maximum Attempts"
+          description="Max number of exam attempts allowed (0 = unlimited)."
+          value={settings.maxAttempts}
+          onChange={(v) => set('maxAttempts', v)}
+          min={0} unit="attempts"
+        />
+      </SettingsCard>
 
       <PassingScoreRulesSection
         rules={settings.passingScoreRules}
@@ -450,69 +491,52 @@ export function ExamSettingsForm({
         onChange={(rules) => set('passingScoreRules', rules)}
       />
 
-      <div className="grid gap-6 lg:grid-cols-2">
-        <section>
-          <div className="mb-3 flex items-center gap-2">
-            <Timer className="h-4 w-4 text-purple-600" />
-            <h2 className="text-sm font-bold text-gray-800">Time Limit</h2>
-          </div>
-          <NumberInput
-            label="Exam Time Limit"
-            description="Minutes allowed to complete the exam. Set to 0 for no limit."
-            value={settings.timeLimitMinutes}
-            onChange={(v) => set('timeLimitMinutes', v)}
-            min={0} unit="minutes"
-          />
-        </section>
+      <SettingsCard icon={Timer} title="Time Limit" subtitle="Cap how long learners have to finish the exam.">
+        <NumberInput
+          label="Exam Time Limit"
+          description="Minutes allowed to complete the exam. Set to 0 for no limit."
+          value={settings.timeLimitMinutes}
+          onChange={(v) => set('timeLimitMinutes', v)}
+          min={0} unit="minutes"
+        />
+      </SettingsCard>
 
-        <section>
-          <div className="mb-3 flex items-center gap-2">
-            <Shuffle className="h-4 w-4 text-purple-600" />
-            <h2 className="text-sm font-bold text-gray-800">Shuffle</h2>
-          </div>
-          <div className="space-y-2">
-            <Toggle
-              label="Shuffle Questions"
-              description="Randomise the order of questions in each attempt."
-              checked={settings.shuffleQuestions}
-              onChange={(v) => set('shuffleQuestions', v)}
-            />
-            <Toggle
-              label="Shuffle Answer Options"
-              description="Randomise the order of A/B/C/D options for each question."
-              checked={settings.shuffleOptions}
-              onChange={(v) => set('shuffleOptions', v)}
-            />
-          </div>
-        </section>
+      <SettingsCard icon={Shuffle} title="Shuffle" subtitle="Randomise order to discourage answer sharing.">
+        <Toggle
+          label="Shuffle Questions"
+          description="Randomise the order of questions in each attempt."
+          checked={settings.shuffleQuestions}
+          onChange={(v) => set('shuffleQuestions', v)}
+        />
+        <Toggle
+          label="Shuffle Answer Options"
+          description="Randomise the order of A/B/C/D options for each question."
+          checked={settings.shuffleOptions}
+          onChange={(v) => set('shuffleOptions', v)}
+        />
+      </SettingsCard>
+
+      <SettingsCard icon={Eye} title="Demo & Retake" subtitle="Control answer visibility and post-pass retakes.">
+        <Toggle
+          label="Show Answers After Demo"
+          description="Display correct answers and explanations after the demo assessment."
+          checked={settings.showAnswersAfterTrial}
+          onChange={(v) => set('showAnswersAfterTrial', v)}
+        />
+        <Toggle
+          label="Allow Retake After Passing"
+          description="Let employees retake the exam even after they have already passed."
+          checked={settings.allowRetakeAfterPass}
+          onChange={(v) => set('allowRetakeAfterPass', v)}
+        />
+      </SettingsCard>
+
+      <div className="flex items-start gap-2.5 rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4">
+        <RotateCcw className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+        <p className="text-xs leading-relaxed text-amber-700">
+          These settings apply globally to all SOPs. Changes take effect immediately for new quiz sessions.
+        </p>
       </div>
-
-      <section>
-        <div className="mb-3 flex items-center gap-2">
-          <Eye className="h-4 w-4 text-purple-600" />
-          <h2 className="text-sm font-bold text-gray-800">Demo & Retake</h2>
-        </div>
-        <div className="grid gap-2 lg:grid-cols-2">
-          <Toggle
-            label="Show Answers After Demo"
-            description="Display correct answers and explanations after the demo assessment."
-            checked={settings.showAnswersAfterTrial}
-            onChange={(v) => set('showAnswersAfterTrial', v)}
-          />
-          <Toggle
-            label="Allow Retake After Passing"
-            description="Let employees retake the exam even after they have already passed."
-            checked={settings.allowRetakeAfterPass}
-            onChange={(v) => set('allowRetakeAfterPass', v)}
-          />
-        </div>
-        <div className="mt-3 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3">
-          <RotateCcw className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
-          <p className="text-xs text-amber-700">
-            These settings apply globally to all SOPs. Changes take effect immediately for new quiz sessions.
-          </p>
-        </div>
-      </section>
     </div>
   );
 }

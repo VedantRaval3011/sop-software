@@ -40,7 +40,7 @@ export async function GET(req: NextRequest, { params }: Params) {
       settings?.passingScoreRules ?? [],
       employee?.department ?? '',
       employee?.designation ?? '',
-      settings?.passingScore ?? 70,
+      settings?.passingScore ?? 80,
       payload.sub,
     );
 
@@ -105,6 +105,8 @@ export async function GET(req: NextRequest, { params }: Params) {
         timeLimitMinutes:      settings?.timeLimitMinutes      ?? 0,
         shuffleOptions:        settings?.shuffleOptions        ?? false,
         showAnswersAfterTrial: settings?.showAnswersAfterTrial ?? true,
+        maxAttempts:           settings?.maxAttempts           ?? 0,
+        examQuestionCount:     settings?.examQuestionCount      ?? count,
       },
     });
   } catch (err: unknown) {

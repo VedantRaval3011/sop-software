@@ -45,6 +45,14 @@ export async function connectDB() {
     cached.uri = MONGODB_URI;
     cached.promise = mongoose.connect(MONGODB_URI, {
       bufferCommands: false,
+      // Keep a few warm sockets open so bursts (e.g. a department logging in at
+      // shift start) don't each pay TCP+TLS+auth handshake latency on a cold pool.
+      minPoolSize: 5,
+      maxPoolSize: 50,
+      // Fail fast instead of the 30s default when the primary is unreachable, so
+      // a transient DB hiccup surfaces as a quick error rather than a hung page.
+      serverSelectionTimeoutMS: 10_000,
+      socketTimeoutMS: 45_000,
     });
   }
 
