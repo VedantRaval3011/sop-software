@@ -1,0 +1,68 @@
+[
+  {
+    "_id": "6a27b7595d6cc9fc9b6160d4",
+    "set": {
+      "effectiveDate": "2025-01-29T18:30:00.000Z",
+      "reviewDate": "2027-01-28T18:30:00.000Z",
+      "expiryDate": "2027-01-28T18:30:00.000Z",
+      "nextReviewDate": "2027-01-28T18:30:00.000Z",
+      "validityPeriod": 24,
+      "updatedAt": "2026-06-23T05:31:31.972Z"
+    }
+  },
+  {
+    "_id": "6a2e809342bc345bf5659468",
+    "set": {
+      "effectiveDate": "2025-01-29T18:30:00.000Z",
+      "reviewDate": "2027-01-28T18:30:00.000Z",
+      "expiryDate": "2027-01-28T18:30:00.000Z",
+      "nextReviewDate": "2027-01-28T18:30:00.000Z",
+      "validityPeriod": 24,
+      "updatedAt": "2026-06-23T05:31:31.972Z"
+    }
+  },
+  {
+    "_id": "6a297c93367a20aa2a9bbc1e",
+    "set": {
+      "effectiveDate": "2022-04-27T18:30:00.000Z",
+      "reviewDate": "2024-04-26T18:30:00.000Z",
+      "expiryDate": "2024-04-27T18:30:00.000Z",
+      "nextReviewDate": "2024-04-27T18:30:00.000Z",
+      "validityPeriod": 24,
+      "updatedAt": "2026-06-23T05:31:31.987Z"
+    }
+  },
+  {
+    "_id": "6a2e838942bc345bf565a43a",
+    "set": {
+      "effectiveDate": "2022-04-27T18:30:00.000Z",
+      "reviewDate": "2024-04-26T18:30:00.000Z",
+      "expiryDate": "2024-04-27T18:30:00.000Z",
+      "nextReviewDate": "2024-04-27T18:30:00.000Z",
+      "validityPeriod": 24,
+      "updatedAt": "2026-06-23T05:31:31.987Z"
+    }
+  },
+  {
+    "_id": "6a297c94367a20aa2a9bbc20",
+    "set": {
+      "effectiveDate": "2022-10-30T18:30:00.000Z",
+      "reviewDate": "2024-10-29T18:30:00.000Z",
+      "expiryDate": "2024-10-30T18:30:00.000Z",
+      "nextReviewDate": "2024-10-30T18:30:00.000Z",
+      "validityPeriod": 24,
+      "updatedAt": "2026-06-23T05:31:31.987Z"
+    }
+  },
+  {
+    "_id": "6a2e838942bc345bf565a442",
+    "set": {
+      "effectiveDate": "2022-10-30T18:30:00.000Z",
+      "reviewDate": "2024-10-29T18:30:00.000Z",
+      "expiryDate": "2024-10-30T18:30:00.000Z",
+      "nextReviewDate": "2024-10-30T18:30:00.000Z",
+      "validityPeriod": 24,
+      "updatedAt": "2026-06-23T05:31:31.987Z"
+    }
+  }
+]

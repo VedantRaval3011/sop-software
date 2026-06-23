@@ -8,6 +8,7 @@ import {
   aggregateMcqBanksByFamily,
   buildActiveSopFamilyMap,
   findObsoleteMcqFamilies,
+  mcqFamilyComplete,
   mcqResolveDept,
 } from "@/lib/mcq-bank-utils";
 
@@ -48,6 +49,14 @@ type RegistryEntry = {
   hardCount: number;
   lastUpdated: string | null;
   banks: { id: string; langCode: "ENG" | "GUJ" }[];
+  /** True when the family has actual questions in every language it requires —
+   *  the SAME "MCQ Found" criterion the dashboard capsule (stats route) uses. */
+  hasMcq: boolean;
+  /** Per-language MCQ presence — drives the capsule "w/ EN" / "w/ GU" filters so
+   *  the list count matches the capsule (which counts families that HAVE that
+   *  language's MCQs, not merely SOPs authored in that language). */
+  hasEnMcq: boolean;
+  hasGuMcq: boolean;
   isObsoleteMcq?: boolean;
 };
 
@@ -59,6 +68,9 @@ interface FamilyBank {
   easyQ: number;
   mediumQ: number;
   hardQ: number;
+  /** Per-language question totals — drive the dual-language completeness check. */
+  enQ: number;
+  guQ: number;
   lastUpdated: Date | null;
   banks: { id: string; langCode: "ENG" | "GUJ" }[];
 }
@@ -100,6 +112,7 @@ function foldBanks(rawBanks: RawBank[], includeFam: (fam: string, bank: RawBank)
       banksByFamily.set(fam, {
         totalQ: 0, checkedQ: 0, reviewedQ: 0, similarQ: 0,
         easyQ: 0, mediumQ: 0, hardQ: 0,
+        enQ: 0, guQ: 0,
         lastUpdated: null, banks: [],
       });
     }
@@ -112,6 +125,8 @@ function foldBanks(rawBanks: RawBank[], includeFam: (fam: string, bank: RawBank)
     e.mediumQ += b.mediumCount;
     e.hardQ += b.hardCount;
     const langCode: "ENG" | "GUJ" = (b.language ?? "").toLowerCase() === "gujarati" ? "GUJ" : "ENG";
+    if (langCode === "GUJ") e.guQ += b.totalQuestions;
+    else e.enQ += b.totalQuestions;
     if (b._id) e.banks.push({ id: String(b._id), langCode });
     const ts = b.updatedAt ? new Date(b.updatedAt) : null;
     if (ts && (!e.lastUpdated || ts > e.lastUpdated)) e.lastUpdated = ts;
@@ -130,6 +145,15 @@ function toEntry(
   isObsoleteMcq?: boolean,
 ): RegistryEntry {
   const langCode = language === "GUJ" ? "GUJ" : "ENG";
+  // "MCQ Found" means real questions exist in every language the SOP requires —
+  // identical to the dashboard capsule, so the list and capsule stay in sync.
+  const hasMcq = mcqFamilyComplete(
+    {
+      needsEn: language === "ENG" || language === "ENG-GUJ",
+      needsGu: language === "GUJ" || language === "ENG-GUJ",
+    },
+    bank,
+  );
   return {
     id,
     identifier,
@@ -148,6 +172,9 @@ function toEntry(
     hardCount: bank?.hardQ ?? 0,
     lastUpdated: bank?.lastUpdated?.toISOString() ?? null,
     banks: bank?.banks ?? [],
+    hasMcq,
+    hasEnMcq: (bank?.enQ ?? 0) > 0,
+    hasGuMcq: (bank?.guQ ?? 0) > 0,
     isObsoleteMcq,
   };
 }
@@ -223,6 +250,8 @@ async function buildFullRegistry() {
         easyQ: 0,
         mediumQ: 0,
         hardQ: 0,
+        enQ: fam.enQ,
+        guQ: fam.guQ,
         lastUpdated: fam.lastUpdated,
         banks: fam.banks,
       },

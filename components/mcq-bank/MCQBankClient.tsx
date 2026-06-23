@@ -98,6 +98,12 @@ interface RegistryEntry {
   hardCount: number;
   lastUpdated: string | null;
   banks: { id: string; langCode: "ENG" | "GUJ" }[];
+  /** True when the family has real questions in every required language — the
+   *  same "MCQ Found" criterion as the dashboard capsule. */
+  hasMcq: boolean;
+  /** Per-language MCQ presence — backs the capsule "w/ EN" / "w/ GU" filters. */
+  hasEnMcq: boolean;
+  hasGuMcq: boolean;
   isObsoleteMcq?: boolean;
 }
 
@@ -652,6 +658,10 @@ export function MCQBankClient() {
   const [sortCol, setSortCol] = useState("identifier");
   const [sortDir, setSortDir] = useState("asc");
   const [regLangFilter, setRegLangFilter] = useState("All");
+  // Per-language MCQ-coverage filter, driven by the capsule "w/ EN" / "w/ GU"
+  // clicks. Distinct from regLangFilter (SOP language): this matches the capsule
+  // count of families that actually HAVE that language's MCQs.
+  const [langMcqFilter, setLangMcqFilter] = useState<"all" | "en" | "gu">("all");
 
   // UI state
   const [showDeptCards, setShowDeptCards] = useState(true);
@@ -703,17 +713,28 @@ export function MCQBankClient() {
     if (deptFilter !== "all") {
       rows = rows.filter((e) => e.department === deptFilter);
     }
-    // MCQ presence: "found" = SOPs that have at least one MCQ bank;
-    // "notFound" = SOPs with no MCQ bank yet (banks empty / no questions).
+    // MCQ presence mirrors the dashboard capsule exactly: "found" = the family
+    // has real questions in every language it requires (hasMcq); "notFound" =
+    // everything else, including families whose bank exists but has no questions
+    // (or a dual-language SOP missing one language). Filtering on hasMcq — not
+    // banks.length — keeps the list count in sync with the capsule count.
     if (mcqPresence === "found") {
-      rows = rows.filter((e) => e.banks.length > 0);
+      rows = rows.filter((e) => e.hasMcq);
     } else if (mcqPresence === "notFound") {
-      rows = rows.filter((e) => e.banks.length === 0);
+      rows = rows.filter((e) => !e.hasMcq);
     }
     if (regLangFilter === "English") {
       rows = rows.filter((e) => e.language === "ENG" || e.language === "ENG-GUJ");
     } else if (regLangFilter === "Gujarati") {
       rows = rows.filter((e) => e.language === "GUJ" || e.language === "ENG-GUJ");
+    }
+    // Capsule "w/ EN" / "w/ GU": families that HAVE that language's MCQs. Matches
+    // the capsule count exactly (a family authored in English but with no English
+    // MCQs is excluded — it lives in "EN rem." instead).
+    if (langMcqFilter === "en") {
+      rows = rows.filter((e) => e.hasEnMcq);
+    } else if (langMcqFilter === "gu") {
+      rows = rows.filter((e) => e.hasGuMcq);
     }
     if (search.trim()) {
       const q = search.trim().toLowerCase();
@@ -746,7 +767,7 @@ export function MCQBankClient() {
     return { filteredEntries: sorted, total: sorted.length };
   }, [
     allActiveEntries, allObsoleteEntries, obsoleteOnly, deptFilter, mcqPresence, regLangFilter,
-    search, difficulty, sortCol, sortDir,
+    langMcqFilter, search, difficulty, sortCol, sortDir,
   ]);
 
   const totalBanks = stats?.totalMcqBanks ?? allActiveEntries.length;
@@ -770,6 +791,7 @@ export function MCQBankClient() {
     setObsoleteOnly(false);
     setDeptFilter(department === "Total" ? "all" : department);
     setMcqPresence("all");
+    setLangMcqFilter("all");
     setSearch("");
     mcqRegistryRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   }, []);
@@ -779,16 +801,19 @@ export function MCQBankClient() {
     setObsoleteOnly(false);
     setDeptFilter(department === "Total" ? "all" : department);
     setMcqPresence(presence);
+    setLangMcqFilter("all");
     setSearch("");
     mcqRegistryRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   }, []);
 
-  // Filter the registry by language (clicking "w/ EN" / "w/ GU" on a card).
+  // Filter the registry by MCQ language coverage (clicking "w/ EN" / "w/ GU" on a
+  // card) — i.e. families that HAVE that language's MCQs, matching the capsule.
   const applyLangFilter = useCallback((department: string, lang: "English" | "Gujarati") => {
     setObsoleteOnly(false);
     setDeptFilter(department === "Total" ? "all" : department);
     setMcqPresence("all");
-    setRegLangFilter(lang);
+    setRegLangFilter("All");
+    setLangMcqFilter(lang === "English" ? "en" : "gu");
     setSearch("");
     mcqRegistryRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   }, []);
@@ -803,6 +828,7 @@ export function MCQBankClient() {
     setObsoleteOnly((v) => !v);
     setDeptFilter("all");
     setMcqPresence("all");
+    setLangMcqFilter("all");
     setSearch("");
     mcqRegistryRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   }, []);
@@ -1029,7 +1055,7 @@ export function MCQBankClient() {
                   <p className="text-[10px] text-gray-500 mt-0.5">
                     {regLoading ? "Loading…" : obsoleteOnly
                       ? `${total} obsolete MCQ ${total === 1 ? "family" : "families"}`
-                      : `${total} SOP${total === 1 ? "" : "s"}${deptFilter !== "all" ? ` · ${deptFilter}` : ""}${mcqPresence === "notFound" ? " · Not Found" : mcqPresence === "found" ? " · MCQ Found" : ""}`}
+                      : `${total} SOP${total === 1 ? "" : "s"}${deptFilter !== "all" ? ` · ${deptFilter}` : ""}${mcqPresence === "notFound" ? " · Not Found" : mcqPresence === "found" ? " · MCQ Found" : ""}${langMcqFilter === "en" ? " · w/ EN MCQs" : langMcqFilter === "gu" ? " · w/ GU MCQs" : ""}`}
                   </p>
                 </div>
               </div>
@@ -1049,7 +1075,7 @@ export function MCQBankClient() {
                 {!obsoleteOnly && (
                   <select
                     value={deptFilter}
-                    onChange={(e) => { setDeptFilter(e.target.value); setMcqPresence("all"); }}
+                    onChange={(e) => { setDeptFilter(e.target.value); setMcqPresence("all"); setLangMcqFilter("all"); }}
                     className="px-2.5 py-1.5 rounded-lg bg-white border border-gray-300 text-gray-800 text-[11px] focus:outline-none focus:border-purple-400 cursor-pointer"
                   >
                     <option value="all">All Depts</option>
@@ -1078,6 +1104,15 @@ export function MCQBankClient() {
                     }`}
                   >
                     {mcqPresence === "notFound" ? "Not Found" : "MCQ Found"} <X className="h-3 w-3 ml-0.5" />
+                  </button>
+                )}
+                {langMcqFilter !== "all" && !obsoleteOnly && (
+                  <button
+                    type="button"
+                    onClick={() => setLangMcqFilter("all")}
+                    className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-blue-300 bg-blue-100 text-blue-700 text-[10px] font-bold hover:bg-blue-200 transition-colors"
+                  >
+                    {langMcqFilter === "en" ? "w/ EN MCQs" : "w/ GU MCQs"} <X className="h-3 w-3 ml-0.5" />
                   </button>
                 )}
                 <select

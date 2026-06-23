@@ -167,8 +167,11 @@ export async function GET() {
       d.checkedQ += bank.checkedQ;
       d.reviewedQ += bank.reviewedQ;
       d.similarQ += bank.similarQ;
-      if (bank.hasEn) d.sopEng++;
-      if (bank.hasGu) d.sopGuj++;
+      // "w/ EN" / "w/ GU" = families that actually HAVE that language's MCQs
+      // (questions present), not merely an empty bank row. Mirrors the registry's
+      // hasEnMcq/hasGuMcq and mcqFamilyComplete so the capsule and list agree.
+      if (bank.enQ > 0) d.sopEng++;
+      if (bank.guQ > 0) d.sopGuj++;
 
       if (bank.totalQ > 0 && bank.checkedQ >= bank.totalQ) {
         d.approvedSops++;

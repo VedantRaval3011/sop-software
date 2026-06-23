@@ -55,7 +55,7 @@ export default function LmsAdminPage() {
               href="/lms/admin/employee-training"
               className="flex items-center gap-1.5 rounded-lg border border-purple-200 bg-purple-50 px-3 py-1.5 text-xs font-semibold text-purple-700 transition hover:bg-purple-100">
               <LayoutDashboard className="h-3.5 w-3.5" /> Training Dashboard
-            </Link>
+            </Link> 
             <ExamSettingsSaveButton
               saving={saving}
               saved={saved}
