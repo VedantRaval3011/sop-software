@@ -5,6 +5,9 @@ import { BarChart2, ChevronDown, FileText, Pencil, Plus, Presentation, Trash2, V
 import type { DepartmentCapsule } from "@/lib/types";
 import { useDashboardStore } from "@/lib/store/dashboard-store";
 
+// Password required to confirm a department deletion.
+const DELETE_PASSWORD = "indiana132";
+
 function emptyDepartmentCapsule(name: string): DepartmentCapsule {
   const zero = { found: 0, missing: 0 };
   const zeroLang = { found: 0, missing: 0, en: { found: 0, missing: 0 }, gu: { found: 0, missing: 0 } };
@@ -49,6 +52,15 @@ function DepartmentManagerModal({
   // ── Delete tab state ──
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState("");
+  const [deletePassword, setDeletePassword] = useState("");
+  const [deleting, setDeleting] = useState(false);
+
+  // Open/close a department's confirm row, resetting the password + error.
+  const startConfirm = (dept: string | null) => {
+    setConfirmDelete(dept);
+    setDeletePassword("");
+    setDeleteError("");
+  };
 
   // ── Edit tab state ──
   const [editingDept, setEditingDept] = useState<string | null>(null);
@@ -280,42 +292,63 @@ function DepartmentManagerModal({
                         </div>
                         {isEmpty ? (
                           isConfirming ? (
-                            <div className="flex shrink-0 items-center gap-1">
+                            <form
+                              className="flex shrink-0 items-center gap-1"
+                              onSubmit={async (e) => {
+                                e.preventDefault();
+                                if (deleting) return;
+                                if (deletePassword !== DELETE_PASSWORD) {
+                                  setDeleteError("Incorrect password.");
+                                  return;
+                                }
+                                setDeleteError("");
+                                setDeleting(true);
+                                try {
+                                  const res = await fetch("/api/departments", {
+                                    method: "DELETE",
+                                    headers: { "Content-Type": "application/json" },
+                                    body: JSON.stringify({ name: dept.department, password: deletePassword }),
+                                  });
+                                  const data = await res.json();
+                                  if (!res.ok) { setDeleteError(data.error ?? "Failed to delete."); return; }
+                                } catch {
+                                  setDeleteError("Network error. Please try again.");
+                                  return;
+                                } finally {
+                                  setDeleting(false);
+                                }
+                                onDelete(dept.department);
+                                startConfirm(null);
+                              }}
+                            >
+                              <input
+                                type="password"
+                                autoFocus
+                                value={deletePassword}
+                                onChange={(e) => setDeletePassword(e.target.value)}
+                                placeholder="Password"
+                                aria-label={`Password to delete ${dept.department}`}
+                                className="w-24 rounded border border-gray-200 px-1.5 py-0.5 text-[10px] focus:border-red-400 focus:outline-none"
+                              />
                               <button
                                 type="button"
-                                onClick={() => setConfirmDelete(null)}
+                                onClick={() => startConfirm(null)}
                                 className="rounded border border-gray-200 px-2 py-0.5 text-[10px] text-gray-500 hover:bg-gray-50"
                               >
                                 Cancel
                               </button>
                               <button
-                                type="button"
-                                onClick={async () => {
-                                  setDeleteError("");
-                                  try {
-                                    const res = await fetch("/api/departments", {
-                                      method: "DELETE",
-                                      headers: { "Content-Type": "application/json" },
-                                      body: JSON.stringify({ name: dept.department }),
-                                    });
-                                    const data = await res.json();
-                                    if (!res.ok) { setDeleteError(data.error ?? "Failed to delete."); return; }
-                                  } catch {
-                                    setDeleteError("Network error. Please try again.");
-                                    return;
-                                  }
-                                  onDelete(dept.department);
-                                  setConfirmDelete(null);
-                                }}
-                                className="rounded bg-red-600 px-2 py-0.5 text-[10px] font-medium text-white hover:bg-red-700"
+                                type="submit"
+                                disabled={deleting}
+                                className="rounded bg-red-600 px-2 py-0.5 text-[10px] font-medium text-white hover:bg-red-700 disabled:opacity-50"
                               >
-                                Confirm
+                                {deleting ? "Deleting…" : "Confirm"}
                               </button>
-                            </div>
+                            </form>
                           ) : (
                             <button
                               type="button"
-                              onClick={() => setConfirmDelete(dept.department)}
+                              onClick={() => startConfirm(dept.department)}
                               className="shrink-0 rounded p-1 text-gray-400 hover:bg-red-50 hover:text-red-600"
                               title={`Delete ${dept.department}`}
                             >

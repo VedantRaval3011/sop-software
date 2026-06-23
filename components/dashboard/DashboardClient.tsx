@@ -52,6 +52,13 @@ export function DashboardClient() {
 
   const handleDepartmentDeleted = useCallback((name: string) => {
     setDepartmentList((prev) => prev.filter((d) => d !== name));
+    // Also drop the capsule, which is sourced from stats.departments — otherwise
+    // a deleted department keeps showing until the next full stats refetch.
+    setStats((prev) =>
+      prev
+        ? { ...prev, departments: prev.departments.filter((d) => d.department !== name) }
+        : prev,
+    );
   }, []);
 
   // The full grouped registry (active + obsolete). Fetched once and filtered

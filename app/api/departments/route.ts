@@ -4,6 +4,9 @@ import SOP from "@/models/SOP";
 import Department from "@/models/Department";
 import { sortByDeptOrder } from "@/lib/sop-utils";
 
+// Password required to delete a department (also enforced in the UI).
+const DELETE_PASSWORD = "indiana132";
+
 export async function GET() {
   try {
     await connectDB();
@@ -85,10 +88,14 @@ export async function PATCH(request: NextRequest) {
 export async function DELETE(request: NextRequest) {
   try {
     await connectDB();
-    const { name } = await request.json();
+    const { name, password } = await request.json();
     const trimmed = name?.trim();
     if (!trimmed) {
       return NextResponse.json({ error: "Department name required" }, { status: 400 });
+    }
+
+    if (password !== DELETE_PASSWORD) {
+      return NextResponse.json({ error: "Incorrect password." }, { status: 401 });
     }
 
     // Refuse deletion if any active SOPs still belong to this department

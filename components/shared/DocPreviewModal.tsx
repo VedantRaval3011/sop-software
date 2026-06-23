@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import type { PointerEvent as ReactPointerEvent } from "react";
 import { createPortal } from "react-dom";
 import { Download, Loader2, X } from "lucide-react";
 import {
@@ -27,6 +28,73 @@ export function DocPreviewModal({
   const downloadHref = buildPreviewHref(filePath);
   const [iframeLoading, setIframeLoading] = useState(true);
 
+  // Drag-to-move the modal: grab the header and the panel follows the pointer
+  // (free reposition, no placeholder, no blur). Pointer events + pointer capture
+  // give one code path for mouse/touch/pen across browsers and keep the drag
+  // smooth even when the pointer passes over the preview iframe or the page
+  // behind (the iframe would otherwise swallow window-level move events).
+  const modalRef = useRef<HTMLDivElement | null>(null);
+  const [pos, setPos] = useState({ x: 0, y: 0 });
+  const dragRef = useRef<{
+    startX: number; startY: number; baseX: number; baseY: number;
+    naturalLeft: number; naturalTop: number; width: number; height: number;
+  } | null>(null);
+
+  // Clamp a translate offset so the panel stays fully inside the viewport.
+  // `natural` is the panel's position when offset is 0 (it's centred via flex).
+  const clampAxis = (value: number, natural: number, size: number, viewport: number) => {
+    const min = -natural;
+    const max = viewport - natural - size;
+    if (max < min) return min; // panel larger than viewport: pin to top/left edge
+    return Math.min(Math.max(value, min), max);
+  };
+
+  const handleHeaderPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
+    // Let the download link / close button work normally.
+    if ((e.target as HTMLElement).closest("button, a, input")) return;
+    const el = modalRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    dragRef.current = {
+      startX: e.clientX, startY: e.clientY,
+      baseX: pos.x, baseY: pos.y,
+      naturalLeft: rect.left - pos.x,
+      naturalTop: rect.top - pos.y,
+      width: rect.width, height: rect.height,
+    };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+  const handleHeaderPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const d = dragRef.current;
+    if (!d) return;
+    const nextX = clampAxis(d.baseX + (e.clientX - d.startX), d.naturalLeft, d.width, window.innerWidth);
+    const nextY = clampAxis(d.baseY + (e.clientY - d.startY), d.naturalTop, d.height, window.innerHeight);
+    setPos({ x: nextX, y: nextY });
+  };
+  const handleHeaderPointerUp = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (!dragRef.current) return;
+    dragRef.current = null;
+    try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
+  };
+
+  // Keep the panel on-screen if the window is resized after it was moved.
+  useEffect(() => {
+    const onResize = () =>
+      setPos((p) => {
+        const el = modalRef.current;
+        if (!el) return p;
+        const rect = el.getBoundingClientRect();
+        const naturalLeft = rect.left - p.x;
+        const naturalTop = rect.top - p.y;
+        return {
+          x: clampAxis(p.x, naturalLeft, rect.width, window.innerWidth),
+          y: clampAxis(p.y, naturalTop, rect.height, window.innerHeight),
+        };
+      });
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
     document.addEventListener("keydown", onKey);
@@ -38,16 +106,22 @@ export function DocPreviewModal({
   }, [officeEmbedSrc, previewSrc]);
 
   const modal = (
-    <div
-      className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 p-4"
-      onClick={onClose}
-    >
+    // No dimming/click-catching backdrop: the layer ignores pointer events
+    // (pointer-events-none) so the page behind stays visible and interactive
+    // while the preview is open. Close via the X button or Escape.
+    <div className="pointer-events-none fixed inset-0 z-100 flex items-center justify-center p-4">
       <div
-        className="flex w-full max-w-5xl flex-col overflow-hidden rounded-lg bg-white shadow-2xl"
-        style={{ height: "min(90vh, 900px)" }}
-        onClick={(e) => e.stopPropagation()}
+        ref={modalRef}
+        className="pointer-events-auto flex w-full max-w-5xl flex-col overflow-hidden rounded-lg bg-white shadow-2xl"
+        style={{ height: "min(90vh, 900px)", transform: `translate(${pos.x}px, ${pos.y}px)` }}
       >
-        <div className="flex shrink-0 items-center justify-between border-b border-gray-200 px-4 py-2">
+        <div
+          className="flex shrink-0 cursor-grab touch-none select-none items-center justify-between border-b border-gray-200 px-4 py-2 active:cursor-grabbing"
+          onPointerDown={handleHeaderPointerDown}
+          onPointerMove={handleHeaderPointerMove}
+          onPointerUp={handleHeaderPointerUp}
+          onPointerCancel={handleHeaderPointerUp}
+        >
           <span className="truncate text-sm font-semibold text-gray-800">{label}</span>
           <div className="flex items-center gap-2">
             <a
