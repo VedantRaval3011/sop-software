@@ -8,7 +8,8 @@ import { invalidateDashboardSopsCache } from "@/lib/server-cache";
 import { requireAuth } from "@/lib/withAuth";
 
 const REPLACE_PROMPT = `Generate replacement MCQ questions that are NOT similar to the excluded questions.
-Return JSON: { "questions": [{ "question", "optionA", "optionB", "optionC", "optionD", "correctAnswer", "explanation", "difficulty", "topic" }] }`;
+Return JSON: { "questions": [{ "question", "optionA", "optionB", "optionC", "optionD", "correctAnswer", "explanation", "difficulty", "topic", "sopReference" }] }
+"sopReference" is REQUIRED for every question: cite the exact SOP section/clause it is derived from, using the numbered clause as it appears in the text (e.g. "4.6.1.4"). Only if that section has no number, use its heading. Never leave it blank or invent a number not present in the SOP text.`;
 
 export async function POST(request: NextRequest) {
   const auth = await requireAuth(["admin", "trainer"]);
@@ -29,13 +30,20 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "SOP not found" }, { status: 404 });
     }
 
-    // Exclude the questions already in this SOP's bank so the model produces new ones.
+    // Only send a small recent sample of existing questions as "avoid" context —
+    // sending the entire bank (often 100+) bloated input tokens and slowed every
+    // call. appendGeneratedToBank still dedups against the full bank locally, so
+    // uniqueness is guaranteed regardless of what the model sees.
     const existingBank = await MCQBank.findOne({ sopId: sop._id, language }).select("mcqs.question").lean();
-    const excluded = (existingBank?.mcqs ?? []).map((m) => m.question).join("\n- ");
+    const excluded = (existingBank?.mcqs ?? [])
+      .slice(-20)
+      .map((m) => m.question)
+      .join("\n- ");
 
     const result = await generateJson<{ questions: BankInputMcq[] }>(
       REPLACE_PROMPT,
-      `SOP content:\n${sop.content.slice(0, 40000)}\n\nExcluded similar questions:\n- ${excluded}\n\nGenerate ${count} new unique questions in ${language}.`,
+      `SOP content:\n${sop.content.slice(0, 40000)}\n\nDo NOT repeat these recent questions:\n- ${excluded}\n\nGenerate ${count} new unique questions in ${language}.`,
+      { maxAttempts: 2, fastFail503: true },
     );
 
     // appendGeneratedToBank dedups against the existing bank before appending.

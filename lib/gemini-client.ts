@@ -16,6 +16,18 @@ import {
 
 export const DEFAULT_MODEL = DEFAULT_FREE_GEMINI_MODEL;
 
+/** Tuning for a single JSON generation call. The MCQ path passes a low
+ *  `maxAttempts` and `fastFail503` so a transient overload doesn't trigger the
+ *  8×-per-model escalating-backoff storm (only the compliance path historically
+ *  had these guards). */
+export interface GeminiJsonOptions {
+  /** Cap per-model attempts inside generateWithModel (default 8). */
+  maxAttempts?: number;
+  /** On a 503/overload, throw immediately instead of retrying the same model —
+   *  the chain then tries at most one fallback before giving up. */
+  fastFail503?: boolean;
+}
+
 const MODEL_FALLBACK_CHAIN = buildFreeModelChain(
   process.env.GEMINI_MODEL,
   DEFAULT_FREE_GEMINI_MODEL,
@@ -63,7 +75,25 @@ function getComplianceMinGapMs(): number {
 
 function is503Error(error: unknown): boolean {
   const msg = errorMessage(error).toLowerCase();
-  return msg.includes("503") || msg.includes("high demand") || msg.includes("unavailable");
+  return (
+    msg.includes("503") ||
+    msg.includes("high demand") ||
+    msg.includes("unavailable") ||
+    msg.includes("overloaded")
+  );
+}
+
+/** True when the model/service is temporarily unavailable (503 / overloaded).
+ *  Callers use this to stop a run early instead of burning quota on retries. */
+export function isGeminiOverloadedError(error: unknown): boolean {
+  return is503Error(error);
+}
+
+/** The model returned an empty candidate (safety block, MAX_TOKENS with no
+ *  content, etc.). Retrying the SAME model usually repeats the empty result, so
+ *  callers should move to the next fallback model instead. */
+function isNoTextResponseError(error: unknown): boolean {
+  return errorMessage(error).toLowerCase().includes("no text response");
 }
 
 function isDailyQuotaError(error: unknown): boolean {
@@ -215,6 +245,7 @@ async function generateWithModel(
   modelName: string,
   maxAttempts = 8,
   complianceMode = false,
+  fastFail503 = false,
 ): Promise<string> {
   let lastError: unknown;
   const effectiveMax = complianceMode ? Math.min(maxAttempts, 3) : maxAttempts;
@@ -222,8 +253,23 @@ async function generateWithModel(
   for (let attempt = 0; attempt < effectiveMax; attempt++) {
     try {
       const result = await model.generateContent(user);
-      const text = result.response.text();
-      if (!text) throw new Error("No text response from Gemini");
+      const resp = result.response;
+      let text = "";
+      try {
+        text = resp.text() ?? "";
+      } catch {
+        // resp.text() throws when the candidate was blocked — fall through to the
+        // empty-text branch below, which records the reason.
+      }
+      if (!text) {
+        const finishReason = resp.candidates?.[0]?.finishReason;
+        const blockReason = resp.promptFeedback?.blockReason;
+        throw new Error(
+          `No text response from Gemini (finishReason=${finishReason ?? "unknown"}${
+            blockReason ? `, blockReason=${blockReason}` : ""
+          })`,
+        );
+      }
       return text;
     } catch (error) {
       lastError = error;
@@ -244,6 +290,22 @@ async function generateWithModel(
         console.warn(`[gemini] ${modelName} 503 high demand — retry once in 3s`);
         await sleep(3_000);
         continue;
+      }
+
+      // Fast-fail path (MCQ generation): a 503/overload means the service is
+      // busy — retrying the SAME model up to 8× with 5–45s backoff just burns
+      // quota and stalls the request. Bail immediately so the chain tries at
+      // most one fallback model, then stops.
+      if (fastFail503 && is503Error(error)) {
+        console.warn(`[gemini] ${modelName} 503/overloaded — fast-fail (no same-model retry)`);
+        throw error;
+      }
+
+      // Empty candidate (safety/MAX_TOKENS). Same-model retries just repeat it —
+      // bail so the chain tries the next fallback model.
+      if (isNoTextResponseError(error)) {
+        console.warn(`[gemini] ${modelName} ${errorMessage(error)} — trying next model`);
+        throw error;
       }
 
       if (complianceMode && isRateLimitError(error)) {
@@ -290,14 +352,24 @@ async function generateJsonWithChain<T>(
   maxOutputTokens: number,
   logPrefix: string,
   complianceMode = false,
+  options: GeminiJsonOptions = {},
 ): Promise<T> {
   let lastError: unknown;
+  const attemptsPerModel = options.maxAttempts ?? 8;
+  const fastFail503 = options.fastFail503 ?? false;
 
   for (const modelName of chain) {
     for (let parseAttempt = 0; parseAttempt < (complianceMode ? 2 : 3); parseAttempt++) {
       try {
         const model = buildModel(system, modelName, true, maxOutputTokens);
-        const text = await generateWithModel(model, user, modelName, 8, complianceMode);
+        const text = await generateWithModel(
+          model,
+          user,
+          modelName,
+          attemptsPerModel,
+          complianceMode,
+          fastFail503,
+        );
         const parsed = parseJsonFromText<T>(text, logPrefix);
         if (modelName !== chain[0]) {
           console.log(`[${logPrefix}] succeeded with fallback model: ${modelName}`);
@@ -308,10 +380,13 @@ async function generateJsonWithChain<T>(
         if (complianceMode && isGeminiFreeTier() && (isRateLimitError(error) || is503Error(error))) {
           throw error;
         }
-        if (isConnectionError(error) || is503Error(error)) {
-          console.warn(
-            `[${logPrefix}] ${is503Error(error) ? "503" : "connection"} on ${modelName} — trying next free model`,
-          );
+        if (isConnectionError(error) || is503Error(error) || isNoTextResponseError(error)) {
+          const why = is503Error(error)
+            ? "503"
+            : isNoTextResponseError(error)
+              ? "empty response"
+              : "connection";
+          console.warn(`[${logPrefix}] ${why} on ${modelName} — trying next free model`);
           break;
         }
         if (isJsonParseError(error) && parseAttempt < 1) {
@@ -328,6 +403,11 @@ async function generateJsonWithChain<T>(
   }
 
   const msg = errorMessage(lastError);
+  if (isNoTextResponseError(lastError)) {
+    throw new Error(
+      `Gemini returned an empty response on all free models — usually a safety filter or the output-token limit (try shortening the SOP content or reducing the batch size). Details: ${msg.slice(0, 220)}`,
+    );
+  }
   if (isConnectionError(lastError)) {
     throw new Error(
       `Gemini API connection failed after trying all free models. Wait 30 seconds and retry. Details: ${errorDetail(lastError).slice(0, 200)}`,
@@ -341,8 +421,12 @@ async function generateJsonWithChain<T>(
   throw lastError instanceof Error ? lastError : new Error(msg);
 }
 
-export async function generateGeminiJson<T>(system: string, user: string): Promise<T> {
-  return generateJsonWithChain<T>(system, user, MODEL_FALLBACK_CHAIN, 16384, "gemini");
+export async function generateGeminiJson<T>(
+  system: string,
+  user: string,
+  options: GeminiJsonOptions = {},
+): Promise<T> {
+  return generateJsonWithChain<T>(system, user, MODEL_FALLBACK_CHAIN, 16384, "gemini", false, options);
 }
 
 export async function generateGeminiComplianceJson<T>(

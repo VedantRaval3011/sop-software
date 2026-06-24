@@ -1,8 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { connectDB } from "@/lib/mongodb";
 import { requireAuth } from "@/lib/withAuth";
-import { runMcqGeneration } from "@/lib/mcq-generation";
+import { enqueueMcqGeneration } from "@/lib/mcq-generation";
 
+// Kick off generation in the background and return immediately. The previous
+// implementation awaited the full dual-language run (up to 16+ Gemini calls plus
+// retries), which routinely blew past the HTTP timeout. The client now polls
+// GET /api/sop/generate-mcqs/status?identifier=… for live progress.
 export async function POST(request: NextRequest) {
   const auth = await requireAuth(["admin", "trainer"]);
   if (auth.error) return auth.error;
@@ -15,8 +19,8 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "identifier is required" }, { status: 400 });
     }
 
-    const result = await runMcqGeneration(identifier);
-    return NextResponse.json(result);
+    const job = await enqueueMcqGeneration(identifier);
+    return NextResponse.json(job, { status: 202 });
   } catch (error) {
     console.error("POST /api/sop/generate-mcqs error:", error);
     return NextResponse.json(

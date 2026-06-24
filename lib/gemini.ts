@@ -5,6 +5,8 @@ export {
   getProvider,
   getComplianceProvider,
   checkOllamaHealth,
+  isGeminiOverloadedError,
   MODEL,
   type LlmProvider,
+  type GeminiJsonOptions,
 } from "@/lib/llm";

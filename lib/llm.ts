@@ -5,7 +5,9 @@ import {
 import {
   generateGeminiComplianceJson,
   generateGeminiJson,
+  isGeminiOverloadedError,
   streamGeminiComplianceAnalysis,
+  type GeminiJsonOptions,
 } from "@/lib/gemini-client";
 import {
   checkOllamaHealth,
@@ -94,11 +96,15 @@ export function getLlmInfo(): LlmInfo {
   };
 }
 
-export async function generateJson<T>(system: string, user: string): Promise<T> {
+export async function generateJson<T>(
+  system: string,
+  user: string,
+  options: GeminiJsonOptions = {},
+): Promise<T> {
   if (getProvider() === "ollama") {
     return generateOllamaJson<T>(system, user, 16_384);
   }
-  return generateGeminiJson<T>(system, user);
+  return generateGeminiJson<T>(system, user, options);
 }
 
 export async function generateComplianceJson<T>(system: string, user: string): Promise<T> {
@@ -120,4 +126,5 @@ export async function* streamComplianceAnalysis(
   yield* streamGeminiComplianceAnalysis(system, user);
 }
 
-export { checkOllamaHealth, DEFAULT_FREE_GEMINI_MODEL as MODEL };
+export { checkOllamaHealth, isGeminiOverloadedError, DEFAULT_FREE_GEMINI_MODEL as MODEL };
+export type { GeminiJsonOptions };

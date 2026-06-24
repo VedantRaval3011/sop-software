@@ -14,6 +14,9 @@ export interface BankInputMcq {
   explanation: string;
   difficulty: "easy" | "medium" | "hard";
   topic: string;
+  /** Exact SOP section/clause the question traces back to (e.g. "4.6.1.4").
+   *  Optional here so legacy callers without it still type-check. */
+  sopReference?: string;
 }
 
 const DIFFICULTY_MAP: Record<string, DifficultyLevel> = {
@@ -53,7 +56,9 @@ export function toBankMcq(q: BankInputMcq, sopIdentifier: string): IMCQ {
     options,
     correctAnswer: correctText,
     explanation: (q.explanation ?? "").trim() || "Refer to the SOP for details.",
-    sopReference: (q.topic ?? "").trim() || sopIdentifier,
+    // Prefer the model-supplied section/clause reference; fall back to the topic
+    // heading, then the SOP identifier, so this field is never empty.
+    sopReference: (q.sopReference ?? "").trim() || (q.topic ?? "").trim() || sopIdentifier,
     optionVariants: [],
     isChecked: false,
     isReviewed: false,

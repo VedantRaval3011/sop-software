@@ -14,9 +14,12 @@ import {
   FolderOpen,
   Home,
   LayoutList,
+  Loader2,
+  Lock,
   Monitor,
   RefreshCw,
   Search,
+  Sparkles,
   Upload,
   X,
 } from "lucide-react";
@@ -110,6 +113,11 @@ interface RegistryEntry {
 // ─────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────
+// Password required to regenerate an SOP's MCQ bank (archives the current bank
+// and generates a fresh set). Gate is client-side only — it guards against
+// accidental clicks, not a determined user.
+const REGEN_PASSWORD = "indiana132";
+
 const fmt = (n: number | undefined | null) => (n == null ? "—" : n.toLocaleString());
 const fmtDate = (d: string | null | undefined) =>
   d ? new Date(d).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" }) : "—";
@@ -517,11 +525,28 @@ function DeptColorCard({
 // ─────────────────────────────────────────────────────────────
 // Registry table row
 // ─────────────────────────────────────────────────────────────
+// Live per-row generation progress (mirrors the MCQGenJob status endpoint).
+interface GenProgress {
+  status: "generating" | "error";
+  mode?: "generate" | "regenerate";
+  phase?: string;
+  percent?: number;
+  totalInserted?: number;
+  totalSkipped?: number;
+  totalFailedBatches?: number;
+  error?: string;
+}
+
 function RegistryRow({
-  entry, isEven, onViewMcqs,
+  entry, isEven, onViewMcqs, onGenerate, onRegenerate, genStatus,
 }: {
-  entry: RegistryEntry; isEven: boolean; onViewMcqs?: (id: string) => void;
+  entry: RegistryEntry; isEven: boolean;
+  onViewMcqs?: (id: string) => void;
+  onGenerate?: (entry: RegistryEntry) => void;
+  onRegenerate?: (entry: RegistryEntry) => void;
+  genStatus?: GenProgress;
 }) {
+  const isGenerating = genStatus?.status === "generating";
   const remaining = Math.max(0, entry.totalMcqs - entry.approved);
   const isDual = entry.language === "ENG-GUJ";
   // SOP No. / SOP Name rendered with displaySopCode / displaySopTitle and the exact
@@ -598,7 +623,7 @@ function RegistryRow({
         <span className="text-[11px] text-gray-500">{fmtDate(entry.lastUpdated)}</span>
       </td>
       <td className="px-3 py-2.5 whitespace-nowrap">
-        {entry.banks.length > 0 ? (
+        <div className="flex flex-col items-start gap-1">
           <div className="flex items-center gap-1">
             {entry.banks.map((b) => (
               <button
@@ -610,10 +635,74 @@ function RegistryRow({
                 <Eye className="h-2.5 w-2.5" /> {entry.banks.length > 1 ? b.langCode : "VIEW MCQs"}
               </button>
             ))}
+            {/* "Not Found" rows (no MCQs in every required language, and not obsolete)
+                get a one-click Generate action that creates the bank and flips the
+                row's status to MCQ Found once generation completes. */}
+            {!entry.hasMcq && !entry.isObsoleteMcq && (
+              <button
+                type="button"
+                onClick={() => onGenerate?.(entry)}
+                disabled={isGenerating}
+                className="inline-flex items-center gap-1 rounded-full border border-emerald-300 bg-emerald-50 px-2.5 py-1 text-[9px] font-semibold text-emerald-700 hover:bg-emerald-100 transition-colors disabled:cursor-not-allowed disabled:opacity-70"
+              >
+                {isGenerating ? (
+                  <><Loader2 className="h-2.5 w-2.5 animate-spin" /> Generating…</>
+                ) : (
+                  <><Sparkles className="h-2.5 w-2.5" /> {entry.banks.length > 0 ? "Generate" : "Generate MCQ"}</>
+                )}
+              </button>
+            )}
+            {/* Regenerate is available for every SOP that already has MCQs. It
+                archives the current bank and generates a fresh set, but is gated
+                behind a password prompt (handled by the parent). */}
+            {!entry.isObsoleteMcq && entry.hasMcq && (
+              <button
+                type="button"
+                onClick={() => onRegenerate?.(entry)}
+                disabled={isGenerating}
+                className="inline-flex items-center gap-1 rounded-full border border-amber-300 bg-amber-50 px-2.5 py-1 text-[9px] font-semibold text-amber-700 hover:bg-amber-100 transition-colors disabled:cursor-not-allowed disabled:opacity-70"
+              >
+                {isGenerating ? (
+                  <><Loader2 className="h-2.5 w-2.5 animate-spin" /> Regenerating…</>
+                ) : (
+                  <><RefreshCw className="h-2.5 w-2.5" /> Regenerate</>
+                )}
+              </button>
+            )}
+            {entry.banks.length === 0 && entry.isObsoleteMcq && (
+              <span className="text-[9px] text-gray-300">—</span>
+            )}
           </div>
-        ) : (
-          <span className="text-[9px] text-gray-300">—</span>
-        )}
+          {/* Live progress — mode, phase, % and running counts while a run is active. */}
+          {isGenerating && (
+            <div className="flex w-44 flex-col gap-0.5">
+              <div className="flex items-center justify-between gap-2 text-[8px] text-gray-500">
+                <span className="truncate" title={genStatus?.phase}>
+                  {genStatus?.mode === "regenerate" ? "Regenerating" : "Generating"}
+                  {genStatus?.phase ? ` · ${genStatus.phase}` : "…"}
+                </span>
+                <span className="shrink-0 font-bold tabular-nums text-gray-700">{genStatus?.percent ?? 0}%</span>
+              </div>
+              <div className="h-1 w-full overflow-hidden rounded-full bg-gray-100">
+                <div
+                  className="h-full rounded-full bg-emerald-500 transition-all duration-500"
+                  style={{ width: `${Math.min(genStatus?.percent ?? 0, 100)}%` }}
+                />
+              </div>
+              {genStatus?.totalInserted != null && (
+                <span className="text-[8px] text-gray-400">
+                  +{genStatus.totalInserted} new · {genStatus.totalSkipped ?? 0} skipped
+                  {genStatus.totalFailedBatches ? ` · ${genStatus.totalFailedBatches} failed` : ""}
+                </span>
+              )}
+            </div>
+          )}
+          {genStatus?.status === "error" && (
+            <span className="text-[9px] font-semibold text-red-500">
+              {genStatus.error ?? "Generation failed — retry"}
+            </span>
+          )}
+        </div>
       </td>
     </tr>
   );
@@ -666,6 +755,16 @@ export function MCQBankClient() {
   // UI state
   const [showDeptCards, setShowDeptCards] = useState(true);
   const [refreshKey, setRefreshKey] = useState(0);
+  // Per-family MCQ generation state, keyed by registry entry id (family key).
+  const [genStatus, setGenStatus] = useState<Record<string, GenProgress>>({});
+  // Identifiers currently being polled, so we never start two poll loops for one row.
+  const pollingRef = useRef<Set<string>>(new Set());
+
+  // Regenerate flow — the entry awaiting password confirmation, plus the typed
+  // password and any validation error.
+  const [regenTarget, setRegenTarget] = useState<RegistryEntry | null>(null);
+  const [regenPassword, setRegenPassword] = useState("");
+  const [regenError, setRegenError] = useState<string | null>(null);
 
   const mcqRegistryRef = useRef<HTMLDivElement>(null);
 
@@ -701,6 +800,123 @@ export function MCQBankClient() {
 
   useEffect(() => { fetchStats(); }, [fetchStats, refreshKey]);
   useEffect(() => { fetchRegistry(); }, [fetchRegistry, refreshKey]);
+
+  // Generate MCQs for a "Not Found" family on demand. The endpoint runs the full
+  // generation pipeline into mcqbanks; once it succeeds we refresh stats + registry
+  // so the row flips from "Not Found" to "MCQ Found".
+  // Poll the generation job's status endpoint until it finishes, pushing live
+  // progress into genStatus. Generation runs in the background server-side, so we
+  // never hold an HTTP request open for the whole run.
+  const pollJob = useCallback((entry: RegistryEntry) => {
+    if (pollingRef.current.has(entry.id)) return;
+    pollingRef.current.add(entry.id);
+    let polls = 0;
+    const MAX_POLLS = 240; // ~10 min at 2.5s
+
+    const tick = async () => {
+      polls++;
+      try {
+        const res = await fetch(
+          `/api/sop/generate-mcqs/status?identifier=${encodeURIComponent(entry.identifier)}`,
+        );
+        if (res.ok) {
+          const d = await res.json();
+          if (d.status === "completed") {
+            pollingRef.current.delete(entry.id);
+            setGenStatus((s) => { const n = { ...s }; delete n[entry.id]; return n; });
+            setRefreshKey((k) => k + 1);
+            return;
+          }
+          if (d.status === "failed") {
+            pollingRef.current.delete(entry.id);
+            setGenStatus((s) => ({
+              ...s,
+              [entry.id]: { status: "error", mode: d.mode, error: d.error ?? "Generation failed" },
+            }));
+            return;
+          }
+          setGenStatus((s) => ({
+            ...s,
+            [entry.id]: {
+              status: "generating",
+              mode: d.mode,
+              phase: d.phase,
+              percent: d.percent,
+              totalInserted: d.totalInserted,
+              totalSkipped: d.totalSkipped,
+              totalFailedBatches: d.totalFailedBatches,
+            },
+          }));
+        }
+      } catch {
+        /* transient network blip — keep polling */
+      }
+      if (polls >= MAX_POLLS) {
+        pollingRef.current.delete(entry.id);
+        setGenStatus((s) => ({
+          ...s,
+          [entry.id]: { status: "error", error: "Timed out waiting for generation — Refresh to check." },
+        }));
+        return;
+      }
+      setTimeout(tick, 2500);
+    };
+
+    setTimeout(tick, 1500);
+  }, []);
+
+  const handleGenerate = useCallback(async (entry: RegistryEntry) => {
+    setGenStatus((s) => ({ ...s, [entry.id]: { status: "generating", phase: "Queued", percent: 0 } }));
+    try {
+      const res = await fetch("/api/sop/generate-mcqs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ identifier: entry.identifier }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error ?? "Generation failed");
+      }
+      const job = await res.json().catch(() => ({}));
+      setGenStatus((s) => ({
+        ...s,
+        [entry.id]: { status: "generating", mode: job.mode, phase: "Queued", percent: 0 },
+      }));
+      pollJob(entry);
+    } catch (e) {
+      setGenStatus((s) => ({
+        ...s,
+        [entry.id]: { status: "error", error: e instanceof Error ? e.message : "Generation failed" },
+      }));
+    }
+  }, [pollJob]);
+
+  // Open the password prompt for an SOP the user wants to regenerate.
+  const requestRegenerate = useCallback((entry: RegistryEntry) => {
+    setRegenTarget(entry);
+    setRegenPassword("");
+    setRegenError(null);
+  }, []);
+
+  const cancelRegenerate = useCallback(() => {
+    setRegenTarget(null);
+    setRegenPassword("");
+    setRegenError(null);
+  }, []);
+
+  // Validate the password, then run the same generation pipeline as "Generate"
+  // (the endpoint archives the active bank and installs a fresh one).
+  const confirmRegenerate = useCallback(() => {
+    if (regenPassword !== REGEN_PASSWORD) {
+      setRegenError("Incorrect password. Please try again.");
+      return;
+    }
+    const entry = regenTarget;
+    setRegenTarget(null);
+    setRegenPassword("");
+    setRegenError(null);
+    if (entry) handleGenerate(entry);
+  }, [regenPassword, regenTarget, handleGenerate]);
 
   const handleSort = (field: string) => {
     if (sortCol === field) setSortDir((d) => (d === "asc" ? "desc" : "asc"));
@@ -843,6 +1059,58 @@ export function MCQBankClient() {
 
   return (
     <>
+      {/* Regenerate password prompt — gates the destructive "archive + regenerate"
+          action behind a password so it isn't triggered by an accidental click. */}
+      {regenTarget && (
+        <div
+          className="fixed inset-0 z-[70] flex items-center justify-center bg-black/40 p-4"
+          onClick={cancelRegenerate}
+        >
+          <div
+            className="w-full max-w-sm rounded-2xl bg-white p-6 shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-1 flex items-center gap-2">
+              <Lock className="h-4 w-4 text-purple-600" />
+              <h3 className="text-sm font-bold text-gray-800">Regenerate MCQs</h3>
+            </div>
+            <p className="mb-4 text-xs leading-relaxed text-gray-500">
+              Enter the password to regenerate MCQs for{" "}
+              <span className="font-semibold text-gray-700">{displaySopCode(regenTarget.identifier)}</span>.
+              This archives the current bank to Obsolete MCQs and generates a fresh set.
+            </p>
+            <form onSubmit={(e) => { e.preventDefault(); confirmRegenerate(); }}>
+              <input
+                type="password"
+                autoFocus
+                value={regenPassword}
+                onChange={(e) => { setRegenPassword(e.target.value); setRegenError(null); }}
+                placeholder="Password"
+                className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-800 placeholder-gray-400 focus:border-purple-400 focus:outline-none"
+              />
+              {regenError && (
+                <p className="mt-2 text-xs font-semibold text-red-500">{regenError}</p>
+              )}
+              <div className="mt-4 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={cancelRegenerate}
+                  className="rounded-lg border border-gray-300 px-3 py-1.5 text-xs font-semibold text-gray-600 hover:bg-gray-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-purple-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-purple-700"
+                >
+                  <RefreshCw className="h-3.5 w-3.5" /> Regenerate
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
       {/* Department folder modal (Digital Repository) — opened from a dept capsule/card.
           Rendered before the viewer so the MCQ viewer stacks on top when both are open. */}
       {modalDept && (
@@ -1192,6 +1460,9 @@ export function MCQBankClient() {
                         entry={entry}
                         isEven={idx % 2 === 0}
                         onViewMcqs={(id) => setViewerBankId(id)}
+                        onGenerate={handleGenerate}
+                        onRegenerate={requestRegenerate}
+                        genStatus={genStatus[entry.id]}
                       />
                     ))}
                   </tbody>
