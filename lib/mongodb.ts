@@ -1,6 +1,7 @@
 import mongoose from "mongoose";
 import { ensureDefaultAdmin } from "@/lib/ensure-admin";
 import { validateEnv } from "@/lib/validateEnv";
+import { MONGO_CONNECT_OPTIONS } from "./mongo-client-options.mjs";
 
 const MONGODB_URI = process.env.MONGODB_URI;
 
@@ -41,22 +42,50 @@ export async function connectDB() {
     return cached.conn;
   }
 
-  if (!cached.promise) {
-    cached.uri = MONGODB_URI;
-    cached.promise = mongoose.connect(MONGODB_URI, {
-      bufferCommands: false,
-      // Keep a few warm sockets open so bursts (e.g. a department logging in at
-      // shift start) don't each pay TCP+TLS+auth handshake latency on a cold pool.
-      minPoolSize: 5,
-      maxPoolSize: 50,
-      // Fail fast instead of the 30s default when the primary is unreachable, so
-      // a transient DB hiccup surfaces as a quick error rather than a hung page.
-      serverSelectionTimeoutMS: 10_000,
-      socketTimeoutMS: 45_000,
-    });
+  const maxAttempts = 3;
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (!cached.promise) {
+      cached.uri = MONGODB_URI;
+      cached.promise = mongoose.connect(MONGODB_URI, {
+        bufferCommands: false,
+        minPoolSize: 5,
+        maxPoolSize: 50,
+        ...MONGO_CONNECT_OPTIONS,
+      });
+    }
+
+    try {
+      cached.conn = await cached.promise;
+      await ensureDefaultAdmin();
+      return cached.conn;
+    } catch (err) {
+      lastError = err;
+      cached.conn = null;
+      cached.promise = null;
+      if (attempt < maxAttempts && isMongoConnectivityError(err)) {
+        await new Promise((r) => setTimeout(r, attempt * 1500));
+        continue;
+      }
+      throw err;
+    }
   }
 
-  cached.conn = await cached.promise;
-  await ensureDefaultAdmin();
-  return cached.conn;
+  throw lastError;
+}
+
+/** True when MongoDB is unreachable (network, timeout, IP allowlist, etc.). */
+export function isMongoConnectivityError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const name = (error as { name?: string }).name ?? "";
+  if (
+    name === "MongoNetworkError" ||
+    name === "MongooseServerSelectionError" ||
+    name === "MongoServerSelectionError"
+  ) {
+    return true;
+  }
+  const msg = error instanceof Error ? error.message : String(error);
+  return /ETIMEDOUT|ECONNREFUSED|MongoNetworkError|server selection/i.test(msg);
 }

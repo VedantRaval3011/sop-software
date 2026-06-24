@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { connectDB } from "@/lib/mongodb";
+import { connectDB, isMongoConnectivityError } from "@/lib/mongodb";
 import Department from "@/models/Department";
 import { buildDashboardStats, sortByDeptOrder } from "@/lib/sop-utils";
 import { loadGroupedRegistry } from "@/lib/dashboardRegistrySource";
@@ -33,9 +33,16 @@ export async function GET() {
     );
   } catch (error) {
     console.error("GET /api/sops/stats error:", error);
+    const dbDown = isMongoConnectivityError(error);
     return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Failed to fetch stats" },
-      { status: 500 },
+      {
+        error: dbDown
+          ? "Database is temporarily unreachable. Check your network or MongoDB Atlas IP allowlist."
+          : error instanceof Error
+            ? error.message
+            : "Failed to fetch stats",
+      },
+      { status: dbDown ? 503 : 500 },
     );
   }
 }

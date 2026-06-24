@@ -43,7 +43,11 @@ if (clean) {
 
 killPort(PORT);
 
-execSync("node scripts/seed-admin.mjs", { cwd: root, stdio: "inherit" });
+try {
+  execSync("node scripts/seed-admin.mjs", { cwd: root, stdio: "inherit" });
+} catch {
+  console.warn("Warning: seed-admin failed (MongoDB may be slow or unreachable). Continuing…");
+}
 
 const child = spawn("npx", ["next", "dev", "--webpack", "-p", String(PORT)], {
   cwd: root,

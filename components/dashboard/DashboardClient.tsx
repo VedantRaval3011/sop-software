@@ -101,15 +101,38 @@ export function DashboardClient() {
   }, [allItems, filters]);
 
   const fetchStats = useCallback(async () => {
+    const cached = readClientCache<DashboardStats & { departmentList?: string[] }>(
+      DASHBOARD_STATS_CACHE_KEY,
+      "stats",
+    );
     try {
       const res = await fetch(`/api/sops/stats?_t=${Date.now()}`, { cache: "no-store" });
-      if (!res.ok) throw new Error(`Stats fetch failed: ${res.status}`);
+      if (!res.ok) {
+        const body = (await res.json().catch(() => ({}))) as { error?: string };
+        const msg = body.error ?? `Could not refresh dashboard stats (${res.status})`;
+        if (cached) {
+          setStats(cached);
+          setDepartmentList(cached.departmentList ?? []);
+          setError(`Showing cached stats — ${msg}`);
+        } else {
+          setError(msg);
+        }
+        return;
+      }
       const data = await res.json();
       setStats(data);
       setDepartmentList(data.departmentList ?? []);
       writeClientCache(DASHBOARD_STATS_CACHE_KEY, "stats", data);
+      setError(null);
     } catch (e) {
-      console.error("fetchStats error:", e);
+      const msg = e instanceof Error ? e.message : "Failed to load stats";
+      if (cached) {
+        setStats(cached);
+        setDepartmentList(cached.departmentList ?? []);
+        setError(`Showing cached stats — ${msg}`);
+      } else {
+        setError(msg);
+      }
     }
   }, []);
 
@@ -354,7 +377,7 @@ export function DashboardClient() {
       setStats(cachedStats);
       setDepartmentList(cachedStats.departmentList ?? []);
     }
-    fetchStats().catch((e) => setError(e.message));
+    fetchStats();
   }, [fetchStats]);
 
   useEffect(() => {
@@ -432,6 +455,12 @@ export function DashboardClient() {
               {" "}
               — Create a <code className="rounded bg-red-100 px-1">.env.local</code> file with
               your MongoDB connection string.
+            </span>
+          )}
+          {(error.includes("unreachable") || error.includes("ETIMEDOUT")) && (
+            <span>
+              {" "}
+              — Verify MongoDB Atlas is running and your current IP is on the network access allowlist.
             </span>
           )}
         </div>
