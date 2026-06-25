@@ -1,0 +1,60 @@
+/** Read-only diagnostic: inspect the PEGE23 family — why Gujarati prior versions show "missing". */
+import fs from "fs";
+import mongoose from "mongoose";
+
+function loadEnv() {
+  const env = fs.readFileSync(".env.local", "utf8");
+  for (const line of env.split(/\r?\n/)) {
+    const m = line.match(/^([A-Z0-9_]+)=(.*)$/);
+    if (m && !process.env[m[1]]) process.env[m[1]] = m[2].trim();
+  }
+}
+
+async function main() {
+  loadEnv();
+  await mongoose.connect(process.env.MONGODB_URI!);
+  const col = mongoose.connection.collection("sops");
+
+  const records = await col
+    .find({ identifier: { $regex: /^PEGE23/i } })
+    .toArray();
+
+  console.log(`Found ${records.length} records matching ^PEGE23\n`);
+  const rows = records
+    .map((r: any) => ({
+      _id: String(r._id),
+      identifier: r.identifier,
+      sopBaseId: r.sopBaseId,
+      version: r.version,
+      versionNum: r.versionNum,
+      language: r.language,
+      fileType: r.fileType,
+      isObsolete: r.isObsolete ?? false,
+      headerDatesValid: r.headerDatesValid,
+      name: (r.name || "").slice(0, 40),
+      fileUrl: r.fileUrl,
+    }))
+    .sort((a, b) =>
+      (a.identifier + a.language + a.fileType).localeCompare(
+        b.identifier + b.language + b.fileType,
+      ),
+    );
+
+  for (const r of rows) {
+    console.log(
+      `${String(r.identifier).padEnd(14)} | base=${String(r.sopBaseId).padEnd(8)} | v=${String(r.version).padEnd(5)} vNum=${String(r.versionNum).padEnd(4)} | ${String(r.language).padEnd(9)} ${String(r.fileType).padEnd(5)} | hdrOk=${String(r.headerDatesValid)} obs=${r.isObsolete}`,
+    );
+  }
+
+  console.log("\n--- urls ---");
+  for (const r of rows) {
+    console.log(`${r.identifier} [${r.language}/${r.fileType}] -> ${r.fileUrl}`);
+  }
+
+  await mongoose.disconnect();
+}
+
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

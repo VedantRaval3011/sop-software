@@ -1633,7 +1633,7 @@ function extractSubjectTitle(content: string): string | null {
   // English "SUBJECT" and Gujarati "વિષય"; stop at the next header cell label
   // (English EFF. DATE / SUPERSEDES … or Gujarati લાગુ પડેલ / ફેર ચકાસણી / રદ કરેલ).
   const match = content.match(
-    /(?:SUBJECT|વિષય)\s*:?\s*(.+?)\s*(?:EFF\.?\s*DATE|REVIEW\s*DT\.?|SUPERSEDES|PAGE\s*NO\.?|PREPARED\s*BY|SOP\s*NO\.?|લાગુ\s*પડેલ|ફેર\s*ચકાસણી|રદ\s*કરેલ|બનાવનાર|$)/i,
+    /(?:SUBJECT|વિષય)\s*:?\s*(.+?)\s*(?:EFF\.?\s*DATE|REVIEW\s*DT\.?|SUPERSEDES|PAGE\s*NO\.?|PREPARED\s*BY|SOP\s*NO\.?|લાગુ?\s*પડેલ?|ફેર\s*ચકાસણી|રદ\s*કરેલ|બનાવનાર|$)/i,
   );
   const title = match?.[1]?.replace(/\s+/g, " ").trim();
   return title && title.length >= 3 ? title : null;

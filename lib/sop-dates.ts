@@ -151,7 +151,7 @@ export type SopHeaderDateValidation = {
 };
 
 const HEADER_STOP_LABEL =
-  /\b(?:EFF\.?\s*DATE|REVIEW\s*DT\.?|SUPERSEDES|PAGE\s*NO\.?|SOP\s*NO\.?|DEPARTMENT|SUBJECT|PREPARED\s*BY|લાગુ\s*પડેલ|ફેર\s*ચકાસણી|રદ\s*કરેલ|વિષય)\b/i;
+  /\b(?:EFF\.?\s*DATE|REVIEW\s*DT\.?|SUPERSEDES|PAGE\s*NO\.?|SOP\s*NO\.?|DEPARTMENT|SUBJECT|PREPARED\s*BY|લાગુ?\s*પડેલ?|ફેર\s*ચકાસણી|રદ\s*કરેલ|વિષય)\b/i;
 
 const NON_DATE_VALUES = /^(?:nil|na|n\/a|-|—|--|\.|none)$/i;
 
@@ -161,7 +161,10 @@ const HEADER_LABEL_PAIRS: Array<{
 }> = [
   { effective: /\bEFF\.?\s*DATE\b/i, review: /\bREVIEW\s*DT\.?\b/i },
   {
-    effective: /લાગુ\s*પડેલ\s*તારીખ/i,
+    // Real-world Gujarati SOP headers vary: some drop the ુ matra on "લાગ",
+    // omit the trailing લ of "પડેલ", and run the words together with no spaces
+    // (e.g. "લાગુપડેતારીખ", "લાગ પડેલ તારીખ"). Keep those two chars optional.
+    effective: /લાગુ?\s*પડેલ?\s*તારીખ/i,
     review: /ફેર\s*ચકાસણી\s*તારીખ/i,
   },
 ];
@@ -312,8 +315,9 @@ export function extractSopDatesFromContent(content: string): ExtractedSopDates {
     headerDates.effectiveDate ??
     matchLabeledDate(
       content,
-      // English "effective date / EFF. DATE" and Gujarati "લાગુ પડેલ તારીખ".
-      /effective\s*date|eff\.?\s*date|date\s*of\s*effect(?:ive|iveness)|implementation\s*date|લાગુ\s*પડેલ\s*તારીખ/i,
+      // English "effective date / EFF. DATE" and Gujarati "લાગુ પડેલ તારીખ"
+      // (ુ matra and trailing લ optional — see HEADER_LABEL_PAIRS).
+      /effective\s*date|eff\.?\s*date|date\s*of\s*effect(?:ive|iveness)|implementation\s*date|લાગુ?\s*પડેલ?\s*તારીખ/i,
     );
 
   const revisionDate = extractLatestRevisionDate(content);
