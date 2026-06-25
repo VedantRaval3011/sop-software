@@ -2,7 +2,7 @@ import SystemCache from '@/models/SystemCache';
 
 // Bump the version suffix whenever the payload shape changes so stale snapshots
 // (memory or persisted) are ignored after a deploy.
-const CACHE_KEY = 'induction-training-matrix-overview:v3';
+const CACHE_KEY = 'induction-training-matrix-overview:v4';
 
 export type InductionTrainingMatrixCacheEntry = { computedAt: number; payload: unknown };
 

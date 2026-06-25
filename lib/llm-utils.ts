@@ -53,7 +53,7 @@ export function stripMarkdownFences(text: string): string {
   return text.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
 }
 
-/** Salvage complete finding objects from truncated JSON responses. */
+/** Salvage complete JSON objects from truncated responses (compliance findings or MCQs). */
 export function extractCompleteObjects(text: string): unknown[] {
   const objects: unknown[] = [];
   let depth = 0;
@@ -68,7 +68,9 @@ export function extractCompleteObjects(text: string): unknown[] {
       depth--;
       if (depth === 0 && start >= 0) {
         const chunk = text.slice(start, i + 1);
-        if (chunk.includes('"clauseNumber"') || chunk.includes('"complianceLevel"')) {
+        const isFinding = chunk.includes('"clauseNumber"') || chunk.includes('"complianceLevel"');
+        const isMcq = chunk.includes('"question"') && chunk.includes('"correctAnswer"');
+        if (isFinding || isMcq) {
           try {
             objects.push(JSON.parse(chunk));
           } catch {
@@ -121,6 +123,11 @@ export function parseJsonFromText<T>(text: string, logPrefix = "llm"): T {
 
   const objects = extractCompleteObjects(cleaned);
   if (objects.length > 0) {
+    const first = objects[0] as Record<string, unknown>;
+    if ("question" in first) {
+      console.warn(`[${logPrefix}] salvaged ${objects.length} complete MCQ(s) from truncated JSON`);
+      return { questions: objects } as T;
+    }
     console.warn(`[${logPrefix}] salvaged ${objects.length} complete finding(s) from truncated JSON`);
     return { findings: objects, overallScore: 0 } as T;
   }

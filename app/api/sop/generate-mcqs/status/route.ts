@@ -25,6 +25,7 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({
       identifier: job.identifier,
       mode: job.mode,
+      languageScope: job.languageScope ?? null,
       status: job.status,
       phase: job.phase,
       percent: job.percent,
@@ -33,6 +34,7 @@ export async function GET(request: NextRequest) {
       totalSkipped: job.totalSkipped,
       totalFailedBatches: job.totalFailedBatches,
       error: job.error ?? null,
+      logs: job.logs ?? [],
       startedAt: job.startedAt,
       finishedAt: job.finishedAt ?? null,
     });

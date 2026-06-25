@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import FindingCard from './components/FindingCard';
 import { getScoreColorClass } from '@/lib/complianceFormatter';
-import { BookOpen, FileText, Layers, CheckCircle, Copy, X, Upload } from 'lucide-react';
+import { BookOpen, FileText, Layers, CheckCircle, Copy, X, Upload, Sparkles, Cpu } from 'lucide-react';
 
 interface Guideline {
   _id: string;
@@ -579,10 +579,20 @@ export default function ComplianceEnginePage() {
   const [submittingApplicable, setSubmittingApplicable] = useState(false);
   const [expandedGuideline, setExpandedGuideline] = useState<string | null>(null);
   const [llmInfo, setLlmInfo] = useState<{
-    provider: 'gemini' | 'ollama';
+    provider: 'gemini' | 'ollama' | 'claude';
     model: string;
     complianceModel: string;
     label: string;
+  } | null>(null);
+  const [selectedProvider, setSelectedProvider] = useState<'claude' | 'gemini' | 'ollama' | null>('claude');
+  const [selectedModel, setSelectedModel] = useState('claude-sonnet-4-6');
+  const [claudeStatus, setClaudeStatus] = useState<{
+    ok: boolean;
+    model?: string;
+    email?: string;
+    subscriptionType?: string;
+    error?: string;
+    loading?: boolean;
   } | null>(null);
 
   // Upload guidelines modal state
@@ -697,7 +707,12 @@ export default function ComplianceEnginePage() {
         const res = await fetch('/api/compliance/analyze-v5', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sopId: sop._id, forceRefresh: true }),
+          body: JSON.stringify({
+            sopId: sop._id,
+            forceRefresh: true,
+            ...(selectedProvider ? { provider: selectedProvider } : {}),
+            ...(selectedProvider === 'claude' ? { model: selectedModel } : {}),
+          }),
         });
         const data = await res.json().catch(() => ({ success: false, error: 'Parse error' }));
         if (data.success) {
@@ -807,6 +822,38 @@ export default function ComplianceEnginePage() {
       })
       .catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (selectedProvider !== 'claude') {
+      setClaudeStatus(null);
+      return;
+    }
+    let cancelled = false;
+    setClaudeStatus({ ok: false, loading: true });
+    fetch('/api/llm/claude-status')
+      .then((res) => res.json())
+      .then((data) => {
+        if (cancelled) return;
+        const c = data.claude ?? {};
+        setClaudeStatus({
+          ok: Boolean(data.success && c.loggedIn),
+          model: c.model,
+          email: c.email,
+          subscriptionType: c.subscriptionType,
+          error: c.error,
+          loading: false,
+        });
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setClaudeStatus({
+          ok: false,
+          error: e instanceof Error ? e.message : 'Could not check Claude status',
+          loading: false,
+        });
+      });
+    return () => { cancelled = true; };
+  }, [selectedProvider]);
 
   const totalClauses = guidelines.reduce((s, g) => s + (g.clauses?.length ?? 0), 0);
 
@@ -935,32 +982,130 @@ export default function ComplianceEnginePage() {
               {llmInfo && (
                 <span
                   className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-bold uppercase tracking-wide ${
-                    llmInfo.provider === 'ollama'
+                    selectedProvider === 'ollama'
                       ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                      : selectedProvider === 'claude'
+                      ? 'bg-violet-50 text-violet-700 border border-violet-200'
                       : 'bg-purple-50 text-purple-700 border border-purple-200'
                   }`}
-                  title={`Compliance model: ${llmInfo.complianceModel}`}
+                  title={
+                    selectedProvider === 'claude'
+                      ? `Claude model: ${selectedModel}`
+                      : `Compliance model: ${llmInfo.complianceModel}`
+                  }
                 >
-                  <span
-                    className={`w-1.5 h-1.5 rounded-full ${
-                      llmInfo.provider === 'ollama' ? 'bg-emerald-500' : 'bg-purple-500'
-                    }`}
-                  />
-                  LLM: {llmInfo.label}
+                  <span className={`w-1.5 h-1.5 rounded-full ${
+                    selectedProvider === 'ollama' ? 'bg-emerald-500'
+                    : selectedProvider === 'claude' ? 'bg-violet-500'
+                    : 'bg-purple-500'
+                  }`} />
+                  {selectedProvider === 'claude'
+                    ? `Claude · ${selectedModel.includes('haiku') ? 'Haiku' : 'Sonnet'}`
+                    : selectedProvider === 'ollama'
+                    ? 'Ollama (local)'
+                    : selectedProvider === 'gemini'
+                    ? `Gemini · ${llmInfo.complianceModel}`
+                    : `LLM: ${llmInfo.label}`}
                 </span>
               )}
             </div>
           </div>
-          <button
-            onClick={() => router.push('/dashboard')}
-            className="flex items-center gap-1.5 px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg transition-all text-sm font-semibold shadow-sm"
-          >
-            ← Dashboard
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setSelectedProvider((p) => (p === 'claude' ? 'gemini' : 'claude'))}
+              title={
+                selectedProvider === 'claude' && claudeStatus?.ok
+                  ? `Claude via your subscription (${claudeStatus.email ?? 'logged in'} · ${selectedModel}) — click for Gemini`
+                  : selectedProvider === 'claude' && claudeStatus?.error
+                    ? `Claude not connected: ${claudeStatus.error}`
+                    : 'Use Claude Code for compliance analysis (default)'
+              }
+              className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors ${
+                selectedProvider === 'claude'
+                  ? claudeStatus?.ok === false && !claudeStatus?.loading
+                    ? 'border border-red-600 bg-red-600 text-white hover:bg-red-700 ring-2 ring-red-300'
+                    : 'border border-violet-600 bg-violet-600 text-white hover:bg-violet-700 ring-2 ring-violet-300'
+                  : 'border border-slate-300 bg-white text-slate-600 hover:bg-slate-50'
+              }`}
+            >
+              <Sparkles className="h-3.5 w-3.5" />
+              {selectedProvider === 'claude'
+                ? claudeStatus?.loading
+                  ? 'Claude…'
+                  : claudeStatus?.ok
+                    ? 'Claude ✓'
+                    : 'Claude !'
+                : 'Claude'}
+            </button>
+            <button
+              type="button"
+              onClick={() => setSelectedProvider('gemini')}
+              title="Use Gemini for compliance analysis"
+              className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors ${
+                selectedProvider === 'gemini'
+                  ? 'border border-blue-600 bg-blue-600 text-white hover:bg-blue-700 ring-2 ring-blue-300'
+                  : 'border border-slate-300 bg-white text-slate-600 hover:bg-slate-50'
+              }`}
+            >
+              ◆ Gemini
+            </button>
+            <button
+              type="button"
+              onClick={() => setSelectedProvider((p) => (p === 'ollama' ? 'claude' : 'ollama'))}
+              title={selectedProvider === 'ollama' ? 'Using local Ollama — click for Claude' : 'Use local Ollama for compliance'}
+              className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors ${
+                selectedProvider === 'ollama'
+                  ? 'border border-emerald-600 bg-emerald-600 text-white hover:bg-emerald-700 ring-2 ring-emerald-300'
+                  : 'border border-slate-300 bg-white text-slate-600 hover:bg-slate-50'
+              }`}
+            >
+              <Cpu className="h-3.5 w-3.5" />
+              {selectedProvider === 'ollama' ? 'Local AI ✓' : 'Local AI'}
+            </button>
+            {selectedProvider === 'claude' && (
+              <select
+                value={selectedModel}
+                onChange={(e) => setSelectedModel(e.target.value)}
+                className="rounded-lg border border-violet-300 bg-white px-2 py-1.5 text-xs font-medium text-gray-700 focus:outline-none focus:ring-2 focus:ring-violet-400"
+              >
+                <option value="claude-haiku-4-5-20251001">Haiku 4.5 (fast)</option>
+                <option value="claude-sonnet-4-6">Sonnet 4.6 (recommended)</option>
+              </select>
+            )}
+            <button
+              onClick={() => router.push('/dashboard')}
+              className="flex items-center gap-1.5 px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg transition-all text-sm font-semibold shadow-sm"
+            >
+              ← Dashboard
+            </button>
+          </div>
         </div>
       </header>
 
       <div className="max-w-7xl mx-auto px-6 py-8">
+        {selectedProvider === 'claude' && claudeStatus && !claudeStatus.loading && (
+          <div
+            className={`mb-6 rounded-lg border px-4 py-3 text-sm ${
+              claudeStatus.ok
+                ? 'border-violet-200 bg-violet-50 text-violet-900'
+                : 'border-red-200 bg-red-50 text-red-700'
+            }`}
+          >
+            {claudeStatus.ok ? (
+              <>
+                Compliance will use your Claude subscription as <strong>{claudeStatus.email}</strong>
+                {claudeStatus.subscriptionType ? ` (${claudeStatus.subscriptionType})` : ''}
+                {' · '}model: <strong>{selectedModel}</strong>
+              </>
+            ) : (
+              <>
+                Claude is not connected. Run <code className="rounded bg-red-100 px-1">claude auth login</code> in a terminal, then refresh.
+                {claudeStatus.error ? ` — ${claudeStatus.error}` : ''}
+              </>
+            )}
+          </div>
+        )}
         {/* Step tabs */}
         <div className="flex flex-wrap items-center gap-3 mb-10">
           {([
@@ -1427,14 +1572,47 @@ export default function ComplianceEnginePage() {
               </div>
             </div>
 
+            {/* Provider summary — toggles are in the header */}
+            <div className="bg-violet-50 border border-violet-200 rounded-xl p-4">
+              <p className="text-xs font-semibold text-violet-700 uppercase tracking-wide mb-2">AI Provider for this run</p>
+              <p className="text-sm text-gray-700">
+                {selectedProvider === 'claude' && (
+                  <>Using <strong>Claude {selectedModel.includes('haiku') ? 'Haiku' : 'Sonnet'}</strong> via your Claude Code subscription. Switch provider in the header.</>
+                )}
+                {selectedProvider === 'gemini' && (
+                  <>Using <strong>Gemini</strong> ({llmInfo?.complianceModel ?? 'cloud'}). Switch provider in the header.</>
+                )}
+                {selectedProvider === 'ollama' && (
+                  <>Using <strong>local Ollama</strong>. Switch provider in the header.</>
+                )}
+              </p>
+            </div>
+
             <div className="flex justify-between">
               <button onClick={() => setCurrentStep('fetch-guidelines')} className="px-6 py-2.5 bg-gray-100 text-gray-600 rounded-xl font-semibold hover:bg-gray-200 transition-all">← Back</button>
               <button
                 onClick={runAnalysis}
-                disabled={sops.length === 0 || guidelines.length === 0}
-                className="px-10 py-3.5 bg-purple-600 text-white rounded-xl font-bold text-base hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed transition-all shadow-lg shadow-purple-200"
+                disabled={
+                  sops.length === 0
+                  || guidelines.length === 0
+                  || (selectedProvider === 'claude' && claudeStatus !== null && !claudeStatus.loading && !claudeStatus.ok)
+                }
+                className={`px-10 py-3.5 rounded-xl font-bold text-base text-white disabled:opacity-50 disabled:cursor-not-allowed transition-all shadow-lg ${
+                  selectedProvider === 'claude'
+                    ? 'bg-violet-600 hover:bg-violet-700 shadow-violet-200'
+                    : selectedProvider === 'ollama'
+                    ? 'bg-emerald-600 hover:bg-emerald-700 shadow-emerald-200'
+                    : 'bg-purple-600 hover:bg-purple-700 shadow-purple-200'
+                }`}
               >
                 🚀 Start Analysis
+                {selectedProvider === 'claude'
+                  ? ` · ${selectedModel.includes('haiku') ? 'Haiku' : 'Sonnet'}`
+                  : selectedProvider === 'gemini'
+                  ? ' · Gemini'
+                  : selectedProvider === 'ollama'
+                  ? ' · Ollama'
+                  : ''}
               </button>
             </div>
           </div>

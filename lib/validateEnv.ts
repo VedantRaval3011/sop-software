@@ -1,4 +1,5 @@
 import { getProvider, getComplianceProvider } from "@/lib/llm";
+import { checkClaudeCliHealth } from "@/lib/claude-cli";
 import { checkOllamaHealth } from "@/lib/ollama";
 
 const REQUIRED = ["MONGODB_URI"] as const;
@@ -55,6 +56,12 @@ export async function validateLlmEnv(): Promise<void> {
     !process.env.GEMINI_API_KEY
   ) {
     throw new Error("GEMINI_API_KEY is not configured");
+  }
+  if (getProvider() === "claude") {
+    const health = await checkClaudeCliHealth();
+    if (!health.ok) {
+      throw new Error(health.error ?? "Claude Code CLI is not available. Run: claude auth login");
+    }
   }
 }
 

@@ -16,8 +16,9 @@ import {
   getOllamaComplianceModel,
   getOllamaModel,
 } from "@/lib/ollama";
+import { generateClaudeCliJson, getClaudeCliModel, getMcqClaudeModel, checkClaudeCliHealth } from "@/lib/claude-cli";
 
-export type LlmProvider = "gemini" | "ollama";
+export type LlmProvider = "gemini" | "ollama" | "claude";
 
 export interface LlmInfo {
   provider: LlmProvider;
@@ -27,72 +28,58 @@ export interface LlmInfo {
 }
 
 export function getProvider(): LlmProvider {
-  const provider = (process.env.LLM_PROVIDER ?? "gemini").toLowerCase();
-  return provider === "ollama" ? "ollama" : "gemini";
+  const provider = (process.env.LLM_PROVIDER ?? "claude").toLowerCase();
+  if (provider === "ollama") return "ollama";
+  if (provider === "claude") return "claude";
+  return "gemini";
 }
 
-/** Compliance can use a different provider than MCQ generation. */
+/** Compliance can use a different provider than MCQ generation. Defaults to Gemini
+ *  even when MCQ uses Claude CLI — compliance does not run through Claude Code. */
 export function getComplianceProvider(): LlmProvider {
   const override = process.env.LLM_COMPLIANCE_PROVIDER?.toLowerCase();
-  if (override === "ollama" || override === "gemini") {
+  if (override === "ollama" || override === "gemini" || override === "claude") {
     return override;
   }
-  return getProvider();
+  return "gemini";
+}
+
+function providerLabel(p: LlmProvider, role: "mcq" | "compliance"): { model: string; label: string } {
+  if (p === "ollama") {
+    const model = role === "compliance" ? getOllamaComplianceModel() : getOllamaModel();
+    return { model, label: `Ollama (${model})` };
+  }
+  if (p === "claude") {
+    const model = role === "mcq" ? getMcqClaudeModel() : getClaudeCliModel();
+    return { model, label: `Claude CLI (${model})` };
+  }
+  const geminiModel =
+    role === "compliance"
+      ? (process.env.COMPLIANCE_GEMINI_MODEL ?? process.env.GEMINI_MODEL ?? DEFAULT_FREE_COMPLIANCE_MODEL)
+      : (process.env.GEMINI_MODEL ?? DEFAULT_FREE_GEMINI_MODEL);
+  return { model: geminiModel, label: `Gemini (${geminiModel})` };
 }
 
 export function getLlmInfo(): LlmInfo {
   const mcqProvider = getProvider();
   const complianceProvider = getComplianceProvider();
+  const mcq = providerLabel(mcqProvider, "mcq");
+  const compliance = providerLabel(complianceProvider, "compliance");
 
   if (mcqProvider === complianceProvider) {
-    if (complianceProvider === "ollama") {
-      const model = getOllamaModel();
-      const complianceModel = getOllamaComplianceModel();
-      return {
-        provider: complianceProvider,
-        model,
-        complianceModel,
-        label:
-          model === complianceModel
-            ? `Ollama (${model})`
-            : `Ollama (compliance: ${complianceModel})`,
-      };
-    }
-
-    const model = process.env.GEMINI_MODEL ?? DEFAULT_FREE_GEMINI_MODEL;
-    const complianceModel =
-      process.env.COMPLIANCE_GEMINI_MODEL ?? process.env.GEMINI_MODEL ?? DEFAULT_FREE_COMPLIANCE_MODEL;
     return {
       provider: complianceProvider,
-      model,
-      complianceModel,
-      label:
-        model === complianceModel
-          ? `Gemini (${model})`
-          : `Gemini (compliance: ${complianceModel})`,
+      model: mcq.model,
+      complianceModel: compliance.model,
+      label: mcq.label,
     };
   }
 
-  const mcqLabel =
-    mcqProvider === "ollama"
-      ? `Ollama (${getOllamaModel()})`
-      : `Gemini (${process.env.GEMINI_MODEL ?? DEFAULT_FREE_GEMINI_MODEL})`;
-  const complianceLabel =
-    complianceProvider === "ollama"
-      ? `Ollama (${getOllamaComplianceModel()})`
-      : `Gemini (${process.env.COMPLIANCE_GEMINI_MODEL ?? process.env.GEMINI_MODEL ?? DEFAULT_FREE_COMPLIANCE_MODEL})`;
-
   return {
     provider: complianceProvider,
-    model:
-      mcqProvider === "ollama"
-        ? getOllamaModel()
-        : (process.env.GEMINI_MODEL ?? DEFAULT_FREE_GEMINI_MODEL),
-    complianceModel:
-      complianceProvider === "ollama"
-        ? getOllamaComplianceModel()
-        : (process.env.COMPLIANCE_GEMINI_MODEL ?? process.env.GEMINI_MODEL ?? DEFAULT_FREE_COMPLIANCE_MODEL),
-    label: `MCQ: ${mcqLabel} · Compliance: ${complianceLabel}`,
+    model: mcq.model,
+    complianceModel: compliance.model,
+    label: `MCQ: ${mcq.label} · Compliance: ${compliance.label}`,
   };
 }
 
@@ -100,17 +87,23 @@ export async function generateJson<T>(
   system: string,
   user: string,
   options: GeminiJsonOptions = {},
+  providerOverride?: LlmProvider,
 ): Promise<T> {
-  if (getProvider() === "ollama") {
-    return generateOllamaJson<T>(system, user, 16_384);
-  }
+  const p = providerOverride ?? getProvider();
+  if (p === "ollama") return generateOllamaJson<T>(system, user, 16_384);
+  if (p === "claude") return generateClaudeCliJson<T>(system, user);
   return generateGeminiJson<T>(system, user, options);
 }
 
-export async function generateComplianceJson<T>(system: string, user: string): Promise<T> {
-  if (getComplianceProvider() === "ollama") {
-    return generateOllamaComplianceJson<T>(system, user);
-  }
+export async function generateComplianceJson<T>(
+  system: string,
+  user: string,
+  providerOverride?: LlmProvider,
+  modelOverride?: string,
+): Promise<T> {
+  const p = providerOverride ?? getComplianceProvider();
+  if (p === "ollama") return generateOllamaComplianceJson<T>(system, user);
+  if (p === "claude") return generateClaudeCliJson<T>(system, user, modelOverride);
   return generateGeminiComplianceJson<T>(system, user);
 }
 
@@ -126,5 +119,5 @@ export async function* streamComplianceAnalysis(
   yield* streamGeminiComplianceAnalysis(system, user);
 }
 
-export { checkOllamaHealth, isGeminiOverloadedError, DEFAULT_FREE_GEMINI_MODEL as MODEL };
+export { checkOllamaHealth, checkClaudeCliHealth, isGeminiOverloadedError, DEFAULT_FREE_GEMINI_MODEL as MODEL };
 export type { GeminiJsonOptions };

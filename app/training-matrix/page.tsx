@@ -4,9 +4,17 @@ import { Fragment, createContext, useCallback, useContext, useEffect, useLayoutE
 import Link from 'next/link';
 import { useAuthGuard } from '@/hooks/useAuthGuard';
 import { sopFamilyCodesMatch } from '@/lib/sopIdentifierNormalize';
+import { resolveSopStatusFromMap } from '@/lib/trainingMatrixMcqStats';
 
 function stripVersion(code: string): string {
   return String(code || '').toUpperCase().replace(/-\d+$/, '').trim();
+}
+
+function sopStatusForCode<T>(
+  map: Record<string, T> | undefined,
+  sopCode: string,
+): T | undefined {
+  return resolveSopStatusFromMap(sopCode, map, stripVersion);
 }
 
 function monthForCode(monthMap: Record<string, string>, sopCode: string): string {
@@ -4114,7 +4122,7 @@ export default function TrainingMatrixPage() {
         .map(({ sopCode, uploadDept }) => {
           const dept = uploadDept as Dept;
           const monthMap = data.sopMonthMapByDept?.[dept] || {};
-          const status = data.sopStatusByCode?.[sopCode];
+          const status = sopStatusForCode(data.sopStatusByCode, sopCode);
           let completed = 0,
             pending = 0;
           const completedEmployees: string[] = [];
@@ -4193,7 +4201,7 @@ export default function TrainingMatrixPage() {
         .map(({ sopCode, depts: sopDepts }) => {
           const primaryDept = (sopDepts[0] as Dept) || depts[0];
           const monthMap = data.sopMonthMapByDept?.[primaryDept] || {};
-          const status = data.sopStatusByCode?.[sopCode];
+          const status = sopStatusForCode(data.sopStatusByCode, sopCode);
           // Aggregate employee stats across all depts that share this SOP
           let completed = 0, pending = 0;
           const completedEmployees: string[] = [];
@@ -4242,7 +4250,7 @@ export default function TrainingMatrixPage() {
 
       const sops = allFilteredCodes
         .map((sopCode) => {
-          const status = data.sopStatusByCode?.[sopCode];
+          const status = sopStatusForCode(data.sopStatusByCode, sopCode);
           const upper = stripVersion(sopCode).toUpperCase();
           // Find the primary department this SOP actually belongs to
           const primaryDept = departments.find((d) =>
@@ -4379,7 +4387,7 @@ export default function TrainingMatrixPage() {
           const stat = sopStats.get(sopCode) || { completed: 0, pending: 0, pendingEmployees: [], completedEmployees: [] };
           const totalApplicable = stat.completed + stat.pending;
           const completionPct = totalApplicable ? Math.round((stat.completed / totalApplicable) * 100) : 0;
-          const status = data.sopStatusByCode?.[sopCode];
+          const status = sopStatusForCode(data.sopStatusByCode, sopCode);
           const meta = sopRowMeta(sopCode, status as { title?: string; gujaratiName?: string; isDualLanguage?: boolean });
           return {
             sopCode,
@@ -6092,7 +6100,7 @@ export default function TrainingMatrixPage() {
                 if (empModalFilter === 'due' && r.symbol === '√') return false;
                 if (empModalFilter === 'assigned' && r.symbol !== '√') return false;
                 if (q) {
-                  const sopStatus = data?.sopStatusByCode?.[r.sopCode] || data?.sopStatusByCode?.[stripVersion(r.sopCode)];
+                  const sopStatus = sopStatusForCode(data?.sopStatusByCode, r.sopCode);
                   const title = (sopStatus?.title || '').toLowerCase();
                   return r.sopCode.toLowerCase().includes(q) || title.includes(q) || (r.month || '').toLowerCase().includes(q);
                 }
@@ -6105,8 +6113,8 @@ export default function TrainingMatrixPage() {
                 if (empModalSort.field === 'code') { va = a.sopCode; vb = b.sopCode; }
                 else if (empModalSort.field === 'month') { va = a.month || ''; vb = b.month || ''; }
                 else if (empModalSort.field === 'name') {
-                  const sa = data?.sopStatusByCode?.[a.sopCode] || data?.sopStatusByCode?.[stripVersion(a.sopCode)];
-                  const sb = data?.sopStatusByCode?.[b.sopCode] || data?.sopStatusByCode?.[stripVersion(b.sopCode)];
+                  const sa = sopStatusForCode(data?.sopStatusByCode, a.sopCode);
+                  const sb = sopStatusForCode(data?.sopStatusByCode, b.sopCode);
                   va = sa?.title || ''; vb = sb?.title || '';
                 }
                 const cmp = va.localeCompare(vb);
@@ -6232,7 +6240,7 @@ export default function TrainingMatrixPage() {
                         <tbody>
                           {displayRows.map((r, idx) => {
                             const isDue = r.symbol !== '√';
-                            const sopStatus = data?.sopStatusByCode?.[r.sopCode] || data?.sopStatusByCode?.[stripVersion(r.sopCode)];
+                            const sopStatus = sopStatusForCode(data?.sopStatusByCode, r.sopCode);
                             const sopTitle = sopStatus?.title || '—';
                             const isExpired = sopStatus?.expired;
                             const targetDate = sopStatus?.targetDate;

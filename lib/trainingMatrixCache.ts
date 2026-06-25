@@ -2,7 +2,7 @@ import SystemCache from '@/models/SystemCache';
 
 // Bump the version suffix whenever the payload shape changes so stale snapshots
 // (memory or persisted) are ignored after a deploy.
-const CACHE_KEY = 'training-matrix-overview:v57';
+const CACHE_KEY = 'training-matrix-overview:v58';
 
 export type TrainingMatrixCacheEntry = { computedAt: number; payload: unknown };
 

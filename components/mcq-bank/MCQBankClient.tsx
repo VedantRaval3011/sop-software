@@ -8,6 +8,7 @@ import {
   CheckCircle2,
   ChevronDown,
   Copy,
+  Cpu,
   Eye,
   FileText,
   Folder,
@@ -107,8 +108,13 @@ interface RegistryEntry {
   /** Per-language MCQ presence — backs the capsule "w/ EN" / "w/ GU" filters. */
   hasEnMcq: boolean;
   hasGuMcq: boolean;
+  enMcqCount: number;
+  guMcqCount: number;
   isObsoleteMcq?: boolean;
 }
+
+type McqLang = "English" | "Gujarati";
+const MCQ_BANK_CAP = 100;
 
 // ─────────────────────────────────────────────────────────────
 // Helpers
@@ -528,27 +534,64 @@ function DeptColorCard({
 // Live per-row generation progress (mirrors the MCQGenJob status endpoint).
 interface GenProgress {
   status: "generating" | "error";
-  mode?: "generate" | "regenerate";
+  mode?: "generate" | "regenerate" | "continue";
+  languageScope?: McqLang;
   phase?: string;
   percent?: number;
   totalInserted?: number;
   totalSkipped?: number;
   totalFailedBatches?: number;
+  logs?: string[];
   error?: string;
 }
 
+function ActionBtn({
+  label, variant, disabled, loading, icon: Icon, onClick,
+}: {
+  label: string;
+  variant: "generate" | "regenerate" | "continue" | "view";
+  disabled?: boolean;
+  loading?: boolean;
+  icon: typeof Sparkles;
+  onClick: () => void;
+}) {
+  const styles = {
+    generate: "border-emerald-300 bg-emerald-50 text-emerald-700 hover:bg-emerald-100",
+    regenerate: "border-amber-300 bg-amber-50 text-amber-700 hover:bg-amber-100",
+    continue: "border-violet-300 bg-violet-50 text-violet-700 hover:bg-violet-100",
+    view: "border-violet-300 bg-violet-50 text-violet-700 hover:bg-violet-100",
+  }[variant];
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-[9px] font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-70 ${styles}`}
+    >
+      {loading ? (
+        <><Loader2 className="h-2.5 w-2.5 animate-spin" /> {label}…</>
+      ) : (
+        <><Icon className="h-2.5 w-2.5" /> {label}</>
+      )}
+    </button>
+  );
+}
+
 function RegistryRow({
-  entry, isEven, onViewMcqs, onGenerate, onRegenerate, genStatus,
+  entry, isEven, onViewMcqs, onGenerate, onRegenerate, onContinue, genStatus,
 }: {
   entry: RegistryEntry; isEven: boolean;
   onViewMcqs?: (id: string) => void;
-  onGenerate?: (entry: RegistryEntry) => void;
-  onRegenerate?: (entry: RegistryEntry) => void;
+  onGenerate?: (entry: RegistryEntry, language?: McqLang) => void;
+  onRegenerate?: (entry: RegistryEntry, language?: McqLang) => void;
+  onContinue?: (entry: RegistryEntry, language?: McqLang) => void;
   genStatus?: GenProgress;
 }) {
   const isGenerating = genStatus?.status === "generating";
   const remaining = Math.max(0, entry.totalMcqs - entry.approved);
   const isDual = entry.language === "ENG-GUJ";
+  const needsEn = entry.language === "ENG" || isDual;
+  const needsGu = entry.language === "GUJ" || isDual;
   // SOP No. / SOP Name rendered with displaySopCode / displaySopTitle and the exact
   // same Tailwind classes the SOP Registry uses, so both modules look identical.
   const sopCode = displaySopCode(entry.identifier);
@@ -624,50 +667,75 @@ function RegistryRow({
       </td>
       <td className="px-3 py-2.5 whitespace-nowrap">
         <div className="flex flex-col items-start gap-1">
-          <div className="flex items-center gap-1">
+          <div className="flex flex-wrap items-center gap-1">
             {entry.banks.map((b) => (
-              <button
+              <ActionBtn
                 key={b.id}
-                type="button"
+                variant="view"
+                icon={Eye}
+                label={entry.banks.length > 1 ? `View ${b.langCode}` : "VIEW MCQs"}
                 onClick={() => onViewMcqs?.(b.id)}
-                className="inline-flex items-center gap-1 rounded-full border border-violet-300 bg-violet-50 px-2.5 py-1 text-[9px] font-semibold text-violet-700 hover:bg-violet-100 transition-colors"
-              >
-                <Eye className="h-2.5 w-2.5" /> {entry.banks.length > 1 ? b.langCode : "VIEW MCQs"}
-              </button>
+              />
             ))}
-            {/* "Not Found" rows (no MCQs in every required language, and not obsolete)
-                get a one-click Generate action that creates the bank and flips the
-                row's status to MCQ Found once generation completes. */}
-            {!entry.hasMcq && !entry.isObsoleteMcq && (
-              <button
-                type="button"
-                onClick={() => onGenerate?.(entry)}
+            {!entry.isObsoleteMcq && needsEn && !entry.hasEnMcq && (
+              <ActionBtn
+                variant="generate"
+                icon={Sparkles}
+                label={isDual ? "Generate ENG" : "Generate MCQ"}
                 disabled={isGenerating}
-                className="inline-flex items-center gap-1 rounded-full border border-emerald-300 bg-emerald-50 px-2.5 py-1 text-[9px] font-semibold text-emerald-700 hover:bg-emerald-100 transition-colors disabled:cursor-not-allowed disabled:opacity-70"
-              >
-                {isGenerating ? (
-                  <><Loader2 className="h-2.5 w-2.5 animate-spin" /> Generating…</>
-                ) : (
-                  <><Sparkles className="h-2.5 w-2.5" /> {entry.banks.length > 0 ? "Generate" : "Generate MCQ"}</>
-                )}
-              </button>
+                loading={isGenerating && (!genStatus?.languageScope || genStatus.languageScope === "English")}
+                onClick={() => onGenerate?.(entry, isDual ? "English" : undefined)}
+              />
             )}
-            {/* Regenerate is available for every SOP that already has MCQs. It
-                archives the current bank and generates a fresh set, but is gated
-                behind a password prompt (handled by the parent). */}
-            {!entry.isObsoleteMcq && entry.hasMcq && (
-              <button
-                type="button"
-                onClick={() => onRegenerate?.(entry)}
+            {!entry.isObsoleteMcq && needsGu && !entry.hasGuMcq && (
+              <ActionBtn
+                variant="generate"
+                icon={Sparkles}
+                label={isDual ? "Generate GUJ" : "Generate MCQ"}
                 disabled={isGenerating}
-                className="inline-flex items-center gap-1 rounded-full border border-amber-300 bg-amber-50 px-2.5 py-1 text-[9px] font-semibold text-amber-700 hover:bg-amber-100 transition-colors disabled:cursor-not-allowed disabled:opacity-70"
-              >
-                {isGenerating ? (
-                  <><Loader2 className="h-2.5 w-2.5 animate-spin" /> Regenerating…</>
-                ) : (
-                  <><RefreshCw className="h-2.5 w-2.5" /> Regenerate</>
-                )}
-              </button>
+                loading={isGenerating && (!genStatus?.languageScope || genStatus.languageScope === "Gujarati")}
+                onClick={() => onGenerate?.(entry, isDual ? "Gujarati" : undefined)}
+              />
+            )}
+            {!entry.isObsoleteMcq && needsEn && entry.hasEnMcq && (
+              <ActionBtn
+                variant="regenerate"
+                icon={RefreshCw}
+                label={isDual ? "Regenerate ENG" : "Regenerate"}
+                disabled={isGenerating}
+                loading={isGenerating && genStatus?.mode === "regenerate" && (!genStatus?.languageScope || genStatus.languageScope === "English")}
+                onClick={() => onRegenerate?.(entry, isDual ? "English" : undefined)}
+              />
+            )}
+            {!entry.isObsoleteMcq && needsGu && entry.hasGuMcq && (
+              <ActionBtn
+                variant="regenerate"
+                icon={RefreshCw}
+                label={isDual ? "Regenerate GUJ" : "Regenerate"}
+                disabled={isGenerating}
+                loading={isGenerating && genStatus?.mode === "regenerate" && (!genStatus?.languageScope || genStatus.languageScope === "Gujarati")}
+                onClick={() => onRegenerate?.(entry, isDual ? "Gujarati" : undefined)}
+              />
+            )}
+            {!entry.isObsoleteMcq && needsEn && entry.hasEnMcq && entry.enMcqCount < MCQ_BANK_CAP && (
+              <ActionBtn
+                variant="continue"
+                icon={Sparkles}
+                label={isDual ? "Continue ENG" : "Continue"}
+                disabled={isGenerating}
+                loading={isGenerating && genStatus?.mode === "continue" && (!genStatus?.languageScope || genStatus.languageScope === "English")}
+                onClick={() => onContinue?.(entry, isDual ? "English" : undefined)}
+              />
+            )}
+            {!entry.isObsoleteMcq && needsGu && entry.hasGuMcq && entry.guMcqCount < MCQ_BANK_CAP && (
+              <ActionBtn
+                variant="continue"
+                icon={Sparkles}
+                label={isDual ? "Continue GUJ" : "Continue"}
+                disabled={isGenerating}
+                loading={isGenerating && genStatus?.mode === "continue" && (!genStatus?.languageScope || genStatus.languageScope === "Gujarati")}
+                onClick={() => onContinue?.(entry, isDual ? "Gujarati" : undefined)}
+              />
             )}
             {entry.banks.length === 0 && entry.isObsoleteMcq && (
               <span className="text-[9px] text-gray-300">—</span>
@@ -678,7 +746,8 @@ function RegistryRow({
             <div className="flex w-44 flex-col gap-0.5">
               <div className="flex items-center justify-between gap-2 text-[8px] text-gray-500">
                 <span className="truncate" title={genStatus?.phase}>
-                  {genStatus?.mode === "regenerate" ? "Regenerating" : "Generating"}
+                  {genStatus?.mode === "regenerate" ? "Regenerating" : genStatus?.mode === "continue" ? "Continuing" : "Generating"}
+                  {genStatus?.languageScope ? ` ${genStatus.languageScope === "Gujarati" ? "GUJ" : "ENG"}` : ""}
                   {genStatus?.phase ? ` · ${genStatus.phase}` : "…"}
                 </span>
                 <span className="shrink-0 font-bold tabular-nums text-gray-700">{genStatus?.percent ?? 0}%</span>
@@ -689,6 +758,13 @@ function RegistryRow({
                   style={{ width: `${Math.min(genStatus?.percent ?? 0, 100)}%` }}
                 />
               </div>
+              {genStatus?.logs && genStatus.logs.length > 0 && (
+                <div className="mt-0.5 w-56 rounded bg-gray-900 px-2 py-1.5 font-mono text-[7.5px] leading-tight text-green-400 space-y-0.5 max-h-[52px] overflow-y-auto">
+                  {genStatus.logs.slice(-5).map((line, i) => (
+                    <div key={i} className="truncate" title={line}>{line}</div>
+                  ))}
+                </div>
+              )}
               {genStatus?.totalInserted != null && (
                 <span className="text-[8px] text-gray-400">
                   +{genStatus.totalInserted} new · {genStatus.totalSkipped ?? 0} skipped
@@ -755,6 +831,15 @@ export function MCQBankClient() {
   // UI state
   const [showDeptCards, setShowDeptCards] = useState(true);
   const [refreshKey, setRefreshKey] = useState(0);
+  const [selectedProvider, setSelectedProvider] = useState<"claude" | "ollama" | null>("claude");
+  const [claudeStatus, setClaudeStatus] = useState<{
+    ok: boolean;
+    model?: string;
+    email?: string;
+    subscriptionType?: string;
+    error?: string;
+    loading?: boolean;
+  } | null>(null);
   // Per-family MCQ generation state, keyed by registry entry id (family key).
   const [genStatus, setGenStatus] = useState<Record<string, GenProgress>>({});
   // Identifiers currently being polled, so we never start two poll loops for one row.
@@ -762,7 +847,7 @@ export function MCQBankClient() {
 
   // Regenerate flow — the entry awaiting password confirmation, plus the typed
   // password and any validation error.
-  const [regenTarget, setRegenTarget] = useState<RegistryEntry | null>(null);
+  const [regenTarget, setRegenTarget] = useState<{ entry: RegistryEntry; language?: McqLang } | null>(null);
   const [regenPassword, setRegenPassword] = useState("");
   const [regenError, setRegenError] = useState<string | null>(null);
 
@@ -800,6 +885,38 @@ export function MCQBankClient() {
 
   useEffect(() => { fetchStats(); }, [fetchStats, refreshKey]);
   useEffect(() => { fetchRegistry(); }, [fetchRegistry, refreshKey]);
+
+  useEffect(() => {
+    if (selectedProvider !== "claude") {
+      setClaudeStatus(null);
+      return;
+    }
+    let cancelled = false;
+    setClaudeStatus({ ok: false, loading: true });
+    fetch("/api/llm/claude-status")
+      .then((res) => res.json())
+      .then((data) => {
+        if (cancelled) return;
+        const c = data.claude ?? {};
+        setClaudeStatus({
+          ok: Boolean(data.success && c.loggedIn),
+          model: c.model,
+          email: c.email,
+          subscriptionType: c.subscriptionType,
+          error: c.error,
+          loading: false,
+        });
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setClaudeStatus({
+          ok: false,
+          error: e instanceof Error ? e.message : "Could not check Claude status",
+          loading: false,
+        });
+      });
+    return () => { cancelled = true; };
+  }, [selectedProvider]);
 
   // Generate MCQs for a "Not Found" family on demand. The endpoint runs the full
   // generation pipeline into mcqbanks; once it succeeds we refresh stats + registry
@@ -840,11 +957,13 @@ export function MCQBankClient() {
             [entry.id]: {
               status: "generating",
               mode: d.mode,
+              languageScope: d.languageScope,
               phase: d.phase,
               percent: d.percent,
               totalInserted: d.totalInserted,
               totalSkipped: d.totalSkipped,
               totalFailedBatches: d.totalFailedBatches,
+              logs: d.logs ?? [],
             },
           }));
         }
@@ -865,13 +984,20 @@ export function MCQBankClient() {
     setTimeout(tick, 1500);
   }, []);
 
-  const handleGenerate = useCallback(async (entry: RegistryEntry) => {
-    setGenStatus((s) => ({ ...s, [entry.id]: { status: "generating", phase: "Queued", percent: 0 } }));
+  const handleGenerate = useCallback(async (entry: RegistryEntry, language?: McqLang) => {
+    setGenStatus((s) => ({
+      ...s,
+      [entry.id]: { status: "generating", languageScope: language, phase: "Queued", percent: 0, logs: [] },
+    }));
     try {
       const res = await fetch("/api/sop/generate-mcqs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ identifier: entry.identifier }),
+        body: JSON.stringify({
+          identifier: entry.identifier,
+          ...(language ? { language } : {}),
+          ...(selectedProvider ? { provider: selectedProvider } : {}),
+        }),
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
@@ -880,7 +1006,14 @@ export function MCQBankClient() {
       const job = await res.json().catch(() => ({}));
       setGenStatus((s) => ({
         ...s,
-        [entry.id]: { status: "generating", mode: job.mode, phase: "Queued", percent: 0 },
+        [entry.id]: {
+          status: "generating",
+          mode: job.mode,
+          languageScope: job.languageScope ?? language,
+          phase: "Queued",
+          percent: 0,
+          logs: [],
+        },
       }));
       pollJob(entry);
     } catch (e) {
@@ -889,11 +1022,40 @@ export function MCQBankClient() {
         [entry.id]: { status: "error", error: e instanceof Error ? e.message : "Generation failed" },
       }));
     }
-  }, [pollJob]);
+  }, [pollJob, selectedProvider]);
+
+  const handleContinue = useCallback(async (entry: RegistryEntry, language?: McqLang) => {
+    setGenStatus((s) => ({
+      ...s,
+      [entry.id]: { status: "generating", mode: "continue", languageScope: language, phase: "Queued", percent: 0, logs: [] },
+    }));
+    try {
+      const res = await fetch("/api/sop/generate-mcqs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          identifier: entry.identifier,
+          mode: "continue",
+          ...(language ? { language } : {}),
+          ...(selectedProvider ? { provider: selectedProvider } : {}),
+        }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error ?? "Continue generation failed");
+      }
+      pollJob(entry);
+    } catch (e) {
+      setGenStatus((s) => ({
+        ...s,
+        [entry.id]: { status: "error", error: e instanceof Error ? e.message : "Continue generation failed" },
+      }));
+    }
+  }, [pollJob, selectedProvider]);
 
   // Open the password prompt for an SOP the user wants to regenerate.
-  const requestRegenerate = useCallback((entry: RegistryEntry) => {
-    setRegenTarget(entry);
+  const requestRegenerate = useCallback((entry: RegistryEntry, language?: McqLang) => {
+    setRegenTarget({ entry, language });
     setRegenPassword("");
     setRegenError(null);
   }, []);
@@ -911,11 +1073,12 @@ export function MCQBankClient() {
       setRegenError("Incorrect password. Please try again.");
       return;
     }
-    const entry = regenTarget;
+    if (!regenTarget) return;
+    const { entry, language } = regenTarget;
     setRegenTarget(null);
     setRegenPassword("");
     setRegenError(null);
-    if (entry) handleGenerate(entry);
+    if (entry) handleGenerate(entry, language);
   }, [regenPassword, regenTarget, handleGenerate]);
 
   const handleSort = (field: string) => {
@@ -1075,8 +1238,9 @@ export function MCQBankClient() {
               <h3 className="text-sm font-bold text-gray-800">Regenerate MCQs</h3>
             </div>
             <p className="mb-4 text-xs leading-relaxed text-gray-500">
-              Enter the password to regenerate MCQs for{" "}
-              <span className="font-semibold text-gray-700">{displaySopCode(regenTarget.identifier)}</span>.
+              Enter the password to regenerate{" "}
+              {regenTarget.language ? `${regenTarget.language === "Gujarati" ? "Gujarati" : "English"} MCQs` : "MCQs"} for{" "}
+              <span className="font-semibold text-gray-700">{displaySopCode(regenTarget.entry.identifier)}</span>.
               This archives the current bank to Obsolete MCQs and generates a fresh set.
             </p>
             <form onSubmit={(e) => { e.preventDefault(); confirmRegenerate(); }}>
@@ -1151,6 +1315,46 @@ export function MCQBankClient() {
                   className="flex items-center gap-1.5 rounded-lg bg-violet-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-violet-700">
                   <Home className="h-3.5 w-3.5" /> Home
                 </button>
+                <button
+                  type="button"
+                  onClick={() => setSelectedProvider((p) => (p === "claude" ? null : "claude"))}
+                  title={
+                    selectedProvider === "claude" && claudeStatus?.ok
+                      ? `Claude Sonnet via your subscription (${claudeStatus.email ?? "logged in"} · ${claudeStatus.subscriptionType ?? "active"} · ${claudeStatus.model ?? "claude-sonnet-4-6"}) — click to switch to Gemini`
+                      : selectedProvider === "claude" && claudeStatus?.error
+                        ? `Claude not connected: ${claudeStatus.error}`
+                        : "Claude is the default — click to use Gemini instead"
+                  }
+                  className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors ${
+                    selectedProvider === "claude"
+                      ? claudeStatus?.ok === false && !claudeStatus?.loading
+                        ? "border border-red-600 bg-red-600 text-white hover:bg-red-700 ring-2 ring-red-300"
+                        : "border border-violet-600 bg-violet-600 text-white hover:bg-violet-700 ring-2 ring-violet-300"
+                      : "border border-slate-300 bg-white text-slate-600 hover:bg-slate-50"
+                  }`}
+                >
+                  <Sparkles className="h-3.5 w-3.5" />
+                  {selectedProvider === "claude"
+                    ? claudeStatus?.loading
+                      ? "Claude…"
+                      : claudeStatus?.ok
+                        ? "Claude ✓"
+                        : "Claude !"
+                    : "Claude"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSelectedProvider((p) => (p === "ollama" ? "claude" : "ollama"))}
+                  title={selectedProvider === "ollama" ? "Using local Ollama model (gemma3:12b) — click to switch back to Claude" : "Click to use local Ollama model (gemma3:12b) for MCQ generation"}
+                  className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors ${
+                    selectedProvider === "ollama"
+                      ? "border border-emerald-600 bg-emerald-600 text-white hover:bg-emerald-700 ring-2 ring-emerald-300"
+                      : "border border-slate-300 bg-white text-slate-600 hover:bg-slate-50"
+                  }`}
+                >
+                  <Cpu className="h-3.5 w-3.5" />
+                  {selectedProvider === "ollama" ? "Local AI (Gemma3)" : "Local AI"}
+                </button>
                 <button type="button"
                   className="flex items-center gap-1.5 rounded-lg border border-slate-800 bg-slate-800 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-900">
                   <Monitor className="h-3.5 w-3.5" /> Dev Mode
@@ -1184,6 +1388,29 @@ export function MCQBankClient() {
           {statsError && (
             <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
               {statsError}
+            </div>
+          )}
+          {selectedProvider === "claude" && claudeStatus && !claudeStatus.loading && (
+            <div
+              className={`rounded-lg border px-4 py-3 text-sm ${
+                claudeStatus.ok
+                  ? "border-violet-200 bg-violet-50 text-violet-900"
+                  : "border-red-200 bg-red-50 text-red-700"
+              }`}
+            >
+              {claudeStatus.ok ? (
+                <>
+                  Connected to your Claude subscription as <strong>{claudeStatus.email}</strong>
+                  {claudeStatus.subscriptionType ? ` (${claudeStatus.subscriptionType})` : ""}
+                  {" · "}model: <strong>{claudeStatus.model ?? "claude-sonnet-4-6"}</strong>
+                  {" · "}generates up to 100 unique MCQs per language (batched, deduped)
+                </>
+              ) : (
+                <>
+                  Claude is not connected on this machine. Run <code className="rounded bg-red-100 px-1">claude auth login</code> in a terminal, then refresh.
+                  {claudeStatus.error ? ` — ${claudeStatus.error}` : ""}
+                </>
+              )}
             </div>
           )}
 
@@ -1462,6 +1689,7 @@ export function MCQBankClient() {
                         onViewMcqs={(id) => setViewerBankId(id)}
                         onGenerate={handleGenerate}
                         onRegenerate={requestRegenerate}
+                        onContinue={handleContinue}
                         genStatus={genStatus[entry.id]}
                       />
                     ))}

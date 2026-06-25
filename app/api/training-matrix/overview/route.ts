@@ -4,7 +4,13 @@ import SOP from '@/models/SOP';
 import MCQBank from '@/models/MCQBank';
 import TrainingMatrixUpload from '@/models/TrainingMatrixUpload';
 import DepartmentTrainer from '@/models/DepartmentTrainer';
-import { groupSOPRecords, baseIdentifierFromIdentifier } from '@/lib/sop-utils';
+import { groupSOPRecords, baseIdentifierFromIdentifier, sopFamilyGroupKey } from '@/lib/sop-utils';
+import {
+  aliasSopStatusByCode,
+  buildMcqStatMapsFromAgg,
+  lookupMcqCombinedStat,
+  lookupMcqLangStat,
+} from '@/lib/trainingMatrixMcqStats';
 import {
   buildExcelToDbBaseLookup,
   dbBasePresentInExcelCodes,
@@ -131,14 +137,14 @@ type McqBuckets = ReturnType<typeof buildEmptyMcqBuckets>;
 function computeMcqBuckets(
   sopCodes: Iterable<string>,
   dbBaseLangs: Map<string, Set<LangKey>>,
-  mcqLangStatMap: Map<string, { eng: LangStat; guj: LangStat }>,
+  resolveLangStat: (code: string) => { eng: LangStat; guj: LangStat } | undefined,
 ): McqBuckets {
   const b = buildEmptyMcqBuckets();
   const T = MCQ_CREATED_THRESHOLD;
   for (const code of sopCodes) {
     const langSet = dbBaseLangs.get(code) || new Set<LangKey>(['ENG']);
     const isDual = langSet.has('GUJ');
-    const langStat = mcqLangStatMap.get(code);
+    const langStat = resolveLangStat(code);
     const engTq = langStat?.eng.totalQuestions ?? 0;
     const engApproved = langStat?.eng.approvedCount ?? 0;
     const gujTq = langStat?.guj.totalQuestions ?? 0;
@@ -307,7 +313,7 @@ async function computeOverviewPayload(forceFresh: boolean) {
           $project: {
             sopIdentifier: 1,
             language: 1,
-            totalQuestions: { $ifNull: ['$totalQuestions', { $size: { $ifNull: ['$mcqs', []] } }] },
+            totalQuestions: { $size: { $ifNull: ['$mcqs', []] } },
             approvedCount: {
               $size: {
                 $filter: {
@@ -340,24 +346,10 @@ async function computeOverviewPayload(forceFresh: boolean) {
 
     const stripVer = (c: string) => String(c || '').toUpperCase().replace(/-\d+$/, '').trim();
 
-    const mcqLangStatMap = new Map<string, { eng: LangStat; guj: LangStat }>();
-    const mcqStatMap = new Map<string, LangStat>();
-    for (const row of mcqAgg as Array<{ sopIdentifier: string; language: string | null; totalQuestions: number; approvedCount: number }>) {
-      const base = baseIdentifierFromIdentifier(String(row.sopIdentifier || ''));
-      if (!base) continue;
-      const isGuj = String(row.language || '') === 'Gujarati';
-      const total = row.totalQuestions || 0;
-      const approved = row.approvedCount || 0;
-      if (!mcqLangStatMap.has(base)) mcqLangStatMap.set(base, { eng: { totalQuestions: 0, approvedCount: 0 }, guj: { totalQuestions: 0, approvedCount: 0 } });
-      const entry = mcqLangStatMap.get(base)!;
-      const slot = isGuj ? entry.guj : entry.eng;
-      slot.totalQuestions += total;
-      slot.approvedCount += approved;
-      const combined = mcqStatMap.get(base) || { totalQuestions: 0, approvedCount: 0 };
-      combined.totalQuestions += total;
-      combined.approvedCount += approved;
-      mcqStatMap.set(base, combined);
-    }
+    const { mcqLangStatMap, mcqStatMap } = buildMcqStatMapsFromAgg(
+      mcqAgg as Array<{ sopIdentifier: string; language: string | null; totalQuestions: number; approvedCount: number }>,
+    );
+    const dbBaseToFamKey = new Map<string, string>();
 
     // 3. Per-family metadata, languages, department.
     const dbBaseSet = new Set<string>();
@@ -379,6 +371,7 @@ async function computeOverviewPayload(forceFresh: boolean) {
       const base = baseIdentifierFromIdentifier(row.identifier);
       if (!base || dbBaseSet.has(base)) continue;
       dbBaseSet.add(base);
+      dbBaseToFamKey.set(base, sopFamilyGroupKey(row));
 
       const langs = new Set<LangKey>();
       if (row.language === 'ENG' || row.language === 'ENG-GUJ') langs.add('ENG');
@@ -425,7 +418,7 @@ async function computeOverviewPayload(forceFresh: boolean) {
     for (const base of dbBaseSet) {
       const langs = dbBaseLangs.get(base) || new Set<LangKey>(['ENG']);
       const meta = dbBaseMeta.get(base)!;
-      const ls = mcqLangStatMap.get(base);
+      const ls = lookupMcqLangStat(base, dbBaseToFamKey, mcqLangStatMap);
       if ((ls?.eng.totalQuestions ?? 0) > 0) langs.add('ENG');
       if ((ls?.guj.totalQuestions ?? 0) > 0) langs.add('GUJ');
       if (meta.gujaratiName) langs.add('GUJ');
@@ -480,8 +473,8 @@ async function computeOverviewPayload(forceFresh: boolean) {
     }> = {};
     for (const base of dbBaseSet) {
       const meta = dbBaseMeta.get(base)!;
-      const ls = mcqLangStatMap.get(base);
-      const combined = mcqStatMap.get(base) || { totalQuestions: 0, approvedCount: 0 };
+      const ls = lookupMcqLangStat(base, dbBaseToFamKey, mcqLangStatMap);
+      const combined = lookupMcqCombinedStat(base, dbBaseToFamKey, mcqStatMap);
       sopStatusByCode[base] = {
         expired: meta.expired,
         targetDate: meta.targetDate,
@@ -496,6 +489,7 @@ async function computeOverviewPayload(forceFresh: boolean) {
         isDualLanguage: meta.isDualLanguage,
       };
     }
+    aliasSopStatusByCode(sopStatusByCode, dbBaseSet, excelToDbBase, stripVer);
 
     // 5b. Trainers (from `departmenttrainers`) and upload snapshots (from
     //     `trainingmatricesupload`) — both fetched in the parallel batch above to
@@ -616,7 +610,9 @@ async function computeOverviewPayload(forceFresh: boolean) {
         { key: 'ENG', label: 'ENG', found: excel ? engFound : engNeeded, missing: excel ? engMissing : 0 },
         ...(gujNeeded > 0 ? [{ key: 'GUJ', label: 'GUJ', found: excel ? gujFound : gujNeeded, missing: excel ? gujMissing : 0 }] : []),
       ];
-      const mcq = computeMcqBuckets(codes, dbBaseLangs, mcqLangStatMap);
+      const mcq = computeMcqBuckets(codes, dbBaseLangs, (code) =>
+        lookupMcqLangStat(code, dbBaseToFamKey, mcqLangStatMap),
+      );
 
       // SOP-wise trainer buckets (scope = this card's DB SOP codes).
       const sop0TrainerList = codes.filter((c) => (baseTrainerCount.get(c) ?? 0) === 0);

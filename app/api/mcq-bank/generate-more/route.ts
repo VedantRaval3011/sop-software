@@ -3,7 +3,8 @@ import { connectDB } from "@/lib/mongodb";
 import MCQBank from "@/models/MCQBank";
 import SOP from "@/models/SOP";
 import { generateJson } from "@/lib/gemini";
-import { appendGeneratedToBank, type BankInputMcq } from "@/lib/mcq-bank-write";
+import { appendGeneratedToBank, MCQ_BANK_CAP, type BankInputMcq } from "@/lib/mcq-bank-write";
+import { MCQ_CONTENT_LIMIT, mcqPromptSopExcerpt } from "@/lib/mcq-source-text";
 import { invalidateDashboardSopsCache } from "@/lib/server-cache";
 import { requireAuth } from "@/lib/withAuth";
 
@@ -34,15 +35,28 @@ export async function POST(request: NextRequest) {
     // sending the entire bank (often 100+) bloated input tokens and slowed every
     // call. appendGeneratedToBank still dedups against the full bank locally, so
     // uniqueness is guaranteed regardless of what the model sees.
-    const existingBank = await MCQBank.findOne({ sopId: sop._id, language }).select("mcqs.question").lean();
+    const existingBank = await MCQBank.findOne({ sopId: sop._id, language, isObsolete: { $ne: true } })
+      .select("mcqs.question")
+      .lean();
+    const bankSize = existingBank?.mcqs?.length ?? 0;
+    if (bankSize >= MCQ_BANK_CAP) {
+      return NextResponse.json(
+        { error: `Bank already has the maximum of ${MCQ_BANK_CAP} MCQs` },
+        { status: 400 },
+      );
+    }
+    const room = MCQ_BANK_CAP - bankSize;
+    const askCount = Math.min(Number(count) || 3, room);
+
     const excluded = (existingBank?.mcqs ?? [])
       .slice(-20)
       .map((m) => m.question)
       .join("\n- ");
 
+    const excerpt = mcqPromptSopExcerpt(sop.content, 0, MCQ_CONTENT_LIMIT);
     const result = await generateJson<{ questions: BankInputMcq[] }>(
       REPLACE_PROMPT,
-      `SOP content:\n${sop.content.slice(0, 40000)}\n\nDo NOT repeat these recent questions:\n- ${excluded}\n\nGenerate ${count} new unique questions in ${language}.`,
+      `SOP text:\n${excerpt}\n\nAvoid repeating:\n- ${excluded}\n\nGenerate ${askCount} new unique questions in ${language}.`,
       { maxAttempts: 2, fastFail503: true },
     );
 

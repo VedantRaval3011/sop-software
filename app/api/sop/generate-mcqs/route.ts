@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { connectDB } from "@/lib/mongodb";
 import { requireAuth } from "@/lib/withAuth";
-import { enqueueMcqGeneration } from "@/lib/mcq-generation";
+import { enqueueMcqGeneration, parseMcqLanguage } from "@/lib/mcq-generation";
 
 // Kick off generation in the background and return immediately. The previous
 // implementation awaited the full dual-language run (up to 16+ Gemini calls plus
@@ -18,8 +18,12 @@ export async function POST(request: NextRequest) {
     if (!identifier) {
       return NextResponse.json({ error: "identifier is required" }, { status: 400 });
     }
+    const p = body.provider;
+    const provider = p === "ollama" ? "ollama" : p === "gemini" ? "gemini" : p === "claude" ? "claude" : undefined;
+    const modeOverride = body.mode === "continue" ? "continue" : undefined;
+    const languageScope = parseMcqLanguage(body.language);
 
-    const job = await enqueueMcqGeneration(identifier);
+    const job = await enqueueMcqGeneration(identifier, provider, modeOverride, languageScope);
     return NextResponse.json(job, { status: 202 });
   } catch (error) {
     console.error("POST /api/sop/generate-mcqs error:", error);
