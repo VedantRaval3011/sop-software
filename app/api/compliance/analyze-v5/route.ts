@@ -7,7 +7,7 @@ import { analyzeSOPComplianceV5, type SopLibraryEntry } from "@/lib/complianceEn
 import { saveComplianceReport } from "@/lib/complianceReportStorage";
 import { extractClauses } from "@/lib/ocrProcessor";
 import { requireAuth } from "@/lib/withAuth";
-import { getComplianceProvider } from "@/lib/llm";
+import { getComplianceProvider, checkClaudeCliHealth, type LlmProvider } from "@/lib/llm";
 import { warmupOllamaComplianceModel } from "@/lib/ollama-warmup";
 
 const MAX_CLAUSE_TEXT = 4000;
@@ -64,6 +64,11 @@ export async function POST(request: NextRequest) {
     await connectDB();
     const body = await request.json();
     const { sopId, forceRefresh = false } = body;
+    const p = body.provider as string | undefined;
+    const providerOverride: LlmProvider | undefined =
+      p === "claude" ? "claude" : p === "ollama" ? "ollama" : p === "gemini" ? "gemini" : undefined;
+    const modelOverride: string | undefined =
+      typeof body.model === "string" && body.model.trim() ? body.model.trim() : undefined;
 
     if (!sopId) {
       return NextResponse.json({ success: false, error: "sopId is required" }, { status: 400 });
@@ -140,8 +145,18 @@ export async function POST(request: NextRequest) {
       expiryDate: s.expiryDate ?? null,
     }));
 
-    if (getComplianceProvider() === "ollama") {
+    const effectiveProvider = providerOverride ?? getComplianceProvider();
+    if (effectiveProvider === "ollama") {
       await warmupOllamaComplianceModel();
+    }
+    if (effectiveProvider === "claude") {
+      const health = await checkClaudeCliHealth();
+      if (!health.ok) {
+        return NextResponse.json(
+          { success: false, error: health.error ?? "Claude Code is not connected. Run: claude auth login" },
+          { status: 503 },
+        );
+      }
     }
 
     const result = await analyzeSOPComplianceV5({
@@ -151,6 +166,8 @@ export async function POST(request: NextRequest) {
       sopContent: sop.content,
       guidelineClauses,
       sopLibrary,
+      provider: providerOverride,
+      model: modelOverride,
     });
 
     await saveComplianceReport({

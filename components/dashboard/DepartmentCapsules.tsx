@@ -652,19 +652,19 @@ const DepartmentCard = memo(function DepartmentCard({
           formatLabel="DOCX"
           l1="EN" f1={cap.version.docx?.en?.found ?? 0} m1={cap.version.docx?.en?.missing ?? 0}
           l2="GJ" f2={cap.version.docx?.gu?.found ?? 0} m2={cap.version.docx?.gu?.missing ?? 0}
-          onF1={() => f({ versionStatus: "found", fileType: "EN DOCX" })}
-          onM1={() => f({ versionStatus: "missing", fileType: "Needs EN" })}
-          onF2={() => f({ versionStatus: "found", fileType: "GJ DOCX" })}
-          onM2={() => f({ versionStatus: "missing", fileType: "Needs GJ" })}
+          onF1={() => f({ versionStatus: "found", language: "ENG" })}
+          onM1={() => f({ versionStatus: "missing", language: "ENG" })}
+          onF2={() => f({ versionStatus: "found", language: "GUJ" })}
+          onM2={() => f({ versionStatus: "missing", language: "GUJ" })}
         />
         <FormatLangPairRow
           formatLabel="PDF"
           l1="EN" f1={cap.version.pdf?.en?.found ?? 0} m1={cap.version.pdf?.en?.missing ?? 0}
           l2="GJ" f2={cap.version.pdf?.gu?.found ?? 0} m2={cap.version.pdf?.gu?.missing ?? 0}
-          onF1={() => f({ versionStatus: "found", fileType: "EN PDF" })}
-          onM1={() => f({ versionStatus: "missing", fileType: "Needs EN" })}
-          onF2={() => f({ versionStatus: "found", fileType: "GJ PDF" })}
-          onM2={() => f({ versionStatus: "missing", fileType: "Needs GJ" })}
+          onF1={() => f({ versionStatus: "found", language: "ENG" })}
+          onM1={() => f({ versionStatus: "missing", language: "ENG" })}
+          onF2={() => f({ versionStatus: "found", language: "GUJ" })}
+          onM2={() => f({ versionStatus: "missing", language: "GUJ" })}
         />
 
         {/* Version Dates */}

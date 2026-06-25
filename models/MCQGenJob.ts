@@ -1,8 +1,8 @@
 import mongoose, { Schema, Document, Model } from "mongoose";
 
-/** "generate" = first-time bank for a Not-Found SOP; "regenerate" = archive the
- *  current bank and build a fresh one. Surfaced so the UI can say which it's doing. */
-export type McqGenMode = "generate" | "regenerate";
+/** "generate" = first-time bank; "regenerate" = archive current + build fresh;
+ *  "continue" = append more MCQs to the existing bank without archiving. */
+export type McqGenMode = "generate" | "regenerate" | "continue";
 export type McqGenStatus = "queued" | "running" | "completed" | "failed";
 export type McqGenLangStatus = "pending" | "running" | "done" | "failed";
 
@@ -17,9 +17,13 @@ export interface IMcqGenLangProgress {
   skipped: number; // deduped / recycled
 }
 
+export type McqGenLanguage = "English" | "Gujarati";
+
 export interface IMcqGenJob extends Document {
   identifier: string;
   mode: McqGenMode;
+  /** When set, only this language is generated/regenerated/continued. */
+  languageScope?: McqGenLanguage;
   status: McqGenStatus;
   /** Human-readable current phase, e.g. "Generating English — batch 3/4 (75 MCQs)". */
   phase: string;
@@ -32,6 +36,8 @@ export interface IMcqGenJob extends Document {
   totalFailedBatches: number;
   /** Set when the run aborts (overload circuit breaker, no SOP, etc.). */
   error?: string;
+  /** Rolling log of recent generation events, capped at 30 entries. */
+  logs: string[];
   startedAt: Date;
   finishedAt?: Date;
   createdAt: Date;
@@ -61,7 +67,8 @@ const MCQGenJobSchema = new Schema<IMcqGenJob>(
     // One live job per SOP identifier — re-running upserts/replaces it so the
     // status endpoint always reflects the most recent run.
     identifier: { type: String, required: true, unique: true },
-    mode: { type: String, enum: ["generate", "regenerate"], required: true },
+    mode: { type: String, enum: ["generate", "regenerate", "continue"], required: true },
+    languageScope: { type: String, enum: ["English", "Gujarati"] },
     status: {
       type: String,
       enum: ["queued", "running", "completed", "failed"],
@@ -74,6 +81,7 @@ const MCQGenJobSchema = new Schema<IMcqGenJob>(
     totalSkipped: { type: Number, default: 0 },
     totalFailedBatches: { type: Number, default: 0 },
     error: { type: String },
+    logs: { type: [String], default: [] },
     startedAt: { type: Date, default: Date.now },
     finishedAt: { type: Date },
   },

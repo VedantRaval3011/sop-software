@@ -1,6 +1,6 @@
 import MCQBank, { type IMCQ, type DifficultyLevel } from "@/models/MCQBank";
 import type { ISOP } from "@/models/SOP";
-import { isSimilarQuestion } from "@/lib/similarity";
+import { isDuplicateMcqQuestion } from "@/lib/similarity";
 
 // Shape the generator produces (kept structural to avoid a circular import with
 // lib/mcq-generation). Any object with these fields can be written to a bank.
@@ -32,6 +32,9 @@ const STARS: Record<DifficultyLevel, "⭐" | "⭐⭐" | "⭐⭐⭐"> = {
 };
 
 const LETTER_INDEX: Record<string, number> = { A: 0, B: 1, C: 2, D: 3 };
+
+/** Hard cap on MCQs stored per SOP identifier + language. */
+export const MCQ_BANK_CAP = 100;
 
 /**
  * Map a generated MCQ to the MCQBank embedded shape.
@@ -79,6 +82,8 @@ export interface BankWriteResult {
   inserted: number;
   skipped: number;
   total: number;
+  /** Question texts that were actually written (survived dedup). */
+  insertedQuestions: string[];
 }
 
 /**
@@ -103,12 +108,17 @@ function dedupToBank(
   generated: BankInputMcq[],
   identifier: string,
   against: string[],
+  maxInsert = Infinity,
 ): { toAdd: IMCQ[]; skipped: number } {
   const seen = [...against];
   const toAdd: IMCQ[] = [];
   let skipped = 0;
   for (const q of generated) {
-    if (seen.some((eq) => isSimilarQuestion(q.question, eq))) {
+    if (toAdd.length >= maxInsert) {
+      skipped++;
+      continue;
+    }
+    if (seen.some((eq) => isDuplicateMcqQuestion(q.question, eq))) {
       skipped++;
       continue;
     }
@@ -129,14 +139,27 @@ export async function appendGeneratedToBank(
   sop: Pick<ISOP, "_id" | "name" | "identifier" | "department">,
   language: "English" | "Gujarati",
   generated: BankInputMcq[],
+  aiModel = "gemini-2.5-flash",
 ): Promise<BankWriteResult> {
   const idRegex = identifierRegex(sop.identifier);
   const bank = await MCQBank.findOne({ sopIdentifier: idRegex, language, isObsolete: { $ne: true } });
   const existingQuestions = bank ? bank.mcqs.map((m) => m.question) : [];
-  const { toAdd, skipped } = dedupToBank(generated, sop.identifier, existingQuestions);
+  const room = Math.max(0, MCQ_BANK_CAP - existingQuestions.length);
+  if (room === 0) {
+    return {
+      bankId: bank ? String(bank._id) : "",
+      inserted: 0,
+      skipped: generated.length,
+      total: bank?.mcqs.length ?? 0,
+      insertedQuestions: [],
+    };
+  }
+  const { toAdd, skipped } = dedupToBank(generated, sop.identifier, existingQuestions, room);
 
   if (!bank) {
-    if (toAdd.length === 0) return { bankId: "", inserted: 0, skipped, total: 0 };
+    if (toAdd.length === 0) {
+      return { bankId: "", inserted: 0, skipped, total: 0, insertedQuestions: [] };
+    }
     const created = await MCQBank.create({
       sopId: sop._id,
       sopName: sop.name,
@@ -147,9 +170,15 @@ export async function appendGeneratedToBank(
       totalQuestions: toAdd.length,
       generatedAt: new Date(),
       difficultyDistribution: difficultyDistribution(toAdd),
-      aiModel: "gemini-2.5-flash",
+      aiModel,
     });
-    return { bankId: String(created._id), inserted: toAdd.length, skipped, total: toAdd.length };
+    return {
+      bankId: String(created._id),
+      inserted: toAdd.length,
+      skipped,
+      total: toAdd.length,
+      insertedQuestions: toAdd.map((m) => m.question),
+    };
   }
 
   if (toAdd.length > 0) {
@@ -158,7 +187,29 @@ export async function appendGeneratedToBank(
     bank.difficultyDistribution = difficultyDistribution(bank.mcqs);
     await bank.save();
   }
-  return { bankId: String(bank._id), inserted: toAdd.length, skipped, total: bank.mcqs.length };
+  return {
+    bankId: String(bank._id),
+    inserted: toAdd.length,
+    skipped,
+    total: bank.mcqs.length,
+    insertedQuestions: toAdd.map((m) => m.question),
+  };
+}
+
+/**
+ * Archive the SOP's current active bank(s) without creating a new one.
+ * Used by progressive regeneration: archive first, then append batches one by one.
+ */
+export async function archiveBankForSop(
+  sop: Pick<ISOP, "identifier">,
+  language: "English" | "Gujarati",
+): Promise<number> {
+  const idRegex = identifierRegex(sop.identifier);
+  const result = await MCQBank.updateMany(
+    { sopIdentifier: idRegex, language, isObsolete: { $ne: true } },
+    { $set: { isObsolete: true, obsoleteAt: new Date(), obsoleteReason: SUPERSEDED_REASON } },
+  );
+  return result.modifiedCount;
 }
 
 /**
@@ -174,15 +225,23 @@ export async function replaceBankForSop(
   sop: Pick<ISOP, "_id" | "name" | "identifier" | "department">,
   language: "English" | "Gujarati",
   generated: BankInputMcq[],
+  aiModel = "gemini-2.5-flash",
 ): Promise<BankWriteResult> {
   const idRegex = identifierRegex(sop.identifier);
-  const { toAdd, skipped } = dedupToBank(generated, sop.identifier, []);
+  const capped = generated.slice(0, MCQ_BANK_CAP);
+  const { toAdd, skipped } = dedupToBank(capped, sop.identifier, []);
 
   if (toAdd.length === 0) {
     const cur = await MCQBank.findOne({ sopIdentifier: idRegex, language, isObsolete: { $ne: true } })
       .select("_id totalQuestions")
       .lean();
-    return { bankId: cur ? String(cur._id) : "", inserted: 0, skipped, total: cur?.totalQuestions ?? 0 };
+    return {
+      bankId: cur ? String(cur._id) : "",
+      inserted: 0,
+      skipped,
+      total: cur?.totalQuestions ?? 0,
+      insertedQuestions: [],
+    };
   }
 
   // Archive the current active bank(s) to the Obsolete MCQs section (preserving
@@ -202,7 +261,13 @@ export async function replaceBankForSop(
     totalQuestions: toAdd.length,
     generatedAt: new Date(),
     difficultyDistribution: difficultyDistribution(toAdd),
-    aiModel: "gemini-2.5-flash",
+    aiModel,
   });
-  return { bankId: String(created._id), inserted: toAdd.length, skipped, total: toAdd.length };
+  return {
+    bankId: String(created._id),
+    inserted: toAdd.length,
+    skipped,
+    total: toAdd.length,
+    insertedQuestions: toAdd.map((m) => m.question),
+  };
 }

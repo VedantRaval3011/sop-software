@@ -129,7 +129,7 @@ async function chatOnce(
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") {
       throw new Error(
-        `Ollama request timed out after ${effectiveTimeout}ms. Increase OLLAMA_COMPLIANCE_TIMEOUT_MS or reduce COMPLIANCE_MAX_CLAUSES_PER_BATCH.`,
+        `Ollama request timed out after ${effectiveTimeout}ms. Increase OLLAMA_TIMEOUT_MS in .env.local or reduce the content sent to the model.`,
       );
     }
     throw error;

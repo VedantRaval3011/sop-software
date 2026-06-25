@@ -57,6 +57,8 @@ type RegistryEntry = {
    *  language's MCQs, not merely SOPs authored in that language). */
   hasEnMcq: boolean;
   hasGuMcq: boolean;
+  enMcqCount: number;
+  guMcqCount: number;
   isObsoleteMcq?: boolean;
 };
 
@@ -175,6 +177,8 @@ function toEntry(
     hasMcq,
     hasEnMcq: (bank?.enQ ?? 0) > 0,
     hasGuMcq: (bank?.guQ ?? 0) > 0,
+    enMcqCount: bank?.enQ ?? 0,
+    guMcqCount: bank?.guQ ?? 0,
     isObsoleteMcq,
   };
 }

@@ -787,20 +787,21 @@ function priorDocxHeaderDatesOk(
  * docx + pdf: for a dual-language (ENG-GUJ) SOP, both the English AND Gujarati copies of
  * each required revision must exist, so a missing translation makes the SOP Not Found.
  */
-function priorVersionsComplete(sop: RegistrySOP): boolean {
+function priorVersionsCompleteForLang(sop: RegistrySOP, lang: "ENG" | "GUJ"): boolean {
   const requiredVersions = requiredPriorVersionNumbers(versionNumber(sop.version));
   if (requiredVersions.length === 0) return true;
+  const completeNums = new Set(
+    sop.priorVersions
+      .filter((pv) => pv.language === lang && Boolean(pv.docx) && Boolean(pv.pdf))
+      .map((pv) => versionNumber(pv.version)),
+  );
+  return requiredVersions.every((n) => completeNums.has(n));
+}
+
+function priorVersionsComplete(sop: RegistrySOP): boolean {
   const requiredLangs =
     sop.language === "ENG-GUJ" ? ["ENG", "GUJ"] : [sop.language === "GUJ" ? "GUJ" : "ENG"];
-  for (const lang of requiredLangs) {
-    const completeNums = new Set(
-      sop.priorVersions
-        .filter((pv) => pv.language === lang && Boolean(pv.docx) && Boolean(pv.pdf))
-        .map((pv) => versionNumber(pv.version)),
-    );
-    if (!requiredVersions.every((n) => completeNums.has(n))) return false;
-  }
-  return true;
+  return requiredLangs.every((lang) => priorVersionsCompleteForLang(sop, lang as "ENG" | "GUJ"));
 }
 
 export function applyFilters(items: RegistrySOP[], filters: SOPFilters): RegistrySOP[] {
@@ -846,11 +847,17 @@ export function applyFilters(items: RegistrySOP[], filters: SOPFilters): Registr
   }
 
   if (filters.fileType) {
-    result = result.filter((s) => matchFileType(s, filters.fileType!));
+    // Version-section lang pills reuse fileType labels; versionStatus handles those.
+    const versionLangFileType =
+      filters.versionStatus &&
+      ["Needs EN", "Needs GJ", "EN DOCX", "GJ DOCX", "EN PDF", "GJ PDF"].includes(filters.fileType);
+    if (!versionLangFileType) {
+      result = result.filter((s) => matchFileType(s, filters.fileType!));
+    }
   }
 
   if (filters.media) {
-    result = result.filter((s) => matchMedia(s, filters.media!));
+    result = result.filter((s) => matchMedia(s, filters.media!, filters.language));
   }
 
   if (filters.videoType) {
@@ -859,13 +866,15 @@ export function applyFilters(items: RegistrySOP[], filters: SOPFilters): Registr
 
   if (filters.versionStatus === "found" || filters.versionStatus === "missing") {
     const isVersionComplete = (s: RegistrySOP): boolean => {
-      const needsEn = s.language === "ENG" || s.language === "ENG-GUJ";
-      const needsGu = s.language === "GUJ" || s.language === "ENG-GUJ";
-      return (
-        priorVersionsComplete(s) &&
-        (needsEn ? hasFile(s.files.docx, "en") && hasFile(s.files.pdf, "en") : true) &&
-        (needsGu ? hasFile(s.files.docx, "gu") && hasFile(s.files.pdf, "gu") : true)
-      );
+      if (filters.language === "ENG") return priorVersionsCompleteForLang(s, "ENG");
+      if (filters.language === "GUJ") return priorVersionsCompleteForLang(s, "GUJ");
+      if (filters.fileType === "Needs EN" || filters.fileType === "EN DOCX" || filters.fileType === "EN PDF") {
+        return priorVersionsCompleteForLang(s, "ENG");
+      }
+      if (filters.fileType === "Needs GJ" || filters.fileType === "GJ DOCX" || filters.fileType === "GJ PDF") {
+        return priorVersionsCompleteForLang(s, "GUJ");
+      }
+      return priorVersionsComplete(s);
     };
     if (filters.versionStatus === "found") {
       result = result.filter(isVersionComplete);
@@ -933,14 +942,18 @@ function matchFileType(s: RegistrySOP, fileType: string): boolean {
   const needsEn = s.language === "ENG" || s.language === "ENG-GUJ";
   const needsGu = s.language === "GUJ" || s.language === "ENG-GUJ";
   switch (fileType) {
-    case "DOCX":       return Boolean(s.files.docx.en || s.files.docx.gu);
-    case "No DOCX":    return !s.files.docx.en && !s.files.docx.gu;
+    case "DOCX":
+      return (!needsEn || Boolean(s.files.docx.en)) && (!needsGu || Boolean(s.files.docx.gu));
+    case "No DOCX":
+      return (needsEn && !s.files.docx.en) || (needsGu && !s.files.docx.gu);
     case "EN DOCX":    return needsEn && Boolean(s.files.docx.en);
     case "No EN DOCX": return needsEn && !s.files.docx.en;
     case "GJ DOCX":    return needsGu && Boolean(s.files.docx.gu);
     case "No GJ DOCX": return needsGu && !s.files.docx.gu;
-    case "PDF":        return Boolean(s.files.pdf.en || s.files.pdf.gu);
-    case "No PDF":     return !s.files.pdf.en && !s.files.pdf.gu;
+    case "PDF":
+      return (!needsEn || Boolean(s.files.pdf.en)) && (!needsGu || Boolean(s.files.pdf.gu));
+    case "No PDF":
+      return (needsEn && !s.files.pdf.en) || (needsGu && !s.files.pdf.gu);
     case "EN PDF":     return needsEn && Boolean(s.files.pdf.en);
     case "No EN PDF":  return needsEn && !s.files.pdf.en;
     case "GJ PDF":     return needsGu && Boolean(s.files.pdf.gu);
@@ -951,7 +964,44 @@ function matchFileType(s: RegistrySOP, fileType: string): boolean {
   }
 }
 
-function matchMedia(s: RegistrySOP, media: string): boolean {
+function matchMedia(s: RegistrySOP, media: string, language?: string): boolean {
+  const needsEn = s.language === "ENG" || s.language === "ENG-GUJ";
+  const needsGu = s.language === "GUJ" || s.language === "ENG-GUJ";
+
+  // Per-language pills (ENG / GUJ rows) — mirror buildCapsule video/slide counts.
+  if (language === "ENG") {
+    switch (media) {
+      case "Video":
+        return needsEn && s.media.videos.en > 0;
+      case "No Video":
+        return needsEn && s.media.videos.en === 0;
+      case "Slides":
+        return needsEn && s.media.slides.en > 0;
+      case "No Slides":
+        return needsEn && s.media.slides.en === 0;
+      case "No Media":
+        return needsEn && s.media.videos.en === 0 && s.media.slides.en === 0;
+      default:
+        return true;
+    }
+  }
+  if (language === "GUJ") {
+    switch (media) {
+      case "Video":
+        return needsGu && s.media.videos.gu > 0;
+      case "No Video":
+        return needsGu && s.media.videos.gu === 0;
+      case "Slides":
+        return needsGu && s.media.slides.gu > 0;
+      case "No Slides":
+        return needsGu && s.media.slides.gu === 0;
+      case "No Media":
+        return needsGu && s.media.videos.gu === 0 && s.media.slides.gu === 0;
+      default:
+        return true;
+    }
+  }
+
   const videoCount = s.media.videos.en + s.media.videos.gu;
   const slideCount = s.media.slides.en + s.media.slides.gu;
   switch (media) {
@@ -1106,27 +1156,36 @@ function buildCapsule(department: string, sops: RegistrySOP[]): DepartmentCapsul
           bucket[lang].missing++;
         }
       }
-      // Top-level: SOP count — "any file" vs "no file at all"
-      if (hasFile(files, "en") || hasFile(files, "gu")) bucket.found++;
+      // Top-level: SOPs where every required language slot is present
+      const allRequiredPresent =
+        (!needsEn(sop) || hasFile(files, "en")) && (!needsGu(sop) || hasFile(files, "gu"));
+      if (allRequiredPresent) bucket.found++;
       else bucket.missing++;
     }
 
-    const hasCompleteFiles =
-      priorVersionsComplete(sop) &&
-      (needsEn(sop) ? hasFile(sop.files.docx, "en") && hasFile(sop.files.pdf, "en") : true) &&
-      (needsGu(sop) ? hasFile(sop.files.docx, "gu") && hasFile(sop.files.pdf, "gu") : true);
-
-    if (hasCompleteFiles) {
+    // Prior-version history only — current DOCX/PDF slots are tracked in the DOCX/PDF rows above.
+    if (priorVersionsComplete(sop)) {
       capsule.version.found++;
-      // found = complete version only — must satisfy ALL language requirements
-      if (needsEn(sop)) { capsule.version.docx.en.found++; capsule.version.pdf.en.found++; }
-      if (needsGu(sop)) { capsule.version.docx.gu.found++; capsule.version.pdf.gu.found++; }
     } else {
       capsule.version.missing++;
-      // Count ALL required file types as missing — the SOP's version history is incomplete
-      // as a whole, regardless of which specific file is the blocker.
-      if (needsEn(sop)) { capsule.version.docx.en.missing++; capsule.version.pdf.en.missing++; }
-      if (needsGu(sop)) { capsule.version.docx.gu.missing++; capsule.version.pdf.gu.missing++; }
+    }
+    if (needsEn(sop)) {
+      if (priorVersionsCompleteForLang(sop, "ENG")) {
+        capsule.version.docx.en.found++;
+        capsule.version.pdf.en.found++;
+      } else {
+        capsule.version.docx.en.missing++;
+        capsule.version.pdf.en.missing++;
+      }
+    }
+    if (needsGu(sop)) {
+      if (priorVersionsCompleteForLang(sop, "GUJ")) {
+        capsule.version.docx.gu.found++;
+        capsule.version.pdf.gu.found++;
+      } else {
+        capsule.version.docx.gu.missing++;
+        capsule.version.pdf.gu.missing++;
+      }
     }
 
     // SOP-level: prior DOCX header dates valid for every required language (Prior Versions column).
