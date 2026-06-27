@@ -1,6 +1,7 @@
 import MCQBank, { type IMCQ, type DifficultyLevel } from "@/models/MCQBank";
 import type { ISOP } from "@/models/SOP";
-import { isDuplicateMcqQuestion } from "@/lib/similarity";
+import { isDuplicateMcqQuestionForGeneration } from "@/lib/similarity";
+import { sopFamilyIdentifierRegex } from "@/lib/sop-utils";
 
 // Shape the generator produces (kept structural to avoid a circular import with
 // lib/mcq-generation). Any object with these fields can be written to a bank.
@@ -102,6 +103,29 @@ function identifierRegex(identifier: string): RegExp {
   return new RegExp(`^${identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i");
 }
 
+/** Total MCQs across all active banks for this identifier + language. */
+export async function activeBankMcqCount(
+  sopIdentifier: string,
+  language: "English" | "Gujarati",
+): Promise<number> {
+  const banks = await MCQBank.find({
+    sopIdentifier: identifierRegex(sopIdentifier),
+    language,
+    isObsolete: { $ne: true },
+  })
+    .select("mcqs")
+    .lean();
+  return banks.reduce((sum, b) => sum + (b.mcqs?.length ?? 0), 0);
+}
+
+async function loadActiveBanks(sopIdentifier: string, language: "English" | "Gujarati") {
+  return MCQBank.find({
+    sopIdentifier: identifierRegex(sopIdentifier),
+    language,
+    isObsolete: { $ne: true },
+  });
+}
+
 /** Dedup a batch of generated MCQs against a running list, mapping survivors to
  *  the bank shape. Returns the new bank questions plus how many were skipped. */
 function dedupToBank(
@@ -118,7 +142,7 @@ function dedupToBank(
       skipped++;
       continue;
     }
-    if (seen.some((eq) => isDuplicateMcqQuestion(q.question, eq))) {
+    if (seen.some((eq) => isDuplicateMcqQuestionForGeneration(q.question, eq))) {
       skipped++;
       continue;
     }
@@ -142,21 +166,23 @@ export async function appendGeneratedToBank(
   aiModel = "gemini-2.5-flash",
 ): Promise<BankWriteResult> {
   const idRegex = identifierRegex(sop.identifier);
-  const bank = await MCQBank.findOne({ sopIdentifier: idRegex, language, isObsolete: { $ne: true } });
-  const existingQuestions = bank ? bank.mcqs.map((m) => m.question) : [];
-  const room = Math.max(0, MCQ_BANK_CAP - existingQuestions.length);
+  const banks = await loadActiveBanks(sop.identifier, language);
+  const existingQuestions = banks.flatMap((b) => b.mcqs.map((m) => m.question));
+  const totalNow = existingQuestions.length;
+  const room = Math.max(0, MCQ_BANK_CAP - totalNow);
   if (room === 0) {
+    const primary = banks.sort((a, b) => b.mcqs.length - a.mcqs.length)[0];
     return {
-      bankId: bank ? String(bank._id) : "",
+      bankId: primary ? String(primary._id) : "",
       inserted: 0,
       skipped: generated.length,
-      total: bank?.mcqs.length ?? 0,
+      total: totalNow,
       insertedQuestions: [],
     };
   }
   const { toAdd, skipped } = dedupToBank(generated, sop.identifier, existingQuestions, room);
 
-  if (!bank) {
+  if (!banks.length) {
     if (toAdd.length === 0) {
       return { bankId: "", inserted: 0, skipped, total: 0, insertedQuestions: [] };
     }
@@ -181,17 +207,22 @@ export async function appendGeneratedToBank(
     };
   }
 
+  const bank = [...banks].sort((a, b) => b.mcqs.length - a.mcqs.length)[0];
   if (toAdd.length > 0) {
     bank.mcqs.push(...toAdd);
+    if (bank.mcqs.length > MCQ_BANK_CAP) {
+      bank.mcqs = bank.mcqs.slice(0, MCQ_BANK_CAP);
+    }
     bank.totalQuestions = bank.mcqs.length;
     bank.difficultyDistribution = difficultyDistribution(bank.mcqs);
     await bank.save();
   }
+  const total = await activeBankMcqCount(sop.identifier, language);
   return {
     bankId: String(bank._id),
     inserted: toAdd.length,
     skipped,
-    total: bank.mcqs.length,
+    total,
     insertedQuestions: toAdd.map((m) => m.question),
   };
 }
@@ -270,4 +301,22 @@ export async function replaceBankForSop(
     total: toAdd.length,
     insertedQuestions: toAdd.map((m) => m.question),
   };
+}
+
+export type McqDeleteScope = "eng" | "guj" | "both";
+
+/** Permanently remove active MCQ banks for an SOP family, scoped by language. */
+export async function deleteBanksForFamily(
+  identifier: string,
+  scope: McqDeleteScope,
+): Promise<number> {
+  const filter: Record<string, unknown> = {
+    sopIdentifier: sopFamilyIdentifierRegex(identifier),
+    isObsolete: { $ne: true },
+  };
+  if (scope === "eng") filter.language = "English";
+  else if (scope === "guj") filter.language = "Gujarati";
+
+  const result = await MCQBank.deleteMany(filter);
+  return result.deletedCount;
 }

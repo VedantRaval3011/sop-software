@@ -77,8 +77,16 @@ export interface ISOP extends Document {
     | "updating_platform"
     | "approved"
     | "failed";
+  /** Parsed clause index for MCQ generation; invalidated when content hash changes. */
+  mcqClauseCache?: IMcqClauseCache;
   createdAt: Date;
   updatedAt: Date;
+}
+
+export interface IMcqClauseCache {
+  contentHash: string;
+  clauses: { id: string; summary: string; text: string }[];
+  parsedAt: Date;
 }
 
 const SOPSchema = new Schema<ISOP>(
@@ -170,6 +178,17 @@ const SOPSchema = new Schema<ISOP>(
         "failed",
       ],
       default: "idle",
+    },
+    mcqClauseCache: {
+      contentHash: { type: String, trim: true },
+      clauses: [
+        {
+          id: { type: String, trim: true },
+          summary: { type: String, trim: true },
+          text: { type: String },
+        },
+      ],
+      parsedAt: { type: Date },
     },
   },
   { timestamps: true },

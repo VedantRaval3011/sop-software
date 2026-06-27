@@ -3,7 +3,7 @@ import mongoose, { Schema, Document, Model } from "mongoose";
 /** "generate" = first-time bank; "regenerate" = archive current + build fresh;
  *  "continue" = append more MCQs to the existing bank without archiving. */
 export type McqGenMode = "generate" | "regenerate" | "continue";
-export type McqGenStatus = "queued" | "running" | "completed" | "failed";
+export type McqGenStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 export type McqGenLangStatus = "pending" | "running" | "done" | "failed";
 
 export interface IMcqGenLangProgress {
@@ -36,6 +36,8 @@ export interface IMcqGenJob extends Document {
   totalFailedBatches: number;
   /** Set when the run aborts (overload circuit breaker, no SOP, etc.). */
   error?: string;
+  /** When true, the background run stops after the current batch. */
+  cancelRequested?: boolean;
   /** Rolling log of recent generation events, capped at 30 entries. */
   logs: string[];
   startedAt: Date;
@@ -71,7 +73,7 @@ const MCQGenJobSchema = new Schema<IMcqGenJob>(
     languageScope: { type: String, enum: ["English", "Gujarati"] },
     status: {
       type: String,
-      enum: ["queued", "running", "completed", "failed"],
+      enum: ["queued", "running", "completed", "failed", "cancelled"],
       default: "queued",
     },
     phase: { type: String, default: "Queued" },
@@ -81,6 +83,7 @@ const MCQGenJobSchema = new Schema<IMcqGenJob>(
     totalSkipped: { type: Number, default: 0 },
     totalFailedBatches: { type: Number, default: 0 },
     error: { type: String },
+    cancelRequested: { type: Boolean, default: false },
     logs: { type: [String], default: [] },
     startedAt: { type: Date, default: Date.now },
     finishedAt: { type: Date },

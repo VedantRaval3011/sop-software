@@ -19,7 +19,10 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "identifier is required" }, { status: 400 });
     }
     const p = body.provider;
-    const provider = p === "ollama" ? "ollama" : p === "gemini" ? "gemini" : p === "claude" ? "claude" : undefined;
+    const provider =
+      p === "ollama" ? "ollama" :
+      p === "gemini" ? "gemini" :
+      "claude";
     const modeOverride = body.mode === "continue" ? "continue" : undefined;
     const languageScope = parseMcqLanguage(body.language);
 

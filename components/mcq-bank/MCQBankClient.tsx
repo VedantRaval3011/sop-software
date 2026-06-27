@@ -21,6 +21,7 @@ import {
   RefreshCw,
   Search,
   Sparkles,
+  Trash2,
   Upload,
   X,
 } from "lucide-react";
@@ -114,6 +115,7 @@ interface RegistryEntry {
 }
 
 type McqLang = "English" | "Gujarati";
+type McqDeleteScope = "eng" | "guj" | "both";
 const MCQ_BANK_CAP = 100;
 
 // ─────────────────────────────────────────────────────────────
@@ -127,6 +129,12 @@ const REGEN_PASSWORD = "indiana132";
 const fmt = (n: number | undefined | null) => (n == null ? "—" : n.toLocaleString());
 const fmtDate = (d: string | null | undefined) =>
   d ? new Date(d).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" }) : "—";
+
+function deleteScopeLabel(scope: McqDeleteScope): string {
+  if (scope === "eng") return "English MCQs";
+  if (scope === "guj") return "Gujarati MCQs";
+  return "both English and Gujarati MCQs";
+}
 
 // ─────────────────────────────────────────────────────────────
 // Department theme (bordered white cards)
@@ -532,8 +540,19 @@ function DeptColorCard({
 // Registry table row
 // ─────────────────────────────────────────────────────────────
 // Live per-row generation progress (mirrors the MCQGenJob status endpoint).
+interface LangGenProgress {
+  language: McqLang;
+  status: string;
+  inserted: number;
+  target: number;
+  collected: number;
+  batchesDone: number;
+  batchesTotal: number;
+  skipped?: number;
+}
+
 interface GenProgress {
-  status: "generating" | "error";
+  status: "generating" | "completed" | "error" | "cancelled";
   mode?: "generate" | "regenerate" | "continue";
   languageScope?: McqLang;
   phase?: string;
@@ -541,8 +560,258 @@ interface GenProgress {
   totalInserted?: number;
   totalSkipped?: number;
   totalFailedBatches?: number;
+  languages?: LangGenProgress[];
   logs?: string[];
   error?: string;
+  /** Epoch ms when this run was enqueued — ignores stale failed jobs from prior runs. */
+  runStartedAt?: number;
+}
+
+function genModeLabel(mode?: GenProgress["mode"]): string {
+  if (mode === "regenerate") return "Regenerating";
+  if (mode === "continue") return "Continuing";
+  return "Generating";
+}
+
+function McqGenProgressModal({
+  entry,
+  progress,
+  onClose,
+  onStop,
+  stopping,
+}: {
+  entry: RegistryEntry;
+  progress: GenProgress;
+  onClose: () => void;
+  onStop?: () => void;
+  stopping?: boolean;
+}) {
+  const sopCode = displaySopCode(entry.identifier);
+  const sopTitle = displaySopTitle(entry.sopName, entry.identifier);
+  const isDone = progress.status === "completed";
+  const isError = progress.status === "error";
+  const isCancelled = progress.status === "cancelled";
+
+  const langs = progress.languages?.length
+    ? progress.languages
+    : [{
+        language: (progress.languageScope ?? "English") as McqLang,
+        status: isDone ? "done" : "running",
+        inserted: progress.totalInserted ?? 0,
+        target: MCQ_BANK_CAP,
+        collected: progress.languages?.[0]?.collected ?? progress.totalInserted ?? 0,
+        batchesDone: 0,
+        batchesTotal: 0,
+        skipped: progress.totalSkipped,
+      }];
+
+  const totalInBank = langs.reduce((s, l) => s + Math.min(l.collected ?? 0, l.target || MCQ_BANK_CAP), 0);
+  const totalInsertedRun = langs.reduce((s, l) => s + (l.inserted ?? 0), 0);
+  const totalTarget = langs.reduce((s, l) => s + (l.target || MCQ_BANK_CAP), 0) || MCQ_BANK_CAP;
+  const bankPercent = Math.min(100, Math.round((totalInBank / totalTarget) * 100));
+  const barPercent = isDone ? bankPercent : Math.max(bankPercent, progress.percent ?? 0);
+
+  const scopeLabel = progress.languageScope
+    ? progress.languageScope === "Gujarati" ? "Gujarati" : "English"
+    : langs.length > 1 ? "English & Gujarati" : langs[0]?.language ?? "MCQ";
+
+  return (
+    <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/50 p-4 backdrop-blur-[2px]">
+      <div className="w-full max-w-lg overflow-hidden rounded-2xl bg-white shadow-2xl ring-1 ring-black/5">
+        {/* Header */}
+        <div className={`px-6 py-5 ${isError || isCancelled ? "bg-red-50" : isDone ? "bg-emerald-50" : "bg-gradient-to-br from-violet-600 to-indigo-700"}`}>
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                {isDone ? (
+                  <CheckCircle2 className="h-5 w-5 shrink-0 text-emerald-600" />
+                ) : isError || isCancelled ? (
+                  <AlertTriangle className="h-5 w-5 shrink-0 text-red-500" />
+                ) : (
+                  <Loader2 className="h-5 w-5 shrink-0 animate-spin text-white" />
+                )}
+                <h3 className={`text-sm font-bold ${isDone || isError || isCancelled ? "text-gray-800" : "text-white"}`}>
+                  {isDone && totalInBank >= totalTarget
+                    ? "MCQs Ready"
+                    : isDone
+                      ? totalInsertedRun > 0
+                        ? "Partially Complete"
+                        : "No MCQs Added"
+                      : isCancelled
+                        ? "Generation Stopped"
+                        : isError
+                          ? "Generation Failed"
+                          : `${genModeLabel(progress.mode)} MCQs`}
+                </h3>
+              </div>
+              <p className={`mt-1 font-mono text-[13px] font-bold tracking-wider ${isDone || isError || isCancelled ? "text-purple-700" : "text-white/90"}`}>
+                {sopCode}
+              </p>
+              <p className={`mt-0.5 line-clamp-2 text-xs ${isDone || isError || isCancelled ? "text-gray-600" : "text-white/75"}`}>
+                {sopTitle}
+              </p>
+            </div>
+            {(isDone || isError || isCancelled) && (
+              <button
+                type="button"
+                onClick={onClose}
+                className="rounded-lg p-1.5 text-gray-400 transition-colors hover:bg-black/5 hover:text-gray-700"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            )}
+          </div>
+        </div>
+
+        <div className="px-6 py-5 space-y-5">
+          {!isError && !isCancelled && (
+            <>
+              {/* Main counter */}
+              <div className="text-center">
+                <p className="text-[10px] font-bold uppercase tracking-widest text-gray-400">
+                  {isDone ? "Created" : "Creating"} · {scopeLabel}
+                </p>
+                <p className="mt-1 tabular-nums">
+                  <span className="text-4xl font-black text-gray-900">{fmt(totalInBank)}</span>
+                  <span className="mx-1 text-2xl font-light text-gray-300">/</span>
+                  <span className="text-2xl font-bold text-gray-400">{fmt(totalTarget)}</span>
+                </p>
+                {isDone && totalInsertedRun > 0 && (
+                  <p className="mt-1 text-xs font-semibold text-emerald-600">+{fmt(totalInsertedRun)} new this run</p>
+                )}
+                <p className="mt-1 text-[11px] text-gray-500">
+                  Target: {langs.length > 1 ? `${MCQ_BANK_CAP} MCQs per language` : `${MCQ_BANK_CAP} MCQs for this SOP`}
+                </p>
+              </div>
+
+              {/* Progress bar */}
+              <div>
+                <div className="mb-1.5 flex items-center justify-between text-[10px] font-semibold text-gray-500">
+                  <span>{progress.phase ?? (isDone ? "Complete" : "Working…")}</span>
+                  <span className="tabular-nums text-gray-700">{barPercent}%</span>
+                </div>
+                <div className="h-3 w-full overflow-hidden rounded-full bg-gray-100 shadow-inner">
+                  <div
+                    className={`h-full rounded-full transition-all duration-700 ease-out ${
+                      isDone ? "bg-emerald-500" : "bg-gradient-to-r from-violet-500 to-indigo-500"
+                    }`}
+                    style={{ width: `${barPercent}%` }}
+                  />
+                </div>
+              </div>
+
+              {/* Per-language breakdown */}
+              {langs.length > 0 && (
+                <div className="space-y-2">
+                  {langs.map((lp) => {
+                    const target = lp.target || MCQ_BANK_CAP;
+                    const inBank = lp.collected ?? 0;
+                    const pct = Math.min(100, Math.round((inBank / target) * 100));
+                    const langShort = lp.language === "Gujarati" ? "GUJ" : "ENG";
+                    return (
+                      <div key={lp.language} className="rounded-xl border border-gray-100 bg-gray-50 px-3 py-2.5">
+                        <div className="mb-1.5 flex items-center justify-between gap-2">
+                          <span className="text-[10px] font-bold uppercase tracking-wide text-gray-600">{langShort}</span>
+                          <span className="text-[10px] font-bold tabular-nums text-gray-800">
+                            {fmt(inBank)} / {fmt(target)}
+                          </span>
+                        </div>
+                        <div className="h-1.5 w-full overflow-hidden rounded-full bg-gray-200">
+                          <div
+                            className={`h-full rounded-full transition-all duration-500 ${
+                              lp.language === "Gujarati" ? "bg-indigo-500" : "bg-blue-500"
+                            }`}
+                            style={{ width: `${pct}%` }}
+                          />
+                        </div>
+                        {lp.batchesDone > 0 && (
+                          <p className="mt-1 text-[9px] text-gray-400">
+                            Batch {lp.batchesDone}{lp.batchesTotal ? ` / ${lp.batchesTotal}` : ""}
+                            {(lp.skipped ?? 0) > 0 ? ` · ${lp.skipped} skipped` : ""}
+                          </p>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* Stats row */}
+              {!isDone && (progress.totalSkipped != null || progress.totalFailedBatches) && (
+                <div className="flex flex-wrap justify-center gap-3 text-[10px] text-gray-500">
+                  <span><strong className="text-emerald-600">+{progress.totalInserted ?? 0}</strong> new</span>
+                  <span><strong className="text-amber-600">{progress.totalSkipped ?? 0}</strong> skipped (duplicates)</span>
+                  {(progress.totalFailedBatches ?? 0) > 0 && (
+                    <span><strong className="text-red-500">{progress.totalFailedBatches}</strong> failed batches</span>
+                  )}
+                </div>
+              )}
+
+              {/* Live log */}
+              {progress.logs && progress.logs.length > 0 && !isDone && (
+                <div className="rounded-xl bg-gray-900 px-3 py-2.5 font-mono text-[10px] leading-relaxed text-green-400 max-h-28 overflow-y-auto space-y-0.5">
+                  {progress.logs.slice(-8).map((line, i) => (
+                    <div key={i} className="truncate" title={line}>{line}</div>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+
+          {(isError || isCancelled) && (
+            <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+              {progress.error ?? (isCancelled ? "Generation was stopped. MCQs created so far are saved." : "Generation failed. Please try again.")}
+            </div>
+          )}
+
+          {!isDone && !isError && !isCancelled && (
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <p className="text-[10px] leading-snug text-gray-400">
+                You can close this window — generation keeps running on the server.
+              </p>
+              <div className="flex shrink-0 items-center gap-2">
+                <button
+                  type="button"
+                  onClick={onClose}
+                  className="rounded-xl border border-gray-200 bg-white px-4 py-2 text-xs font-semibold text-gray-600 transition-colors hover:bg-gray-50"
+                >
+                  Run in background
+                </button>
+                {onStop && (
+                  <button
+                    type="button"
+                    onClick={onStop}
+                    disabled={stopping}
+                    className="inline-flex items-center gap-1.5 rounded-xl border border-rose-300 bg-rose-50 px-4 py-2 text-xs font-bold uppercase tracking-wide text-rose-700 transition-colors hover:bg-rose-100 disabled:opacity-60"
+                  >
+                    {stopping ? (
+                      <><Loader2 className="h-3.5 w-3.5 animate-spin" /> Stopping…</>
+                    ) : (
+                      <>Stop</>
+                    )}
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
+          {(isDone || isError || isCancelled) && (
+            <div className="flex justify-end">
+              <button
+                type="button"
+                onClick={onClose}
+                className={`rounded-xl px-5 py-2 text-xs font-bold uppercase tracking-wide text-white transition-colors ${
+                  isDone ? "bg-emerald-600 hover:bg-emerald-700" : "bg-gray-700 hover:bg-gray-800"
+                }`}
+              >
+                {isDone ? "Done" : "Close"}
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function ActionBtn({
@@ -577,17 +846,127 @@ function ActionBtn({
   );
 }
 
+function McqCountLink({
+  count,
+  bankId,
+  onView,
+  colorClass,
+  title,
+}: {
+  count: number;
+  bankId?: string;
+  onView?: (id: string) => void;
+  colorClass: string;
+  title?: string;
+}) {
+  const hasCount = count > 0;
+  const display = hasCount ? fmt(count) : "—";
+  const canOpen = hasCount && !!bankId && !!onView;
+
+  if (!canOpen) {
+    return (
+      <span className={`text-[11px] font-bold ${hasCount ? colorClass : "text-gray-300"}`}>
+        {display}
+      </span>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={() => onView!(bankId!)}
+      title={title ?? "View MCQs"}
+      className={`text-[11px] font-bold ${colorClass} cursor-pointer underline-offset-2 hover:underline transition-colors`}
+    >
+      {display}
+    </button>
+  );
+}
+
+function DeleteMcqMenu({
+  entry,
+  needsEn,
+  needsGu,
+  onPick,
+  disabled,
+}: {
+  entry: RegistryEntry;
+  needsEn: boolean;
+  needsGu: boolean;
+  onPick: (scope: McqDeleteScope) => void;
+  disabled?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  const hasAny = entry.hasEnMcq || entry.hasGuMcq;
+
+  useEffect(() => {
+    if (!open) return;
+    const close = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
+  }, [open]);
+
+  if (!hasAny) return null;
+
+  const options: { scope: McqDeleteScope; label: string; count: number }[] = [];
+  if (needsEn && entry.hasEnMcq) {
+    options.push({ scope: "eng", label: "English MCQs", count: entry.enMcqCount });
+  }
+  if (needsGu && entry.hasGuMcq) {
+    options.push({ scope: "guj", label: "Gujarati MCQs", count: entry.guMcqCount });
+  }
+  if (options.length >= 2) {
+    options.push({ scope: "both", label: "Both languages", count: entry.totalMcqs });
+  }
+
+  return (
+    <div className="relative" ref={ref}>
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={() => setOpen((o) => !o)}
+        className="inline-flex items-center gap-1 rounded-full border border-rose-300 bg-rose-50 px-2.5 py-1 text-[9px] font-semibold text-rose-700 transition-colors hover:bg-rose-100 disabled:cursor-not-allowed disabled:opacity-70"
+      >
+        <Trash2 className="h-2.5 w-2.5" /> Delete
+        <ChevronDown className={`h-2.5 w-2.5 transition-transform ${open ? "rotate-180" : ""}`} />
+      </button>
+      {open && (
+        <div className="absolute left-0 top-full z-50 mt-1 min-w-[10.5rem] overflow-hidden rounded-lg border border-gray-200 bg-white py-1 shadow-lg">
+          {options.map((opt) => (
+            <button
+              key={opt.scope}
+              type="button"
+              onClick={() => { setOpen(false); onPick(opt.scope); }}
+              className="flex w-full items-center justify-between gap-3 px-3 py-2 text-left text-[9px] font-semibold text-gray-700 hover:bg-rose-50 hover:text-rose-700"
+            >
+              <span>{opt.label}</span>
+              <span className="tabular-nums text-gray-400">{fmt(opt.count)}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function RegistryRow({
-  entry, isEven, onViewMcqs, onGenerate, onRegenerate, onContinue, genStatus,
+  entry, isEven, onViewMcqs, onGenerate, onRegenerate, onContinue, onDeleteRequest, onOpenProgress, onStop, genStatus,
 }: {
   entry: RegistryEntry; isEven: boolean;
   onViewMcqs?: (id: string) => void;
   onGenerate?: (entry: RegistryEntry, language?: McqLang) => void;
   onRegenerate?: (entry: RegistryEntry, language?: McqLang) => void;
   onContinue?: (entry: RegistryEntry, language?: McqLang) => void;
+  onDeleteRequest?: (entry: RegistryEntry, scope: McqDeleteScope) => void;
+  onOpenProgress?: (entry: RegistryEntry) => void;
+  onStop?: (entry: RegistryEntry) => void;
   genStatus?: GenProgress;
 }) {
-  const isGenerating = genStatus?.status === "generating";
+  const serverRunning = genStatus?.status === "generating";
   const remaining = Math.max(0, entry.totalMcqs - entry.approved);
   const isDual = entry.language === "ENG-GUJ";
   const needsEn = entry.language === "ENG" || isDual;
@@ -599,6 +978,9 @@ function RegistryRow({
   const gujTitle = entry.sopNameGujarati
     ? displaySopTitle(entry.sopNameGujarati, entry.identifier)
     : null;
+  const enBankId = entry.banks.find((b) => b.langCode === "ENG")?.id;
+  const guBankId = entry.banks.find((b) => b.langCode === "GUJ")?.id;
+  const defaultBankId = enBankId ?? guBankId ?? entry.banks[0]?.id;
 
   return (
     <tr className={`hover:bg-purple-50/80 transition-colors group/row border-b border-gray-100/80 ${
@@ -638,9 +1020,31 @@ function RegistryRow({
         )}
       </td>
       <td className="px-3 py-2.5 text-center whitespace-nowrap">
-        <span className={`text-[11px] font-bold ${entry.totalMcqs > 0 ? "text-emerald-600" : "text-gray-300"}`}>
-          {entry.totalMcqs > 0 ? fmt(entry.totalMcqs) : "—"}
-        </span>
+        <McqCountLink
+          count={entry.totalMcqs}
+          bankId={defaultBankId}
+          onView={onViewMcqs}
+          colorClass="text-emerald-600"
+          title="View MCQs"
+        />
+      </td>
+      <td className="px-3 py-2.5 text-center whitespace-nowrap">
+        <McqCountLink
+          count={needsEn ? entry.enMcqCount : 0}
+          bankId={enBankId}
+          onView={onViewMcqs}
+          colorClass="text-blue-600"
+          title="View English MCQs"
+        />
+      </td>
+      <td className="px-3 py-2.5 text-center whitespace-nowrap">
+        <McqCountLink
+          count={needsGu ? entry.guMcqCount : 0}
+          bankId={guBankId}
+          onView={onViewMcqs}
+          colorClass="text-indigo-700"
+          title="View Gujarati MCQs"
+        />
       </td>
       <td className="px-3 py-2.5 text-center whitespace-nowrap">
         <span className={`text-[11px] font-bold ${remaining > 0 ? "text-red-500" : "text-gray-300"}`}>
@@ -667,23 +1071,36 @@ function RegistryRow({
       </td>
       <td className="px-3 py-2.5 whitespace-nowrap">
         <div className="flex flex-col items-start gap-1">
+          {serverRunning ? (
+            <div className="flex flex-col gap-1 rounded-lg border border-purple-200 bg-purple-50 px-2 py-1.5">
+              <span className="text-[9px] font-semibold text-purple-800">
+                Generating… {genStatus?.percent ?? 0}%
+                {genStatus?.phase ? ` · ${genStatus.phase}` : ""}
+              </span>
+              <div className="flex flex-wrap items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => onOpenProgress?.(entry)}
+                  className="text-[9px] font-semibold text-purple-600 hover:underline"
+                >
+                  View logs
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onStop?.(entry)}
+                  className="text-[9px] font-bold uppercase tracking-wide text-rose-600 hover:underline"
+                >
+                  Stop
+                </button>
+              </div>
+            </div>
+          ) : (
           <div className="flex flex-wrap items-center gap-1">
-            {entry.banks.map((b) => (
-              <ActionBtn
-                key={b.id}
-                variant="view"
-                icon={Eye}
-                label={entry.banks.length > 1 ? `View ${b.langCode}` : "VIEW MCQs"}
-                onClick={() => onViewMcqs?.(b.id)}
-              />
-            ))}
             {!entry.isObsoleteMcq && needsEn && !entry.hasEnMcq && (
               <ActionBtn
                 variant="generate"
                 icon={Sparkles}
                 label={isDual ? "Generate ENG" : "Generate MCQ"}
-                disabled={isGenerating}
-                loading={isGenerating && (!genStatus?.languageScope || genStatus.languageScope === "English")}
                 onClick={() => onGenerate?.(entry, isDual ? "English" : undefined)}
               />
             )}
@@ -692,8 +1109,6 @@ function RegistryRow({
                 variant="generate"
                 icon={Sparkles}
                 label={isDual ? "Generate GUJ" : "Generate MCQ"}
-                disabled={isGenerating}
-                loading={isGenerating && (!genStatus?.languageScope || genStatus.languageScope === "Gujarati")}
                 onClick={() => onGenerate?.(entry, isDual ? "Gujarati" : undefined)}
               />
             )}
@@ -702,8 +1117,6 @@ function RegistryRow({
                 variant="regenerate"
                 icon={RefreshCw}
                 label={isDual ? "Regenerate ENG" : "Regenerate"}
-                disabled={isGenerating}
-                loading={isGenerating && genStatus?.mode === "regenerate" && (!genStatus?.languageScope || genStatus.languageScope === "English")}
                 onClick={() => onRegenerate?.(entry, isDual ? "English" : undefined)}
               />
             )}
@@ -712,8 +1125,6 @@ function RegistryRow({
                 variant="regenerate"
                 icon={RefreshCw}
                 label={isDual ? "Regenerate GUJ" : "Regenerate"}
-                disabled={isGenerating}
-                loading={isGenerating && genStatus?.mode === "regenerate" && (!genStatus?.languageScope || genStatus.languageScope === "Gujarati")}
                 onClick={() => onRegenerate?.(entry, isDual ? "Gujarati" : undefined)}
               />
             )}
@@ -722,8 +1133,6 @@ function RegistryRow({
                 variant="continue"
                 icon={Sparkles}
                 label={isDual ? "Continue ENG" : "Continue"}
-                disabled={isGenerating}
-                loading={isGenerating && genStatus?.mode === "continue" && (!genStatus?.languageScope || genStatus.languageScope === "English")}
                 onClick={() => onContinue?.(entry, isDual ? "English" : undefined)}
               />
             )}
@@ -732,46 +1141,21 @@ function RegistryRow({
                 variant="continue"
                 icon={Sparkles}
                 label={isDual ? "Continue GUJ" : "Continue"}
-                disabled={isGenerating}
-                loading={isGenerating && genStatus?.mode === "continue" && (!genStatus?.languageScope || genStatus.languageScope === "Gujarati")}
                 onClick={() => onContinue?.(entry, isDual ? "Gujarati" : undefined)}
+              />
+            )}
+            {!entry.isObsoleteMcq && (entry.hasEnMcq || entry.hasGuMcq) && (
+              <DeleteMcqMenu
+                entry={entry}
+                needsEn={needsEn}
+                needsGu={needsGu}
+                onPick={(scope) => onDeleteRequest?.(entry, scope)}
               />
             )}
             {entry.banks.length === 0 && entry.isObsoleteMcq && (
               <span className="text-[9px] text-gray-300">—</span>
             )}
           </div>
-          {/* Live progress — mode, phase, % and running counts while a run is active. */}
-          {isGenerating && (
-            <div className="flex w-44 flex-col gap-0.5">
-              <div className="flex items-center justify-between gap-2 text-[8px] text-gray-500">
-                <span className="truncate" title={genStatus?.phase}>
-                  {genStatus?.mode === "regenerate" ? "Regenerating" : genStatus?.mode === "continue" ? "Continuing" : "Generating"}
-                  {genStatus?.languageScope ? ` ${genStatus.languageScope === "Gujarati" ? "GUJ" : "ENG"}` : ""}
-                  {genStatus?.phase ? ` · ${genStatus.phase}` : "…"}
-                </span>
-                <span className="shrink-0 font-bold tabular-nums text-gray-700">{genStatus?.percent ?? 0}%</span>
-              </div>
-              <div className="h-1 w-full overflow-hidden rounded-full bg-gray-100">
-                <div
-                  className="h-full rounded-full bg-emerald-500 transition-all duration-500"
-                  style={{ width: `${Math.min(genStatus?.percent ?? 0, 100)}%` }}
-                />
-              </div>
-              {genStatus?.logs && genStatus.logs.length > 0 && (
-                <div className="mt-0.5 w-56 rounded bg-gray-900 px-2 py-1.5 font-mono text-[7.5px] leading-tight text-green-400 space-y-0.5 max-h-[52px] overflow-y-auto">
-                  {genStatus.logs.slice(-5).map((line, i) => (
-                    <div key={i} className="truncate" title={line}>{line}</div>
-                  ))}
-                </div>
-              )}
-              {genStatus?.totalInserted != null && (
-                <span className="text-[8px] text-gray-400">
-                  +{genStatus.totalInserted} new · {genStatus.totalSkipped ?? 0} skipped
-                  {genStatus.totalFailedBatches ? ` · ${genStatus.totalFailedBatches} failed` : ""}
-                </span>
-              )}
-            </div>
           )}
           {genStatus?.status === "error" && (
             <span className="text-[9px] font-semibold text-red-500">
@@ -831,10 +1215,12 @@ export function MCQBankClient() {
   // UI state
   const [showDeptCards, setShowDeptCards] = useState(true);
   const [refreshKey, setRefreshKey] = useState(0);
-  const [selectedProvider, setSelectedProvider] = useState<"claude" | "ollama" | null>("claude");
+  const [selectedProvider, setSelectedProvider] = useState<"claude" | "ollama">("claude");
   const [claudeStatus, setClaudeStatus] = useState<{
     ok: boolean;
     model?: string;
+    mcqModel?: string;
+    mcqApiDirect?: boolean;
     email?: string;
     subscriptionType?: string;
     error?: string;
@@ -842,14 +1228,25 @@ export function MCQBankClient() {
   } | null>(null);
   // Per-family MCQ generation state, keyed by registry entry id (family key).
   const [genStatus, setGenStatus] = useState<Record<string, GenProgress>>({});
+  const [genModalEntry, setGenModalEntry] = useState<RegistryEntry | null>(null);
   // Identifiers currently being polled, so we never start two poll loops for one row.
   const pollingRef = useRef<Set<string>>(new Set());
+  const pollAbortRef = useRef<Set<string>>(new Set());
+  const resumedJobsRef = useRef<Set<string>>(new Set());
+  const runStartedAtRef = useRef<Record<string, number>>({});
+  const [genStopping, setGenStopping] = useState(false);
+  const [stopAllLoading, setStopAllLoading] = useState(false);
 
   // Regenerate flow — the entry awaiting password confirmation, plus the typed
   // password and any validation error.
   const [regenTarget, setRegenTarget] = useState<{ entry: RegistryEntry; language?: McqLang } | null>(null);
   const [regenPassword, setRegenPassword] = useState("");
   const [regenError, setRegenError] = useState<string | null>(null);
+
+  const [deleteTarget, setDeleteTarget] = useState<{ entry: RegistryEntry; scope: McqDeleteScope } | null>(null);
+  const [deletePassword, setDeletePassword] = useState("");
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [deleteLoading, setDeleteLoading] = useState(false);
 
   const mcqRegistryRef = useRef<HTMLDivElement>(null);
 
@@ -901,6 +1298,8 @@ export function MCQBankClient() {
         setClaudeStatus({
           ok: Boolean(data.success && c.loggedIn),
           model: c.model,
+          mcqModel: c.mcqModel,
+          mcqApiDirect: Boolean(c.mcqApiDirect),
           email: c.email,
           subscriptionType: c.subscriptionType,
           error: c.error,
@@ -927,29 +1326,86 @@ export function MCQBankClient() {
   const pollJob = useCallback((entry: RegistryEntry) => {
     if (pollingRef.current.has(entry.id)) return;
     pollingRef.current.add(entry.id);
-    let polls = 0;
-    const MAX_POLLS = 240; // ~10 min at 2.5s
+    pollAbortRef.current.delete(entry.id);
+    const POLL_INTERVAL_MS = 3000;
+
+    const finish = () => {
+      pollingRef.current.delete(entry.id);
+      pollAbortRef.current.delete(entry.id);
+      resumedJobsRef.current.delete(entry.id);
+    };
 
     const tick = async () => {
-      polls++;
+      if (pollAbortRef.current.has(entry.id)) {
+        finish();
+        return;
+      }
+
       try {
         const res = await fetch(
           `/api/sop/generate-mcqs/status?identifier=${encodeURIComponent(entry.identifier)}`,
         );
+        if (pollAbortRef.current.has(entry.id)) {
+          finish();
+          return;
+        }
         if (res.ok) {
           const d = await res.json();
-          if (d.status === "completed") {
-            pollingRef.current.delete(entry.id);
-            setGenStatus((s) => { const n = { ...s }; delete n[entry.id]; return n; });
+          const effectiveStatus =
+            d.cancelRequested && (d.status === "running" || d.status === "queued")
+              ? "cancelled"
+              : d.status;
+
+          const runStarted = runStartedAtRef.current[entry.id] ?? 0;
+          const jobStarted = d.startedAt ? new Date(d.startedAt).getTime() : 0;
+          const isStaleTerminal =
+            (effectiveStatus === "failed" || effectiveStatus === "cancelled") &&
+            Boolean(runStarted && jobStarted > 0 && jobStarted < runStarted - 1000);
+
+          if (isStaleTerminal) {
+            setTimeout(tick, POLL_INTERVAL_MS);
+            return;
+          }
+
+          if (effectiveStatus === "completed") {
+            finish();
+            setGenStatus((s) => ({
+              ...s,
+              [entry.id]: {
+                status: "completed",
+                mode: d.mode,
+                languageScope: d.languageScope,
+                phase: d.phase,
+                percent: d.percent ?? 0,
+                totalInserted: d.totalInserted,
+                totalSkipped: d.totalSkipped,
+                totalFailedBatches: d.totalFailedBatches,
+                languages: d.languages,
+                logs: d.logs ?? [],
+              },
+            }));
             setRefreshKey((k) => k + 1);
             return;
           }
-          if (d.status === "failed") {
-            pollingRef.current.delete(entry.id);
+          if (effectiveStatus === "failed" || effectiveStatus === "cancelled") {
+            finish();
             setGenStatus((s) => ({
               ...s,
-              [entry.id]: { status: "error", mode: d.mode, error: d.error ?? "Generation failed" },
+              [entry.id]: {
+                status: effectiveStatus === "cancelled" ? "cancelled" : "error",
+                mode: d.mode,
+                languageScope: d.languageScope,
+                totalInserted: d.totalInserted,
+                totalSkipped: d.totalSkipped,
+                totalFailedBatches: d.totalFailedBatches,
+                languages: d.languages,
+                logs: d.logs ?? [],
+                error: d.error ?? (effectiveStatus === "cancelled"
+                  ? "Generation stopped. MCQs created so far are saved."
+                  : "Generation failed"),
+              },
             }));
+            setRefreshKey((k) => k + 1);
             return;
           }
           setGenStatus((s) => ({
@@ -963,31 +1419,95 @@ export function MCQBankClient() {
               totalInserted: d.totalInserted,
               totalSkipped: d.totalSkipped,
               totalFailedBatches: d.totalFailedBatches,
+              languages: d.languages,
               logs: d.logs ?? [],
             },
           }));
+        } else if (res.status === 404) {
+          /* job not created yet — keep polling briefly */
         }
       } catch {
         /* transient network blip — keep polling */
       }
-      if (polls >= MAX_POLLS) {
-        pollingRef.current.delete(entry.id);
+
+      if (pollAbortRef.current.has(entry.id)) {
+        finish();
+        return;
+      }
+      setTimeout(tick, POLL_INTERVAL_MS);
+    };
+
+    setTimeout(tick, 800);
+  }, []);
+
+  const stopGeneration = useCallback(async (entry: RegistryEntry) => {
+    setGenStopping(true);
+    try {
+      const res = await fetch("/api/sop/generate-mcqs/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ identifier: entry.identifier }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
         setGenStatus((s) => ({
           ...s,
-          [entry.id]: { status: "error", error: "Timed out waiting for generation — Refresh to check." },
+          [entry.id]: {
+            ...(s[entry.id] ?? { status: "generating" as const }),
+            status: "generating",
+            error: data.error ?? "Stop failed — generation may still be running",
+          },
         }));
         return;
       }
-      setTimeout(tick, 2500);
-    };
+      setGenStatus((s) => ({
+        ...s,
+        [entry.id]: {
+          ...(s[entry.id] ?? { status: "generating" as const }),
+          status: "generating",
+          phase: "Stopping…",
+          error: undefined,
+        },
+      }));
+      if (!pollingRef.current.has(entry.id)) {
+        pollJob(entry);
+      }
+    } catch {
+      setGenStatus((s) => ({
+        ...s,
+        [entry.id]: {
+          ...(s[entry.id] ?? { status: "generating" as const }),
+          status: "generating",
+          error: "Stop request failed — try again",
+        },
+      }));
+    } finally {
+      setGenStopping(false);
+    }
+  }, [pollJob]);
 
-    setTimeout(tick, 1500);
+  const stopAllGeneration = useCallback(async () => {
+    if (!window.confirm("Stop ALL in-flight MCQ generation jobs and kill Claude calls?")) return;
+    setStopAllLoading(true);
+    try {
+      const res = await fetch("/api/sop/generate-mcqs/cancel-all", { method: "POST" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error ?? "Failed to stop all jobs");
+      setGenStatus({});
+      setGenModalEntry(null);
+      setRefreshKey((k) => k + 1);
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : "Failed to stop all jobs");
+    } finally {
+      setStopAllLoading(false);
+    }
   }, []);
 
   const handleGenerate = useCallback(async (entry: RegistryEntry, language?: McqLang) => {
+    setGenModalEntry(entry);
     setGenStatus((s) => ({
       ...s,
-      [entry.id]: { status: "generating", languageScope: language, phase: "Queued", percent: 0, logs: [] },
+      [entry.id]: { status: "generating", languageScope: language, phase: "Starting…", percent: 0, logs: [] },
     }));
     try {
       const res = await fetch("/api/sop/generate-mcqs", {
@@ -996,7 +1516,7 @@ export function MCQBankClient() {
         body: JSON.stringify({
           identifier: entry.identifier,
           ...(language ? { language } : {}),
-          ...(selectedProvider ? { provider: selectedProvider } : {}),
+          provider: selectedProvider === "ollama" ? "ollama" : "claude",
         }),
       });
       if (!res.ok) {
@@ -1004,6 +1524,8 @@ export function MCQBankClient() {
         throw new Error(data.error ?? "Generation failed");
       }
       const job = await res.json().catch(() => ({}));
+      const runStartedAt = job.startedAt ? new Date(job.startedAt).getTime() : Date.now();
+      runStartedAtRef.current[entry.id] = runStartedAt;
       setGenStatus((s) => ({
         ...s,
         [entry.id]: {
@@ -1013,6 +1535,7 @@ export function MCQBankClient() {
           phase: "Queued",
           percent: 0,
           logs: [],
+          runStartedAt,
         },
       }));
       pollJob(entry);
@@ -1025,9 +1548,10 @@ export function MCQBankClient() {
   }, [pollJob, selectedProvider]);
 
   const handleContinue = useCallback(async (entry: RegistryEntry, language?: McqLang) => {
+    setGenModalEntry(entry);
     setGenStatus((s) => ({
       ...s,
-      [entry.id]: { status: "generating", mode: "continue", languageScope: language, phase: "Queued", percent: 0, logs: [] },
+      [entry.id]: { status: "generating", mode: "continue", languageScope: language, phase: "Starting…", percent: 0, logs: [] },
     }));
     try {
       const res = await fetch("/api/sop/generate-mcqs", {
@@ -1037,13 +1561,28 @@ export function MCQBankClient() {
           identifier: entry.identifier,
           mode: "continue",
           ...(language ? { language } : {}),
-          ...(selectedProvider ? { provider: selectedProvider } : {}),
+          provider: selectedProvider === "ollama" ? "ollama" : "claude",
         }),
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.error ?? "Continue generation failed");
       }
+      const job = await res.json().catch(() => ({}));
+      const runStartedAt = job.startedAt ? new Date(job.startedAt).getTime() : Date.now();
+      runStartedAtRef.current[entry.id] = runStartedAt;
+      setGenStatus((s) => ({
+        ...s,
+        [entry.id]: {
+          ...s[entry.id],
+          status: "generating",
+          mode: "continue",
+          languageScope: language,
+          phase: "Queued",
+          percent: 0,
+          runStartedAt,
+        },
+      }));
       pollJob(entry);
     } catch (e) {
       setGenStatus((s) => ({
@@ -1080,6 +1619,113 @@ export function MCQBankClient() {
     setRegenError(null);
     if (entry) handleGenerate(entry, language);
   }, [regenPassword, regenTarget, handleGenerate]);
+
+  const requestDelete = useCallback((entry: RegistryEntry, scope: McqDeleteScope) => {
+    setDeleteTarget({ entry, scope });
+    setDeletePassword("");
+    setDeleteError(null);
+  }, []);
+
+  const cancelDelete = useCallback(() => {
+    setDeleteTarget(null);
+    setDeletePassword("");
+    setDeleteError(null);
+    setDeleteLoading(false);
+  }, []);
+
+  const confirmDelete = useCallback(async () => {
+    if (deletePassword !== REGEN_PASSWORD) {
+      setDeleteError("Incorrect password. Please try again.");
+      return;
+    }
+    if (!deleteTarget) return;
+    setDeleteLoading(true);
+    setDeleteError(null);
+    try {
+      const res = await fetch("/api/mcq-bank/delete", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          identifier: deleteTarget.entry.identifier,
+          scope: deleteTarget.scope,
+          password: deletePassword,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? "Delete failed");
+      setViewerBankId(null);
+      cancelDelete();
+      setRefreshKey((k) => k + 1);
+    } catch (e) {
+      setDeleteError(e instanceof Error ? e.message : "Delete failed");
+      setDeleteLoading(false);
+    }
+  }, [deletePassword, deleteTarget, cancelDelete]);
+
+  const closeGenModal = useCallback(() => {
+    setGenModalEntry(null);
+  }, []);
+
+  // Resume polling for server-side jobs still running after page reload or modal close.
+  useEffect(() => {
+    if (allActiveEntries.length === 0) return;
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const res = await fetch("/api/sop/generate-mcqs/active");
+        if (!res.ok || cancelled) return;
+        const data = await res.json();
+        const jobs: Array<{
+          identifier: string;
+          mode?: GenProgress["mode"];
+          languageScope?: McqLang;
+          phase?: string;
+          percent?: number;
+          totalInserted?: number;
+          totalSkipped?: number;
+          totalFailedBatches?: number;
+          languages?: GenProgress["languages"];
+          logs?: string[];
+          startedAt?: string;
+        }> = data.jobs ?? [];
+
+        for (const job of jobs) {
+          if (cancelled) return;
+          const entry = allActiveEntries.find(
+            (e) => e.identifier.toLowerCase() === job.identifier.toLowerCase(),
+          );
+          if (!entry || resumedJobsRef.current.has(entry.id) || pollingRef.current.has(entry.id)) {
+            continue;
+          }
+          resumedJobsRef.current.add(entry.id);
+          const runStartedAt = job.startedAt ? new Date(job.startedAt).getTime() : Date.now();
+          runStartedAtRef.current[entry.id] = runStartedAt;
+          setGenStatus((s) => ({
+            ...s,
+            [entry.id]: {
+              status: "generating",
+              mode: job.mode,
+              languageScope: job.languageScope,
+              phase: job.phase ?? "Running…",
+              percent: job.percent ?? 0,
+              totalInserted: job.totalInserted,
+              totalSkipped: job.totalSkipped,
+              totalFailedBatches: job.totalFailedBatches,
+              languages: job.languages,
+              logs: job.logs ?? [],
+              runStartedAt,
+            },
+          }));
+          pollJob(entry);
+        }
+      } catch {
+        /* ignore — will retry on next registry refresh */
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [allActiveEntries, pollJob]);
 
   const handleSort = (field: string) => {
     if (sortCol === field) setSortDir((d) => (d === "asc" ? "desc" : "asc"));
@@ -1133,6 +1779,8 @@ export function MCQBankClient() {
       let cmp = 0;
       if (sortCol === "name") cmp = a.sopName.localeCompare(b.sopName);
       else if (sortCol === "questions" || sortCol === "totalMcqs") cmp = b.totalMcqs - a.totalMcqs;
+      else if (sortCol === "enMcqCount") cmp = b.enMcqCount - a.enMcqCount;
+      else if (sortCol === "guMcqCount") cmp = b.guMcqCount - a.guMcqCount;
       else if (sortCol === "remaining") cmp = b.remaining - a.remaining;
       else if (sortCol === "approved") cmp = b.approved - a.approved;
       else if (sortCol === "partial") cmp = b.partial - a.partial;
@@ -1222,6 +1870,20 @@ export function MCQBankClient() {
 
   return (
     <>
+      {genModalEntry && genStatus[genModalEntry.id] && (
+        <McqGenProgressModal
+          entry={genModalEntry}
+          progress={genStatus[genModalEntry.id]}
+          onClose={closeGenModal}
+          onStop={
+            genStatus[genModalEntry.id].status === "generating"
+              ? () => void stopGeneration(genModalEntry)
+              : undefined
+          }
+          stopping={genStopping}
+        />
+      )}
+
       {/* Regenerate password prompt — gates the destructive "archive + regenerate"
           action behind a password so it isn't triggered by an accidental click. */}
       {regenTarget && (
@@ -1275,6 +1937,64 @@ export function MCQBankClient() {
         </div>
       )}
 
+      {deleteTarget && (
+        <div
+          className="fixed inset-0 z-[70] flex items-center justify-center bg-black/40 p-4"
+          onClick={cancelDelete}
+        >
+          <div
+            className="w-full max-w-sm rounded-2xl bg-white p-6 shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-1 flex items-center gap-2">
+              <Trash2 className="h-4 w-4 text-rose-600" />
+              <h3 className="text-sm font-bold text-gray-800">Delete MCQs</h3>
+            </div>
+            <p className="mb-4 text-xs leading-relaxed text-gray-500">
+              Enter the password to permanently delete{" "}
+              <span className="font-semibold text-gray-700">{deleteScopeLabel(deleteTarget.scope)}</span> for{" "}
+              <span className="font-semibold text-gray-700">{displaySopCode(deleteTarget.entry.identifier)}</span>.
+              This cannot be undone.
+            </p>
+            <form onSubmit={(e) => { e.preventDefault(); void confirmDelete(); }}>
+              <input
+                type="password"
+                autoFocus
+                value={deletePassword}
+                onChange={(e) => { setDeletePassword(e.target.value); setDeleteError(null); }}
+                placeholder="Password"
+                disabled={deleteLoading}
+                className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-800 placeholder-gray-400 focus:border-rose-400 focus:outline-none disabled:opacity-60"
+              />
+              {deleteError && (
+                <p className="mt-2 text-xs font-semibold text-red-500">{deleteError}</p>
+              )}
+              <div className="mt-4 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={cancelDelete}
+                  disabled={deleteLoading}
+                  className="rounded-lg border border-gray-300 px-3 py-1.5 text-xs font-semibold text-gray-600 hover:bg-gray-50 disabled:opacity-60"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={deleteLoading}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-rose-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-rose-700 disabled:opacity-60"
+                >
+                  {deleteLoading ? (
+                    <><Loader2 className="h-3.5 w-3.5 animate-spin" /> Deleting…</>
+                  ) : (
+                    <><Trash2 className="h-3.5 w-3.5" /> Delete</>
+                  )}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
       {/* Department folder modal (Digital Repository) — opened from a dept capsule/card.
           Rendered before the viewer so the MCQ viewer stacks on top when both are open. */}
       {modalDept && (
@@ -1317,13 +2037,26 @@ export function MCQBankClient() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => setSelectedProvider((p) => (p === "claude" ? null : "claude"))}
+                  onClick={() => void stopAllGeneration()}
+                  disabled={stopAllLoading}
+                  className="flex items-center gap-1.5 rounded-lg border border-rose-300 bg-rose-50 px-3 py-1.5 text-xs font-semibold text-rose-700 hover:bg-rose-100 disabled:opacity-60"
+                  title="Emergency stop — kills all in-flight Claude MCQ generation"
+                >
+                  {stopAllLoading ? (
+                    <><Loader2 className="h-3.5 w-3.5 animate-spin" /> Stopping…</>
+                  ) : (
+                    <>Stop all generation</>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSelectedProvider("claude")}
                   title={
                     selectedProvider === "claude" && claudeStatus?.ok
-                      ? `Claude Sonnet via your subscription (${claudeStatus.email ?? "logged in"} · ${claudeStatus.subscriptionType ?? "active"} · ${claudeStatus.model ?? "claude-sonnet-4-6"}) — click to switch to Gemini`
+                      ? `Claude Haiku via your subscription (${claudeStatus.email ?? "logged in"} · ${claudeStatus.subscriptionType ?? "active"} · ${claudeStatus.mcqModel ?? "claude-haiku-4-5"}) — default MCQ generator`
                       : selectedProvider === "claude" && claudeStatus?.error
                         ? `Claude not connected: ${claudeStatus.error}`
-                        : "Claude is the default — click to use Gemini instead"
+                        : "Claude Haiku — default MCQ generator (100 unique questions per language)"
                   }
                   className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors ${
                     selectedProvider === "claude"
@@ -1402,8 +2135,16 @@ export function MCQBankClient() {
                 <>
                   Connected to your Claude subscription as <strong>{claudeStatus.email}</strong>
                   {claudeStatus.subscriptionType ? ` (${claudeStatus.subscriptionType})` : ""}
-                  {" · "}model: <strong>{claudeStatus.model ?? "claude-sonnet-4-6"}</strong>
-                  {" · "}generates up to 100 unique MCQs per language (batched, deduped)
+                  {" · "}MCQ model: <strong>{claudeStatus.mcqModel ?? "claude-haiku-4-5"}</strong>
+                  {" · "}
+                  {claudeStatus.mcqApiDirect ? (
+                    <>Anthropic API (fast bulk batches)</>
+                  ) : (
+                    <>
+                      Claude CLI (slow) — add <code className="rounded bg-violet-100 px-1">ANTHROPIC_API_KEY</code> to{" "}
+                      <code className="rounded bg-violet-100 px-1">.env.local</code> for ~10× faster generation
+                    </>
+                  )}
                 </>
               ) : (
                 <>
@@ -1647,6 +2388,8 @@ export function MCQBankClient() {
                         ["dept", "Dept"],
                         ["lang", "Lang"],
                         ["totalMcqs", "Total MCQs"],
+                        ["enMcqCount", "ENG MCQs"],
+                        ["guMcqCount", "GUJ MCQs"],
                         ["remaining", "Remaining"],
                         ["approved", "Approved"],
                         ["partial", "Partial"],
@@ -1668,7 +2411,7 @@ export function MCQBankClient() {
                     {regLoading ? (
                       [...Array(8)].map((_, i) => (
                         <tr key={i} className="border-b border-gray-200">
-                          {[...Array(11)].map((_, j) => (
+                          {[...Array(13)].map((_, j) => (
                             <td key={j} className="px-3 py-3">
                               <div className="h-3 animate-pulse rounded bg-gray-200" />
                             </td>
@@ -1677,7 +2420,7 @@ export function MCQBankClient() {
                       ))
                     ) : filteredEntries.length === 0 ? (
                       <tr>
-                        <td colSpan={11} className="text-center py-12 text-gray-500 text-sm">
+                        <td colSpan={13} className="text-center py-12 text-gray-500 text-sm">
                           No MCQ banks match the current filters.
                         </td>
                       </tr>
@@ -1690,6 +2433,9 @@ export function MCQBankClient() {
                         onGenerate={handleGenerate}
                         onRegenerate={requestRegenerate}
                         onContinue={handleContinue}
+                        onDeleteRequest={requestDelete}
+                        onOpenProgress={setGenModalEntry}
+                        onStop={(e) => void stopGeneration(e)}
                         genStatus={genStatus[entry.id]}
                       />
                     ))}
