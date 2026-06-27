@@ -250,13 +250,22 @@ function collectVersionFiles(records: ISOP[]) {
   const docxDateError: { en?: boolean; gu?: boolean } = {};
 
   for (const record of records) {
-    if (!record.fileUrl) continue;
     const key = langKey(record.language);
-    if (record.fileType === "docx") {
-      docx[key] = record.fileUrl;
-      if (record.headerDatesValid === false) docxDateError[key] = true;
+    if (record.fileUrl) {
+      if (record.fileType === "docx") {
+        docx[key] = record.fileUrl;
+        if (record.headerDatesValid === false) docxDateError[key] = true;
+      }
+      if (record.fileType === "pdf") pdf[key] = record.fileUrl;
     }
-    if (record.fileType === "pdf") pdf[key] = record.fileUrl;
+    for (const doc of record.sopDocuments ?? []) {
+      const type = doc.fileType?.toLowerCase();
+      const docKey = langKey(doc.language);
+      const path = doc.filePath?.trim();
+      if (!path) continue;
+      if (type === "docx" && !docx[docKey]) docx[docKey] = path;
+      if (type === "pdf" && !pdf[docKey]) pdf[docKey] = path;
+    }
   }
 
   return {
@@ -264,6 +273,67 @@ function collectVersionFiles(records: ISOP[]) {
     pdf,
     ...(docxDateError.en || docxDateError.gu ? { docxDateError } : {}),
   };
+}
+
+/** Record slots on the current version — used to decide whether a missing file counts as red. */
+function currentVersionFileSlots(records: ISOP[]): RegistrySOP["fileSlots"] {
+  const docx = { en: false, gu: false };
+  const pdf = { en: false, gu: false };
+  for (const record of records) {
+    const key = langKey(record.language);
+    if (record.fileType === "docx") docx[key] = true;
+    if (record.fileType === "pdf") pdf[key] = true;
+  }
+  return { docx, pdf };
+}
+
+/** Safe accessor — cached registry rows may predate `fileSlots`. */
+export function getFileSlots(
+  sop: Pick<RegistrySOP, "fileSlots" | "files" | "language">,
+): RegistrySOP["fileSlots"] {
+  if (sop.fileSlots?.docx && sop.fileSlots?.pdf) return sop.fileSlots;
+  return {
+    docx: {
+      en: Boolean(sop.files?.docx?.en),
+      gu: Boolean(sop.files?.docx?.gu),
+    },
+    pdf: {
+      en: Boolean(sop.files?.pdf?.en),
+      gu: Boolean(sop.files?.pdf?.gu),
+    },
+  };
+}
+
+/** Whether a DOCX is required for capsule missing counts (red) for this language. */
+export function docxRequiredForLang(sop: RegistrySOP, lang: "en" | "gu"): boolean {
+  const needsEn = sop.language === "ENG" || sop.language === "ENG-GUJ";
+  const needsGu = sop.language === "GUJ" || sop.language === "ENG-GUJ";
+  if (lang === "en") {
+    if (!needsEn) return false;
+    return sop.language === "ENG" || sop.language === "ENG-GUJ";
+  }
+  if (!needsGu) return false;
+  if (sop.language === "GUJ") return true;
+  return getFileSlots(sop).docx.gu;
+}
+
+/** Whether a PDF is required for capsule missing counts for this language. */
+export function pdfRequiredForLang(sop: RegistrySOP, lang: "en" | "gu"): boolean {
+  const needsEn = sop.language === "ENG" || sop.language === "ENG-GUJ";
+  const needsGu = sop.language === "GUJ" || sop.language === "ENG-GUJ";
+  if (lang === "en") {
+    if (!needsEn) return false;
+    return sop.language === "ENG" || sop.language === "ENG-GUJ";
+  }
+  if (!needsGu) return false;
+  if (sop.language === "GUJ") return true;
+  return getFileSlots(sop).pdf.gu;
+}
+
+/** Ensure legacy/cached registry rows have `fileSlots` before UI or filters use them. */
+export function normalizeRegistrySop(sop: RegistrySOP): RegistrySOP {
+  if (sop.fileSlots?.docx && sop.fileSlots?.pdf) return sop;
+  return { ...sop, fileSlots: getFileSlots(sop) };
 }
 
 function hasFile(links: { en?: string; gu?: string }, lang: "en" | "gu") {
@@ -565,8 +635,10 @@ export function groupSOPRecords(records: ISOP[]): RegistrySOP[] {
       (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
     );
     const primary = sorted[0] ?? group[0];
-    const files = collectVersionFiles(currentRecords);
-    const language = resolveLanguage(group);
+    const versionRecords = currentRecords.length ? currentRecords : group;
+    const files = collectVersionFiles(versionRecords);
+    const fileSlots = currentVersionFileSlots(versionRecords);
+    const language = resolveLanguage(versionRecords);
     const expiryDate = pickFamilyDate(currentRecords.length ? currentRecords : group, "expiryDate");
     const effectiveDate = pickFamilyDate(currentRecords.length ? currentRecords : group, "effectiveDate");
     const uploadedAt = currentRecords.reduce(
@@ -594,7 +666,6 @@ export function groupSOPRecords(records: ISOP[]): RegistrySOP[] {
         return fromId && versionNumber(fromId) === versionNumber(currentVersion);
       })?.identifier ?? primary.identifier;
 
-    const versionRecords = currentRecords.length ? currentRecords : group;
     const resolved = resolveSopFamilyNames(versionRecords, displayIdentifier);
 
     result.push({
@@ -617,6 +688,7 @@ export function groupSOPRecords(records: ISOP[]): RegistrySOP[] {
       isObsolete: group.every((r) => r.isObsolete),
       isNew: differenceInDays(new Date(), new Date(primary.createdAt)) <= 14,
       files,
+      fileSlots,
       media: collectMedia(currentRecords),
       mediaUrls: (() => {
         const { videos, slides } = collectMediaUrls(currentRecords);
@@ -939,27 +1011,29 @@ export function applyFilters(items: RegistrySOP[], filters: SOPFilters): Registr
 }
 
 function matchFileType(s: RegistrySOP, fileType: string): boolean {
-  const needsEn = s.language === "ENG" || s.language === "ENG-GUJ";
-  const needsGu = s.language === "GUJ" || s.language === "ENG-GUJ";
   switch (fileType) {
     case "DOCX":
-      return (!needsEn || Boolean(s.files.docx.en)) && (!needsGu || Boolean(s.files.docx.gu));
+      return (!docxRequiredForLang(s, "en") || Boolean(s.files.docx.en))
+        && (!docxRequiredForLang(s, "gu") || Boolean(s.files.docx.gu));
     case "No DOCX":
-      return (needsEn && !s.files.docx.en) || (needsGu && !s.files.docx.gu);
-    case "EN DOCX":    return needsEn && Boolean(s.files.docx.en);
-    case "No EN DOCX": return needsEn && !s.files.docx.en;
-    case "GJ DOCX":    return needsGu && Boolean(s.files.docx.gu);
-    case "No GJ DOCX": return needsGu && !s.files.docx.gu;
+      return (docxRequiredForLang(s, "en") && !s.files.docx.en)
+        || (docxRequiredForLang(s, "gu") && !s.files.docx.gu);
+    case "EN DOCX":    return docxRequiredForLang(s, "en") && Boolean(s.files.docx.en);
+    case "No EN DOCX": return docxRequiredForLang(s, "en") && !s.files.docx.en;
+    case "GJ DOCX":    return docxRequiredForLang(s, "gu") && Boolean(s.files.docx.gu);
+    case "No GJ DOCX": return docxRequiredForLang(s, "gu") && !s.files.docx.gu;
     case "PDF":
-      return (!needsEn || Boolean(s.files.pdf.en)) && (!needsGu || Boolean(s.files.pdf.gu));
+      return (!pdfRequiredForLang(s, "en") || Boolean(s.files.pdf.en))
+        && (!pdfRequiredForLang(s, "gu") || Boolean(s.files.pdf.gu));
     case "No PDF":
-      return (needsEn && !s.files.pdf.en) || (needsGu && !s.files.pdf.gu);
-    case "EN PDF":     return needsEn && Boolean(s.files.pdf.en);
-    case "No EN PDF":  return needsEn && !s.files.pdf.en;
-    case "GJ PDF":     return needsGu && Boolean(s.files.pdf.gu);
-    case "No GJ PDF":  return needsGu && !s.files.pdf.gu;
-    case "Needs EN":   return needsEn;
-    case "Needs GJ":   return needsGu;
+      return (pdfRequiredForLang(s, "en") && !s.files.pdf.en)
+        || (pdfRequiredForLang(s, "gu") && !s.files.pdf.gu);
+    case "EN PDF":     return pdfRequiredForLang(s, "en") && Boolean(s.files.pdf.en);
+    case "No EN PDF":  return pdfRequiredForLang(s, "en") && !s.files.pdf.en;
+    case "GJ PDF":     return pdfRequiredForLang(s, "gu") && Boolean(s.files.pdf.gu);
+    case "No GJ PDF":  return pdfRequiredForLang(s, "gu") && !s.files.pdf.gu;
+    case "Needs EN":   return s.language === "ENG" || s.language === "ENG-GUJ";
+    case "Needs GJ":   return s.language === "GUJ" || s.language === "ENG-GUJ";
     default:           return true;
   }
 }
@@ -1139,26 +1213,21 @@ function buildCapsule(department: string, sops: RegistrySOP[]): DepartmentCapsul
   };
 
   for (const sop of sops) {
-    // Language-specific DOCX/PDF (SOP-level per language slot)
+    // Language-specific DOCX/PDF — red (missing) only when a slot is required and empty.
     for (const [type, files] of [
       ["docx", sop.files.docx],
       ["pdf", sop.files.pdf],
     ] as const) {
       const bucket = type === "docx" ? capsule.docx : capsule.pdf;
+      const requiredFor = type === "docx" ? docxRequiredForLang : pdfRequiredForLang;
       for (const lang of ["en", "gu"] as const) {
-        if (hasFile(files, lang)) {
-          bucket[lang].found++;
-        } else if (
-          sop.language === "ENG-GUJ" ||
-          (lang === "en" && sop.language === "ENG") ||
-          (lang === "gu" && sop.language === "GUJ")
-        ) {
-          bucket[lang].missing++;
-        }
+        if (!requiredFor(sop, lang)) continue;
+        if (hasFile(files, lang)) bucket[lang].found++;
+        else bucket[lang].missing++;
       }
-      // Top-level: SOPs where every required language slot is present
       const allRequiredPresent =
-        (!needsEn(sop) || hasFile(files, "en")) && (!needsGu(sop) || hasFile(files, "gu"));
+        (!requiredFor(sop, "en") || hasFile(files, "en"))
+        && (!requiredFor(sop, "gu") || hasFile(files, "gu"));
       if (allRequiredPresent) bucket.found++;
       else bucket.missing++;
     }

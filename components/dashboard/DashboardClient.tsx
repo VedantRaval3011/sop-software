@@ -15,6 +15,7 @@ import {
   applyFilters,
   baseIdentifierFromIdentifier,
   buildDashboardStats,
+  normalizeRegistrySop,
   paginate,
 } from "@/lib/sop-utils";
 import { exportSopsToExcel } from "@/lib/export-missing";
@@ -142,7 +143,7 @@ export function DashboardClient() {
     // the full set once in the background. All filtering happens client-side.
     const cached = readClientCache<RegistrySOP[]>(DASHBOARD_CACHE_KEY, "all");
     if (cached) {
-      setAllItems(cached);
+      setAllItems(cached.map(normalizeRegistrySop));
       setLoading(false);
     } else {
       setLoading(true);
@@ -154,8 +155,9 @@ export function DashboardClient() {
         throw new Error(err.error ?? "Failed to load SOPs");
       }
       const data = await res.json();
-      setAllItems(data.items);
-      writeClientCache(DASHBOARD_CACHE_KEY, "all", data.items);
+      const items = (data.items as RegistrySOP[]).map(normalizeRegistrySop);
+      setAllItems(items);
+      writeClientCache(DASHBOARD_CACHE_KEY, "all", items);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load");
       if (!cached) {

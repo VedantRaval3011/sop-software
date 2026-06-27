@@ -38,7 +38,7 @@ import {
   buildPreviewHref,
   isOfficePreviewAvailable,
 } from "@/lib/file-urls";
-import { formatUploaded } from "@/lib/sop-utils";
+import { docxRequiredForLang, formatUploaded, pdfRequiredForLang } from "@/lib/sop-utils";
 import { displaySopCode, displaySopTitle } from "@/lib/sop-display";
 import { describeFilters } from "@/lib/filter-breadcrumb";
 import { useDashboardStore } from "@/lib/store/dashboard-store";
@@ -1469,7 +1469,7 @@ function SOPDetailPanel({
                 {pv.docx ? (
                   <FileLink filePath={pv.docx} label="DOCX" hasError={pv.docxDateError} />
                 ) : (
-                  <span className="text-red-500">DOCX</span>
+                  <span className="text-orange-600">DOCX</span>
                 )}
                 <span className="select-none text-gray-300">/</span>
                 {pv.pdf ? <FileLink filePath={pv.pdf} label="PDF" isPdf /> : <span className="text-red-500">PDF</span>}
@@ -1515,7 +1515,7 @@ function SOPDetailPanel({
                       {g.docx ? (
                         <FileLink filePath={g.docx} label="DOCX" hasError={g.docxDateError} />
                       ) : (
-                        <span className="text-red-500">DOCX&nbsp;✗</span>
+                        <span className="text-orange-600">DOCX&nbsp;✗</span>
                       )}
                       {g.pdf ? <FileLink filePath={g.pdf} label="PDF" isPdf /> : <span className="text-red-500">PDF&nbsp;✗</span>}
                     </div>
@@ -1652,6 +1652,7 @@ function FilesCell({ sop }: { sop: RegistrySOP }) {
 
   const renderLangRow = (
     langLabel: string,
+    langKey: "en" | "gu",
     docxPath: string | undefined,
     pdfPath: string | undefined,
     docxHasError?: boolean,
@@ -1660,13 +1661,17 @@ function FilesCell({ sop }: { sop: RegistrySOP }) {
       <span className="w-4.5 shrink-0 text-[8px] font-bold text-gray-500">{langLabel}</span>
       {docxPath ? (
         <FileLink filePath={docxPath} label="DOCX" hasError={docxHasError} />
+      ) : docxRequiredForLang(sop, langKey) ? (
+        <span className="truncate text-[8px] font-bold leading-none text-orange-600" title="DOCX missing">DOCX&nbsp;✗</span>
       ) : (
-        <span className="truncate text-[8px] font-bold leading-none text-red-600" title="DOCX missing">DOCX&nbsp;✗</span>
+        <span className="truncate text-[8px] font-medium leading-none text-gray-300" title="DOCX not required for this version">DOCX&nbsp;—</span>
       )}
       {pdfPath ? (
         <FileLink filePath={pdfPath} label="PDF" isPdf />
-      ) : (
+      ) : pdfRequiredForLang(sop, langKey) ? (
         <span className="truncate text-[8px] font-bold leading-none text-red-600" title="PDF missing">PDF&nbsp;✗</span>
+      ) : (
+        <span className="truncate text-[8px] font-medium leading-none text-gray-300" title="PDF not required for this version">PDF&nbsp;—</span>
       )}
     </div>
   );
@@ -1674,15 +1679,15 @@ function FilesCell({ sop }: { sop: RegistrySOP }) {
   if (!hasGu) {
     return (
       <div className="mx-auto flex w-full min-w-0 flex-col gap-1 text-left leading-none">
-        {renderLangRow("ENG", sop.files.docx.en, sop.files.pdf.en, sop.files.docxDateError?.en)}
+        {renderLangRow("ENG", "en", sop.files.docx.en, sop.files.pdf.en, sop.files.docxDateError?.en)}
       </div>
     );
   }
 
   return (
     <div className="mx-auto flex w-full min-w-0 flex-col gap-1 text-left leading-none">
-      {renderLangRow("ENG", sop.files.docx.en, sop.files.pdf.en, sop.files.docxDateError?.en)}
-      {renderLangRow("GUJ", sop.files.docx.gu, sop.files.pdf.gu, sop.files.docxDateError?.gu)}
+      {renderLangRow("ENG", "en", sop.files.docx.en, sop.files.pdf.en, sop.files.docxDateError?.en)}
+      {renderLangRow("GUJ", "gu", sop.files.docx.gu, sop.files.pdf.gu, sop.files.docxDateError?.gu)}
     </div>
   );
 }
@@ -1711,7 +1716,7 @@ function FileLink({
         <button
           type="button"
           className={`min-w-0 truncate font-bold text-[9px] hover:underline cursor-pointer ${
-            hasError ? "text-red-600" : "text-green-600"
+            hasError ? (isPdf ? "text-red-600" : "text-orange-600") : "text-green-600"
           }`}
           onClick={openPreview}
           title={hasError ? `${label} — header dates invalid or missing` : `Preview ${label}`}
@@ -1764,7 +1769,7 @@ function PriorVersionEntry({ pv }: { pv: PriorVersion }) {
         {pv.docx ? (
           <FileLink filePath={pv.docx} label="DOCX" hasError={pv.docxDateError} />
         ) : (
-          <span className="text-red-500">DOCX</span>
+          <span className="text-orange-600">DOCX</span>
         )}
       </span>
       <span className="select-none text-[8px] text-gray-400">/</span>
