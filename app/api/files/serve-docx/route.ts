@@ -9,7 +9,7 @@ function docxResponse(buffer: Buffer) {
     headers: {
       'Content-Type': contentType,
       'Content-Disposition': 'inline; filename="document.docx"',
-      'Cache-Control': 'private, max-age=300',
+      'Cache-Control': 'private, max-age=60, must-revalidate',
     },
   });
 }

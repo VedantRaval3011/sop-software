@@ -29,6 +29,24 @@ function viewerCacheKey(
   return `${VIEWER_CACHE_VERSION}::${identifier ?? ''}::${language ?? ''}::${pathParam ?? ''}`;
 }
 
+/**
+ * Drop cached viewer URLs whose key contains any of the given substrings
+ * (typically a SOP identifier). Called after a re-upload so the next preview
+ * resolves the new, cache-busted document URL instead of the stale one.
+ */
+export function invalidateViewerUrlCache(matches: Array<string | null | undefined>): number {
+  const needles = matches.map((m) => (m || '').trim()).filter(Boolean);
+  if (!needles.length) return 0;
+  let removed = 0;
+  for (const key of viewerUrlCache.keys()) {
+    if (needles.some((n) => key.includes(n))) {
+      viewerUrlCache.delete(key);
+      removed++;
+    }
+  }
+  return removed;
+}
+
 function getCachedViewerUrl(key: string): string | null {
   const entry = viewerUrlCache.get(key);
   if (!entry) return null;

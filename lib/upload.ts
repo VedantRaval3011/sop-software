@@ -5,6 +5,7 @@ import {
   isBunnyConfigured,
   uploadFileToBunny,
 } from "@/lib/bunny";
+import { appendCdnCacheBuster } from "@/lib/file-urls";
 import { getContentType } from "@/lib/extractContent";
 
 /** No-op kept for call-site compatibility; circuit breaker has been removed. */
@@ -36,7 +37,14 @@ export async function saveUploadedFile(
     filename,
     contentType: getContentType(file.name),
   });
-  return { fileUrl, checksum, fileSize: buffer.length };
+  // Stamp the URL with a hash of the bytes so a re-upload (same CDN path,
+  // overwritten content) gets a distinct URL — busting CDN / viewer / browser
+  // caches so the preview always reflects the most recent upload.
+  return {
+    fileUrl: appendCdnCacheBuster(fileUrl, checksum),
+    checksum,
+    fileSize: buffer.length,
+  };
 }
 
 export function detectFileType(filename: string): "pdf" | "docx" | null {

@@ -4,34 +4,11 @@ import { verifyViewerToken } from '@/lib/viewerToken';
 import { loadWordDocumentBuffer } from '@/lib/loadStoredFileBuffer';
 import mammoth from 'mammoth';
 import { extractDocumentBodyHtmlFromDocx } from '@/lib/docxHeaderExtractor';
-
-// ---------------------------------------------------------------------------
-// Server-side HTML cache for converted DOCX content.
-// Keyed by SHA-256 of the DOCX bytes (POST) or by token path (GET).
-// TTL: 30 minutes. Eliminates re-running mammoth on every view of the same doc.
-// ---------------------------------------------------------------------------
-const HTML_CACHE_TTL_MS = 30 * 60 * 1000;
-interface HtmlCacheEntry { html: string; cachedAt: number }
-const g = global as typeof global & { __docxHtmlCache?: Map<string, HtmlCacheEntry> };
-if (!g.__docxHtmlCache) g.__docxHtmlCache = new Map();
-const htmlCache = g.__docxHtmlCache;
-
-function getCachedHtml(key: string): string | null {
-  const entry = htmlCache.get(key);
-  if (!entry) return null;
-  if (Date.now() - entry.cachedAt > HTML_CACHE_TTL_MS) { htmlCache.delete(key); return null; }
-  return entry.html;
-}
-
-function setCachedHtml(key: string, html: string): void {
-  htmlCache.set(key, { html, cachedAt: Date.now() });
-  if (htmlCache.size > 200) {
-    const now = Date.now();
-    for (const [k, v] of htmlCache) {
-      if (now - v.cachedAt > HTML_CACHE_TTL_MS) htmlCache.delete(k);
-    }
-  }
-}
+import {
+  docxHtmlGetCacheKey,
+  getCachedDocxHtml as getCachedHtml,
+  setCachedDocxHtml as setCachedHtml,
+} from '@/lib/docxHtmlCache';
 
 async function convertBufferToHtml(buffer: Buffer): Promise<string> {
   // Try DOCX body extraction first (preserves layout better).
@@ -75,10 +52,10 @@ export async function GET(request: NextRequest) {
     if (!payload) return NextResponse.json({ error: 'Invalid or expired token' }, { status: 403 });
 
     // Check HTML cache before fetching + converting the file.
-    const cacheKey = `get::${payload.path ?? ''}::${payload.identifier ?? ''}::${payload.language ?? ''}`;
+    const cacheKey = docxHtmlGetCacheKey(payload.path, payload.identifier, payload.language);
     const cached = getCachedHtml(cacheKey);
     if (cached) {
-      return NextResponse.json({ success: true, html: cached }, { headers: { 'Cache-Control': 'private, max-age=1800' } });
+      return NextResponse.json({ success: true, html: cached }, { headers: { 'Cache-Control': 'private, max-age=60, must-revalidate' } });
     }
 
     const buffer = await loadWordDocumentBuffer(
@@ -90,7 +67,7 @@ export async function GET(request: NextRequest) {
 
     const html = await convertBufferToHtml(buffer);
     setCachedHtml(cacheKey, html);
-    return NextResponse.json({ success: true, html }, { headers: { 'Cache-Control': 'private, max-age=1800' } });
+    return NextResponse.json({ success: true, html }, { headers: { 'Cache-Control': 'private, max-age=60, must-revalidate' } });
   } catch (error) {
     console.error('docx-to-html GET error:', error);
     return NextResponse.json({ error: 'Failed to convert document' }, { status: 500 });

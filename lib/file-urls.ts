@@ -43,3 +43,24 @@ export function isCdnUrl(url: string): boolean {
   const cdnUrl = process.env.BUNNY_CDN_URL?.replace(/\/$/, "");
   return Boolean(cdnUrl && url.startsWith(cdnUrl));
 }
+
+/**
+ * Append a content-version query param to a stored file URL.
+ *
+ * `buildCdnPath` is deterministic, so re-uploading a file overwrites the same
+ * Bunny object at the same URL. Every cache layer keys on that URL — Bunny's CDN
+ * edge, Google Docs Viewer, Office Online, and the browser — so a re-upload keeps
+ * showing the stale old file. Stamping the URL with a hash of the bytes gives each
+ * distinct version its own URL, forcing a cache miss everywhere on the next view.
+ *
+ * Keyed by the content checksum (not a timestamp) so re-uploading identical bytes
+ * yields the same URL and doesn't churn caches needlessly.
+ */
+export function appendCdnCacheBuster(url: string, version: string): string {
+  const u = (url || "").trim();
+  const v = (version || "").trim().slice(0, 12);
+  if (!u || !v) return u;
+  // Already stamped with this exact version — leave it alone.
+  if (new RegExp(`[?&]v=${v}(?:&|$)`).test(u)) return u;
+  return u.includes("?") ? `${u}&v=${v}` : `${u}?v=${v}`;
+}
