@@ -3,12 +3,24 @@ import MCQBank from "@/models/MCQBank";
 import MCQGenJob, { type McqGenLanguage, type McqGenMode, type IMcqGenLangProgress } from "@/models/MCQGenJob";
 import { generateJson, isGeminiOverloadedError } from "@/lib/gemini";
 import { generateOllamaJson } from "@/lib/ollama";
-import { generateClaudeCliJson, getMcqClaudeModel } from "@/lib/claude-cli";
+import { generateClaudeCliMcqBatch, getMcqClaudeModel } from "@/lib/claude-cli";
+import { anthropicMcqApiAvailable, generateAnthropicMcqBatch } from "@/lib/anthropic-mcq";
+import { getOrBuildClauseIndex } from "@/lib/mcq-clause-cache";
+import {
+  batchClauses,
+  buildClauseMcqUserPrompt,
+  clauseRefsMatch,
+  clauseRefsMatchExact,
+  filterUncoveredClauses,
+  isClauseCovered,
+  normalizeMcqClauseRef,
+  type SopClause,
+} from "@/lib/mcq-clauses";
 import { DEFAULT_FREE_GEMINI_MODEL } from "@/lib/gemini-free-models";
 import type { LlmProvider } from "@/lib/llm";
 import { invalidateDashboardSopsCache } from "@/lib/server-cache";
 import { connectDB } from "@/lib/mongodb";
-import { appendGeneratedToBank, archiveBankForSop, MCQ_BANK_CAP } from "@/lib/mcq-bank-write";
+import { appendGeneratedToBank, archiveBankForSop, activeBankMcqCount, MCQ_BANK_CAP, type BankInputMcq } from "@/lib/mcq-bank-write";
 import {
   MCQ_CONTENT_CHUNKS,
   MCQ_CONTENT_LIMIT,
@@ -17,32 +29,47 @@ import {
   normalizeSopTextForMcq,
   scoreSopRecordForMcq,
 } from "@/lib/mcq-source-text";
-import { isDuplicateMcqQuestion, normalizeSopReference } from "@/lib/similarity";
+import { isDuplicateMcqQuestionForGeneration } from "@/lib/similarity";
+import {
+  ensureSingleMcqGenJob,
+  healOrphanedMcqGenJobIfNeeded,
+  mcqGenJobMatchFilter,
+  upsertMcqGenJob,
+  updateMcqGenJob,
+} from "@/lib/mcq-gen-job-store";
+import {
+  beginMcqRun,
+  endMcqRun,
+  getMcqRunSignal,
+  isMcqRunActiveInProcess,
+  isMcqRunStopRequested,
+  mcqRunKey,
+  requestMcqRunStop,
+  requestStopAllMcqRuns,
+} from "@/lib/mcq-run-control";
+
+import {
+  clausesPerCall,
+  legacyBatchSize,
+  maxLegacyBatches,
+  mcqContentLimitClaude,
+  shouldUseFastFill,
+} from "@/lib/mcq-generation-config";
 
 /** Each SOP/language bank holds at most this many MCQs (see MCQ_BANK_CAP). */
 export const MCQ_TARGET_PER_LANGUAGE = MCQ_BANK_CAP;
-/** Gemini's 16K output cap can't fit ~100 MCQs in one response, so we generate in
- *  batches and accumulate (deduping) until the target is met. */
-const MCQ_BATCH_SIZE = 25;
-/** Allow extra batches when many model outputs are deduped away. */
-const MCQ_MAX_BATCHES = 12;
-/** Stop only after this many consecutive batches add zero new MCQs to the bank. */
-const MCQ_MAX_EMPTY_BATCHES = 3;
-/** Cap questions per SOP clause so batches spread across the document. */
-const MAX_QUESTIONS_PER_CLAUSE = 2;
-/** Recent question stems sent to the model — kept small to save tokens. */
-const MCQ_AVOID_STEMS = 6;
-const MCQ_AVOID_STEM_CHARS = 100;
-/** Max clause refs listed in the avoid hint (token-cheap vs full question list). */
-const MCQ_AVOID_MAX_CLAUSES = 35;
+const MCQ_MAX_EMPTY_BATCHES = 4;
+const MAX_QUESTIONS_PER_CLAUSE = 1;
 /** Abort the whole run after this many fully-overloaded (503) batches. Hammering
  *  an overloaded service just burns quota without producing MCQs. */
 const MCQ_MAX_OVERLOAD_ABORT = 2;
 /** Per-call retry budget for MCQ generation: a couple of quick tries, and bail
  *  fast on 503 so we don't trigger the escalating-backoff storm. */
 const MCQ_GEN_OPTIONS = { maxAttempts: 2, fastFail503: true } as const;
-/** Extra per-batch retries for Claude — batch 2+ often needs another try after timeouts. */
-const CLAUDE_BATCH_ATTEMPTS = 3;
+const CLAUDE_BATCH_ATTEMPTS = 2;
+
+/** Prevent duplicate concurrent runs for the same identifier in one Node process. */
+const runningMcqIdentifiers = new Set<string>();
 
 export interface GeneratedMCQ {
   question: string;
@@ -51,22 +78,66 @@ export interface GeneratedMCQ {
   optionC: string;
   optionD: string;
   correctAnswer: "A" | "B" | "C" | "D";
-  explanation: string;
+  explanation?: string;
   difficulty: "easy" | "medium" | "hard";
-  topic: string;
-  /** The exact SOP section/clause the question is derived from, so users can trace
-   *  it back to the source. Prefer the numbered clause (e.g. "4.6.1.4"); fall back
-   *  to the section heading (e.g. "5.2 Responsibility") only when the SOP text has
-   *  no number for that section. Shown in the viewer as "Technical SOP Context". */
+  topic?: string;
   sopReference: string;
 }
 
-const MCQ_SYSTEM_PROMPT = `Pharma GMP training expert. From the SOP excerpt, return ONLY JSON:
-{"questions":[{"question","optionA","optionB","optionC","optionD","correctAnswer":"A"|"B"|"C"|"D","explanation","difficulty":"easy"|"medium"|"hard","topic","sopReference"}]}
-Rules: answerable from excerpt only; ~40% easy, ~40% medium, ~20% hard;
-each question MUST test a different clause/topic — vary stems (who/what/when/why/how);
-no paraphrases or rewordings of listed avoid stems/clauses;
-sopReference = exact clause number from text (e.g. "4.6.1.4") or section heading if unnumbered.`;
+/** Valid JSON example — Claude must follow this shape exactly. */
+const MCQ_CLAUSE_SYSTEM = `You are an MCQ generator. Respond with ONLY a JSON object (no markdown, no extra text).
+
+Schema:
+{"questions":[{"question":"string","optionA":"string","optionB":"string","optionC":"string","optionD":"string","correctAnswer":"A","difficulty":"easy","sopReference":"clause-id"}]}
+
+Rules:
+- correctAnswer is exactly one letter: A, B, C, or D (not option text)
+- Use double quotes for all strings; escape internal quotes with backslash
+- No trailing commas; no comments
+- One question per requested clause; sopReference must equal the clause id
+- Keep options short; omit explanation field`;
+
+const MCQ_LEGACY_SYSTEM = `You are an MCQ generator. Output ONLY valid JSON (no markdown).
+
+{"questions":[{"question":"string","optionA":"string","optionB":"string","optionC":"string","optionD":"string","correctAnswer":"A","difficulty":"medium","sopReference":"section"}]}
+
+Rules: correctAnswer = single letter A/B/C/D. Short options. Unique questions. Omit explanation.`;
+
+async function callMcqModel(
+  provider: LlmProvider | undefined,
+  system: string,
+  user: string,
+  identifier: string,
+): Promise<{ questions: GeneratedMCQ[] }> {
+  if (isMcqRunStopRequested(identifier)) {
+    throw new McqGenerationCancelledError();
+  }
+  const signal = getMcqRunSignal(identifier);
+  if (provider === "claude") {
+    if (anthropicMcqApiAvailable()) {
+      const questions = await generateAnthropicMcqBatch(system, user, getMcqClaudeModel(), signal);
+      return { questions };
+    }
+    const questions = await generateClaudeCliMcqBatch(system, user, getMcqClaudeModel(), {
+      runKey: identifier,
+      signal,
+    });
+    return { questions };
+  }
+  if (provider === "ollama") {
+    return generateOllamaJson<{ questions: GeneratedMCQ[] }>(system, user);
+  }
+  return generateJson<{ questions: GeneratedMCQ[] }>(system, user, MCQ_GEN_OPTIONS);
+}
+
+function mcqProviderLabel(provider?: LlmProvider): string {
+  if (provider === "ollama") return "Ollama (gemma3:12b)";
+  if (provider === "claude") {
+    const via = anthropicMcqApiAvailable() ? "Anthropic API" : "Claude CLI";
+    return `${via} (${getMcqClaudeModel()})`;
+  }
+  return "Gemini";
+}
 
 function resolveMcqAiModel(provider?: LlmProvider): string {
   if (provider === "ollama") return "gemma3:12b";
@@ -78,15 +149,111 @@ function resolveMcqAiModel(provider?: LlmProvider): string {
  *  caller maps it to a friendly "retry in a few minutes" job status. */
 class OverloadAbortError extends Error {}
 
+class McqGenerationCancelledError extends Error {
+  constructor() {
+    super("Generation cancelled");
+  }
+}
+
+async function isMcqGenerationCancelled(identifier: string): Promise<boolean> {
+  if (isMcqRunStopRequested(identifier)) return true;
+  const job = await MCQGenJob.findOne({
+    ...mcqGenJobMatchFilter(identifier),
+    status: { $in: ["queued", "running", "cancelled"] },
+  })
+    .select("cancelRequested status")
+    .lean();
+  return Boolean(job?.cancelRequested) || job?.status === "cancelled";
+}
+
+/** Request the in-flight MCQ run for this identifier to stop (kills Claude + sets DB flag). */
+export async function requestMcqGenerationCancel(identifier: string): Promise<boolean> {
+  requestMcqRunStop(identifier);
+
+  const filter = {
+    ...mcqGenJobMatchFilter(identifier),
+    status: { $in: ["queued", "running"] as const },
+  };
+  const result = await MCQGenJob.updateMany(filter, {
+    $set: {
+      status: "cancelled",
+      cancelRequested: true,
+      phase: "Stopped by user",
+      error: "Generation stopped",
+      finishedAt: new Date(),
+      updatedAt: new Date(),
+    },
+  });
+  return result.modifiedCount > 0 || isMcqRunStopRequested(identifier);
+}
+
+/** Stop all active MCQ jobs (DB + in-process Claude children). */
+export async function requestMcqGenerationCancelAll(): Promise<number> {
+  requestStopAllMcqRuns();
+  const result = await MCQGenJob.updateMany(
+    { status: { $in: ["queued", "running"] } },
+    {
+      $set: {
+        status: "cancelled",
+        cancelRequested: true,
+        phase: "Force stopped (all)",
+        error: "Generation stopped by user",
+        finishedAt: new Date(),
+        updatedAt: new Date(),
+      },
+    },
+  );
+  // Also heal any already-flagged-but-stuck jobs
+  const healed = await MCQGenJob.updateMany(
+    { cancelRequested: true, status: { $in: ["queued", "running"] } },
+    {
+      $set: {
+        status: "cancelled",
+        phase: "Force stopped (all)",
+        error: "Generation stopped by user",
+        finishedAt: new Date(),
+        updatedAt: new Date(),
+      },
+    },
+  );
+  return result.modifiedCount + healed.modifiedCount;
+}
+
+async function finalizeCancelledJob(
+  identifier: string,
+  langProgress: IMcqGenLangProgress[],
+  totalApproved: number,
+  totalRecycled: number,
+  failedBatches: number,
+): Promise<void> {
+  for (const lp of langProgress) {
+    if (lp.status === "running") lp.status = "failed";
+  }
+  await updateMcqGenJob(identifier, {
+    status: "cancelled",
+    phase: `Stopped — ${totalApproved} MCQs saved`,
+    languages: langProgress,
+    totalInserted: totalApproved,
+    totalSkipped: totalRecycled,
+    totalFailedBatches: failedBatches,
+    error: "Generation stopped",
+    finishedAt: new Date(),
+  });
+}
+
 function ts(): string {
   return new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
 async function pushLog(identifier: string, message: string): Promise<void> {
   const line = `[${ts()}] ${message}`;
+  const canonicalId = await ensureSingleMcqGenJob(identifier);
   await MCQGenJob.updateOne(
-    { identifier },
-    { $push: { logs: { $each: [line], $slice: -30 } } },
+    { identifier: canonicalId },
+    {
+      $push: { logs: { $each: [line], $slice: -30 } },
+      $set: { updatedAt: new Date() },
+    },
   );
 }
 
@@ -125,14 +292,37 @@ async function hasActiveBankForLang(identifier: string, language: McqGenLanguage
 }
 
 async function activeBankCount(identifier: string, language: "English" | "Gujarati"): Promise<number> {
-  const bank = await MCQBank.findOne({
-    sopIdentifier: escapeId(identifier),
-    language,
-    isObsolete: { $ne: true },
-  })
-    .select("mcqs")
-    .lean();
-  return bank?.mcqs?.length ?? 0;
+  return activeBankMcqCount(identifier, language);
+}
+
+type HaltReason = "cancel" | "cap";
+
+/** Authoritative stop check — reads live bank size from DB before each API call. */
+async function shouldHaltGeneration(
+  identifier: string,
+  language: "English" | "Gujarati",
+): Promise<{ halt: boolean; reason: HaltReason | null; bankTotal: number }> {
+  if (await isMcqGenerationCancelled(identifier)) {
+    return { halt: true, reason: "cancel", bankTotal: await activeBankCount(identifier, language) };
+  }
+  const bankTotal = await activeBankCount(identifier, language);
+  if (bankTotal >= MCQ_BANK_CAP) {
+    return { halt: true, reason: "cap", bankTotal };
+  }
+  return { halt: false, reason: null, bankTotal };
+}
+
+async function handleGenerationHalt(
+  identifier: string,
+  language: "English" | "Gujarati",
+  reason: HaltReason,
+  bankTotal: number,
+): Promise<void> {
+  if (reason === "cancel") {
+    await pushLog(identifier, `${language} · stop requested — halting at ${bankTotal}/${MCQ_BANK_CAP}`);
+    throw new McqGenerationCancelledError();
+  }
+  await pushLog(identifier, `${language} · bank at ${bankTotal}/${MCQ_BANK_CAP} — stopping`);
 }
 
 interface BankDedupState {
@@ -144,7 +334,7 @@ async function loadBankDedupState(
   identifier: string,
   language: "English" | "Gujarati",
 ): Promise<BankDedupState> {
-  const bank = await MCQBank.findOne({
+  const banks = await MCQBank.find({
     sopIdentifier: escapeId(identifier),
     language,
     isObsolete: { $ne: true },
@@ -154,10 +344,12 @@ async function loadBankDedupState(
 
   const questions: string[] = [];
   const refCounts = new Map<string, number>();
-  for (const m of bank?.mcqs ?? []) {
-    if (m.question?.trim()) questions.push(m.question);
-    const ref = normalizeSopReference(m.sopReference);
-    if (ref) refCounts.set(ref, (refCounts.get(ref) ?? 0) + 1);
+  for (const bank of banks) {
+    for (const m of bank.mcqs ?? []) {
+      if (m.question?.trim()) questions.push(m.question);
+      const ref = normalizeMcqClauseRef(m.sopReference);
+      if (ref) refCounts.set(ref, (refCounts.get(ref) ?? 0) + 1);
+    }
   }
   return { questions, refCounts };
 }
@@ -168,7 +360,7 @@ function recordAcceptedMcq(
   refCounts: Map<string, number>,
 ): void {
   seenQuestions.push(q.question);
-  const ref = normalizeSopReference(q.sopReference);
+  const ref = normalizeMcqClauseRef(q.sopReference);
   if (ref) refCounts.set(ref, (refCounts.get(ref) ?? 0) + 1);
 }
 
@@ -188,212 +380,423 @@ function syncInsertedMcqs(
   }
 }
 
+function toBankInput(q: GeneratedMCQ): BankInputMcq {
+  return {
+    question: q.question,
+    optionA: q.optionA,
+    optionB: q.optionB,
+    optionC: q.optionC,
+    optionD: q.optionD,
+    correctAnswer: q.correctAnswer,
+    explanation: q.explanation?.trim() || "Refer to the SOP.",
+    difficulty: q.difficulty,
+    topic: q.topic?.trim() || q.sopReference,
+    sopReference: q.sopReference,
+  };
+}
+
+function clauseRefMatchesBatch(ref: string, batch: SopClause[]): boolean {
+  const norm = normalizeMcqClauseRef(ref);
+  if (!norm) return false;
+  return batch.some((c) => clauseRefsMatch(c.id, norm));
+}
+
+/** Fix missing/wrong sopReference by pairing questions to uncovered clauses in order. */
+function reconcileClauseRefs(questions: GeneratedMCQ[], work: SopClause[]): GeneratedMCQ[] {
+  const out: GeneratedMCQ[] = [];
+  const claimed = new Set<string>();
+
+  for (const q of questions) {
+    let clause = work.find(
+      (c) => !claimed.has(c.id) && clauseRefMatchesBatch(q.sopReference ?? "", [c]),
+    );
+    if (!clause) {
+      clause = work.find((c) => !claimed.has(c.id));
+      if (clause) q.sopReference = clause.id;
+    }
+    if (clause) {
+      claimed.add(clause.id);
+      out.push(q);
+    }
+  }
+  return out;
+}
+
+function refCountForClause(refCounts: Map<string, number>, ref: string): number {
+  let count = 0;
+  for (const [k, v] of refCounts) {
+    if (clauseRefsMatchExact(k, ref)) count += v;
+  }
+  return count;
+}
+
 function isAcceptableMcq(
   q: GeneratedMCQ,
   seenQuestions: string[],
   refCounts: Map<string, number>,
+  allowedClauseIds?: Set<string>,
 ): boolean {
   if (!q?.question?.trim()) return false;
-  if (seenQuestions.some((eq) => isDuplicateMcqQuestion(q.question, eq))) return false;
-  const ref = normalizeSopReference(q.sopReference);
-  if (ref && (refCounts.get(ref) ?? 0) >= MAX_QUESTIONS_PER_CLAUSE) return false;
+  if (seenQuestions.some((eq) => isDuplicateMcqQuestionForGeneration(q.question, eq))) return false;
+  const ref = normalizeMcqClauseRef(q.sopReference);
+    if (allowedClauseIds && ref) {
+    let ok = false;
+    for (const id of allowedClauseIds) {
+      if (clauseRefsMatchExact(id, ref)) {
+        ok = true;
+        break;
+      }
+    }
+    if (!ok) return false;
+  }
+  if (ref && refCountForClause(refCounts, ref) >= MAX_QUESTIONS_PER_CLAUSE) return false;
   return true;
 }
 
-/** Token-cheap hint: clause list + a few short stems instead of full prior questions. */
-function buildAvoidHint(
-  accepted: GeneratedMCQ[],
-): string {
-  if (!accepted.length) return "";
-
-  const refs = [...new Set(
-    accepted
-      .map((q) => (q.sopReference ?? "").trim())
-      .filter(Boolean),
-  )].slice(-MCQ_AVOID_MAX_CLAUSES);
-
-  const refPart = refs.length
-    ? `\nAlready-covered clauses (pick different sections): ${refs.join(", ")}`
-    : "";
-
-  const stems = accepted
-    .slice(-MCQ_AVOID_STEMS)
-    .map((q) => {
-      const stem = q.question.replace(/\s+/g, " ").trim();
-      return stem.length > MCQ_AVOID_STEM_CHARS
-        ? `${stem.slice(0, MCQ_AVOID_STEM_CHARS)}…`
-        : stem;
-    });
-
-  const stemPart = stems.length
-    ? `\nAvoid similar stems:\n- ${stems.join("\n- ")}`
-    : "";
-
-  return refPart + stemPart;
+function coveredClauseRefs(refCounts: Map<string, number>): Set<string> {
+  return new Set([...refCounts.keys()]);
 }
 
-/** Generate MCQs for one language in batches. Calls `onBatchDone` after every
- *  batch with the new unique questions so the caller can write them to the bank
- *  immediately — MCQs land in the DB after each batch, not at the end. */
-async function generateForLanguage(
+async function fetchMcqQuestions(
+  provider: LlmProvider | undefined,
+  system: string,
+  user: string,
+  identifier: string,
+  language: string,
+  batchLabel: string,
+): Promise<GeneratedMCQ[]> {
+  const maxAttempts =
+    provider === "claude"
+      ? anthropicMcqApiAvailable()
+        ? 1
+        : CLAUDE_BATCH_ATTEMPTS
+      : 1;
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (await isMcqGenerationCancelled(identifier)) {
+      throw new McqGenerationCancelledError();
+    }
+    try {
+      const result = await callMcqModel(provider, system, user, identifier);
+      if (await isMcqGenerationCancelled(identifier)) {
+        throw new McqGenerationCancelledError();
+      }
+      return result.questions ?? [];
+    } catch (err) {
+      lastErr = err;
+      if (provider === "claude" && attempt < maxAttempts - 1) {
+        const errMsg = err instanceof Error ? err.message.slice(0, 100) : String(err).slice(0, 100);
+        await pushLog(identifier, `${language} · ${batchLabel} attempt ${attempt + 1} failed — retry (${errMsg})`);
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr ?? new Error("MCQ batch failed");
+}
+
+/** Clause-index pipeline: parse SOP once, then only send uncovered clause text per call. */
+async function generateForLanguageClauseWise(
+  identifier: string,
   sop: ISOP,
   language: "English" | "Gujarati",
   bankCountAtStart: number,
   dedupAtStart: BankDedupState,
   ctx: RunCtx,
-  onBatchDone: (p: {
-    batchesDone: number;
-    newMcqs: GeneratedMCQ[];
-  }) => Promise<{ bankTotal: number; insertedTexts: string[] }>,
+  onBatchDone: (p: { batchesDone: number; newMcqs: GeneratedMCQ[] }) => Promise<{ bankTotal: number; insertedTexts: string[] }>,
   provider?: LlmProvider,
+  mode: McqGenMode = "generate",
 ): Promise<void> {
   if (bankCountAtStart >= MCQ_BANK_CAP) return;
 
-  const seenQuestions = [...dedupAtStart.questions];
-  const refCounts = new Map(dedupAtStart.refCounts);
-  const acceptedThisRun: GeneratedMCQ[] = [];
+  let seenQuestions = [...dedupAtStart.questions];
+  let refCounts = new Map(dedupAtStart.refCounts);
   let bankTotal = bankCountAtStart;
-  let emptyBatchStreak = 0;
 
-  const contentLimit = provider === "ollama" ? MCQ_CONTENT_LIMIT_OLLAMA : MCQ_CONTENT_LIMIT;
-  const normalizedLen = normalizeSopTextForMcq(sop.content).length;
-  const useChunks = normalizedLen > contentLimit;
-  const providerLabel =
-    provider === "ollama" ? "Ollama (gemma3:12b)" :
-    provider === "claude" ? `Claude CLI (${getMcqClaudeModel()})` :
-    "Gemini";
+  const { clauses: allClauses, fromCache } = await getOrBuildClauseIndex(sop);
+  const isContinue = mode === "continue";
 
-  for (let batch = 0; batch < MCQ_MAX_BATCHES && bankTotal < MCQ_BANK_CAP; batch++) {
-    const batchNeed = Math.min(MCQ_BATCH_SIZE, MCQ_BANK_CAP - bankTotal);
-    if (batchNeed <= 0) break;
+  const perCall = clausesPerCall(provider);
+  const countPending = () => filterUncoveredClauses(allClauses, coveredClauseRefs(refCounts));
+  let pending = countPending();
+  const batches = isContinue ? [] : batchClauses(pending, perCall);
+  const totalBatches = isContinue ? Math.ceil(pending.length / perCall) || 0 : batches.length;
 
-    const avoid = buildAvoidHint(acceptedThisRun);
-    const excerpt = mcqPromptSopExcerpt(sop.content, batch, contentLimit, MCQ_CONTENT_CHUNKS);
-    const sectionNote = useChunks
-      ? `\n(SOP section ${(batch % MCQ_CONTENT_CHUNKS) + 1}/${MCQ_CONTENT_CHUNKS} — focus on untested parts.)`
-      : "";
+  await pushLog(
+    identifier,
+    `${language} · clause index${fromCache ? " (cached)" : ""}: ${allClauses.length} clauses, ${pending.length} uncovered → ${isContinue ? "continue (missing only)" : `${totalBatches} targeted calls`}`,
+  );
 
-    const userPrompt = `Language: ${language}
-SOP: ${sop.identifier} · ${sop.department}
-Generate exactly ${batchNeed} NEW unique MCQs — each from a different clause.${sectionNote}${avoid}
+  if (isContinue && pending.length === 0 && bankCountAtStart >= MCQ_BANK_CAP) {
+    await pushLog(identifier, `${language} · bank already at ${MCQ_BANK_CAP} — nothing to add`);
+    return;
+  }
 
-SOP TEXT:
-${excerpt}`;
-
+  if (isContinue && pending.length === 0) {
     await pushLog(
-      sop.identifier,
-      `${language} · batch ${batch + 1}/${MCQ_MAX_BATCHES} → querying ${providerLabel} (${bankTotal}/${MCQ_BANK_CAP} in bank)…`,
+      identifier,
+      `${language} · ${bankCountAtStart}/${MCQ_BANK_CAP} — no uncovered clauses, using excerpt fill`,
+    );
+  }
+
+  let batchNum = 0;
+  const maxBatches = isContinue
+    ? Math.ceil((MCQ_BANK_CAP - bankCountAtStart) / perCall) + 5
+    : batches.length;
+
+  for (let round = 0; round < maxBatches; round++) {
+    if (isContinue) {
+      const fresh = await loadBankDedupState(identifier, language);
+      seenQuestions = [...fresh.questions];
+      refCounts = new Map(fresh.refCounts);
+      bankTotal = await activeBankCount(identifier, language);
+      pending = countPending();
+      if (pending.length === 0) {
+        await pushLog(identifier, `${language} · clause targets met at ${bankTotal}/${MCQ_BANK_CAP} — switching to excerpt fill`);
+        break;
+      }
+    } else if (round >= batches.length) {
+      break;
+    }
+
+    const pre = await shouldHaltGeneration(identifier, language);
+    bankTotal = pre.bankTotal;
+    if (pre.halt && pre.reason) {
+      await handleGenerationHalt(identifier, language, pre.reason, bankTotal);
+      return;
+    }
+
+    batchNum++;
+    const room = MCQ_BANK_CAP - bankTotal;
+    const clauseBatch = isContinue ? pending.slice(0, perCall) : batches[round];
+    const work = clauseBatch.slice(0, room).filter((c) => !isClauseCovered(c.id, coveredClauseRefs(refCounts)));
+    if (!work.length) {
+      if (isContinue) continue;
+      break;
+    }
+
+    const userPrompt = buildClauseMcqUserPrompt(language, sop.identifier, work);
+
+    const batchLabel = isContinue ? `continue batch ${batchNum}` : `clause batch ${batchNum}`;
+    await pushLog(
+      identifier,
+      `${language} · ${batchLabel}${!isContinue ? `/${totalBatches}` : ""} (${work.length} clauses) → ${mcqProviderLabel(provider)} (${bankTotal}/${MCQ_BANK_CAP})`,
     );
 
-    let questions: GeneratedMCQ[];
+    let activeWork = work;
+    let questions: GeneratedMCQ[] | undefined;
     try {
-      let result: { questions: GeneratedMCQ[] } | undefined;
-      const maxAttempts = provider === "claude" ? CLAUDE_BATCH_ATTEMPTS : 1;
-      let lastBatchErr: unknown;
-
-      for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        try {
-          if (provider === "ollama") {
-            result = await generateOllamaJson<{ questions: GeneratedMCQ[] }>(MCQ_SYSTEM_PROMPT, userPrompt);
-          } else if (provider === "claude") {
-            result = await generateClaudeCliJson<{ questions: GeneratedMCQ[] }>(
-              MCQ_SYSTEM_PROMPT,
-              userPrompt,
-              getMcqClaudeModel(),
-            );
-          } else {
-            result = await generateJson<{ questions: GeneratedMCQ[] }>(MCQ_SYSTEM_PROMPT, userPrompt, MCQ_GEN_OPTIONS);
-          }
-          lastBatchErr = undefined;
-          break;
-        } catch (err) {
-          lastBatchErr = err;
-          if (provider === "claude" && attempt < maxAttempts - 1) {
-            const errMsg = err instanceof Error ? err.message.slice(0, 100) : String(err).slice(0, 100);
-            await pushLog(
-              sop.identifier,
-              `${language} · batch ${batch + 1} attempt ${attempt + 1} failed — retrying (${errMsg})`,
-            );
-            continue;
-          }
-          throw err;
-        }
-      }
-
-      if (!result) throw lastBatchErr ?? new Error("MCQ batch failed");
-      questions = result.questions ?? [];
+      questions = await fetchMcqQuestions(
+        provider,
+        MCQ_CLAUSE_SYSTEM,
+        userPrompt,
+        identifier,
+        language,
+        `clause batch ${batchNum}`,
+      );
     } catch (err) {
       ctx.failedBatches++;
       const errMsg = err instanceof Error ? err.message.slice(0, 120) : String(err).slice(0, 120);
       if (provider !== "ollama" && provider !== "claude" && isGeminiOverloadedError(err)) {
         ctx.overloadHits++;
-        await pushLog(sop.identifier, `${language} · batch ${batch + 1}: Gemini overloaded (503) — hit ${ctx.overloadHits}/${MCQ_MAX_OVERLOAD_ABORT}`);
-        console.warn(`[mcq-gen] ${sop.identifier} (${language}) batch ${batch + 1}: overloaded — ${ctx.overloadHits}/${MCQ_MAX_OVERLOAD_ABORT}`);
         if (ctx.overloadHits >= MCQ_MAX_OVERLOAD_ABORT) {
-          throw new OverloadAbortError(
-            "Gemini is overloaded (503). Aborted to avoid wasted API calls — please retry in a few minutes.",
-          );
+          throw new OverloadAbortError("Gemini is overloaded (503). Please retry in a few minutes.");
         }
-        break;
+        continue;
       }
-      await pushLog(sop.identifier, `${language} · batch ${batch + 1} failed — ${errMsg}`);
-      console.error(`[mcq-gen] ${sop.identifier} (${language}) batch ${batch + 1} failed:`, err);
-      break;
+      await pushLog(identifier, `${language} · ${batchLabel} failed — ${errMsg}`);
+      if (activeWork.length > 1 && provider === "claude") {
+        activeWork = activeWork.slice(0, Math.ceil(activeWork.length / 2));
+        await pushLog(identifier, `${language} · ${batchLabel} retry with ${activeWork.length} clause(s)`);
+        try {
+          questions = await fetchMcqQuestions(
+            provider,
+            MCQ_CLAUSE_SYSTEM,
+            buildClauseMcqUserPrompt(language, sop.identifier, activeWork),
+            identifier,
+            language,
+            `${batchLabel} retry`,
+          );
+        } catch (retryErr) {
+          const retryMsg = retryErr instanceof Error ? retryErr.message.slice(0, 100) : String(retryErr).slice(0, 100);
+          await pushLog(identifier, `${language} · ${batchLabel} retry failed — ${retryMsg}`);
+          continue;
+        }
+      } else {
+        continue;
+      }
     }
 
-    if (!questions.length) {
-      await pushLog(sop.identifier, `${language} · batch ${batch + 1}: empty response — stopping`);
-      break;
+    if (!questions?.length) {
+      await pushLog(identifier, `${language} · ${batchLabel}: model returned no questions`);
+      continue;
     }
 
-    const candidates: GeneratedMCQ[] = [];
+    questions = reconcileClauseRefs(questions, activeWork);
+    const activeIds = new Set(activeWork.map((c) => c.id));
+
+    const post = await shouldHaltGeneration(identifier, language);
+    bankTotal = post.bankTotal;
+    if (post.halt && post.reason === "cancel") {
+      await handleGenerationHalt(identifier, language, "cancel", bankTotal);
+    }
+    if (post.halt && post.reason === "cap") {
+      await pushLog(identifier, `${language} · bank at ${bankTotal}/${MCQ_BANK_CAP} — stopping`);
+      return;
+    }
+
+    const insertRoom = MCQ_BANK_CAP - bankTotal;
+    if (insertRoom <= 0) return;
+
+    const candidates: BankInputMcq[] = [];
+    const batchSeen = [...seenQuestions];
+    const batchRefCounts = new Map(refCounts);
+    for (const q of questions) {
+      if (!clauseRefMatchesBatch(q.sopReference ?? "", activeWork)) continue;
+      if (!isAcceptableMcq(q, batchSeen, batchRefCounts, activeIds)) continue;
+      batchSeen.push(q.question);
+      const ref = normalizeMcqClauseRef(q.sopReference);
+      if (ref) batchRefCounts.set(ref, (batchRefCounts.get(ref) ?? 0) + 1);
+      candidates.push(toBankInput(q));
+      if (candidates.length >= insertRoom) break;
+    }
+
+    if (candidates.length === 0 && questions.length > 0) {
+      await pushLog(
+        identifier,
+        `${language} · ${batchLabel}: ${questions.length} parsed but 0 accepted (check clause refs / duplicates)`,
+      );
+    }
+
+    const prevBankTotal = bankTotal;
+    const batchResult = await onBatchDone({ batchesDone: batchNum, newMcqs: candidates });
+    bankTotal = batchResult.bankTotal;
+    syncInsertedMcqs(candidates, batchResult.insertedTexts, seenQuestions, refCounts, []);
+
+    await pushLog(
+      identifier,
+      `${language} · clause batch ${batchNum}: +${bankTotal - prevBankTotal} → ${bankTotal}/${MCQ_BANK_CAP}`,
+    );
+  }
+
+  bankTotal = await activeBankCount(identifier, language);
+  if (bankTotal >= MCQ_BANK_CAP) return;
+
+  const freshDedup = await loadBankDedupState(identifier, language);
+  await pushLog(
+    identifier,
+    `${language} · ${bankTotal}/${MCQ_BANK_CAP} after clauses — excerpt fill for remainder`,
+  );
+  await generateForLanguageLegacy(
+    identifier, sop, language, bankTotal, freshDedup,
+    ctx, onBatchDone, provider,
+  );
+}
+
+/** Legacy excerpt batches — only when clause index is insufficient. */
+async function generateForLanguageLegacy(
+  identifier: string,
+  sop: ISOP,
+  language: "English" | "Gujarati",
+  bankCountAtStart: number,
+  dedupAtStart: BankDedupState,
+  ctx: RunCtx,
+  onBatchDone: (p: { batchesDone: number; newMcqs: GeneratedMCQ[] }) => Promise<{ bankTotal: number; insertedTexts: string[] }>,
+  provider?: LlmProvider,
+): Promise<void> {
+  const seenQuestions = [...dedupAtStart.questions];
+  const refCounts = new Map(dedupAtStart.refCounts);
+  let bankTotal = bankCountAtStart;
+  let emptyBatchStreak = 0;
+
+  const contentLimit =
+    provider === "ollama" ? MCQ_CONTENT_LIMIT_OLLAMA :
+    provider === "claude" ? mcqContentLimitClaude() :
+    MCQ_CONTENT_LIMIT;
+
+  const legacyMax = maxLegacyBatches();
+  for (let batch = 0; batch < legacyMax; batch++) {
+    if (await isMcqGenerationCancelled(identifier)) {
+      await handleGenerationHalt(identifier, language, "cancel", bankTotal);
+    }
+    if (bankTotal >= MCQ_BANK_CAP) return;
+
+    const batchNeed = legacyBatchSize(provider, MCQ_BANK_CAP - bankTotal);
+    if (batchNeed <= 0) break;
+    const excerpt = mcqPromptSopExcerpt(sop.content, batch, contentLimit, MCQ_CONTENT_CHUNKS);
+    const userPrompt = `${language} · ${sop.identifier}
+Generate exactly ${batchNeed} unique MCQs from this SOP excerpt. Section ${(batch % MCQ_CONTENT_CHUNKS) + 1}/${MCQ_CONTENT_CHUNKS}. Short options.
+
+SOP:
+${excerpt}`;
+
+    let questions: GeneratedMCQ[];
+    try {
+      questions = await fetchMcqQuestions(provider, MCQ_LEGACY_SYSTEM, userPrompt, identifier, language, `fill ${batch + 1}`);
+    } catch (err) {
+      ctx.failedBatches++;
+      const errMsg = err instanceof Error ? err.message.slice(0, 120) : String(err).slice(0, 120);
+      await pushLog(identifier, `${language} · fill batch ${batch + 1} failed — ${errMsg}`);
+      continue;
+    }
+
+    if (await isMcqGenerationCancelled(identifier)) {
+      await handleGenerationHalt(identifier, language, "cancel", bankTotal);
+    }
+
+    const candidates: BankInputMcq[] = [];
     const batchSeen = [...seenQuestions];
     const batchRefCounts = new Map(refCounts);
     for (const q of questions) {
       if (candidates.length >= batchNeed) break;
       if (!isAcceptableMcq(q, batchSeen, batchRefCounts)) continue;
       batchSeen.push(q.question);
-      const ref = normalizeSopReference(q.sopReference);
+      const ref = normalizeMcqClauseRef(q.sopReference);
       if (ref) batchRefCounts.set(ref, (batchRefCounts.get(ref) ?? 0) + 1);
-      candidates.push(q);
+      candidates.push(toBankInput(q));
     }
 
-    const prevBankTotal = bankTotal;
+    const prev = bankTotal;
     const batchResult = await onBatchDone({ batchesDone: batch + 1, newMcqs: candidates });
     bankTotal = batchResult.bankTotal;
-    syncInsertedMcqs(
-      candidates,
-      batchResult.insertedTexts,
-      seenQuestions,
-      refCounts,
-      acceptedThisRun,
-    );
-    const inserted = bankTotal - prevBankTotal;
+    syncInsertedMcqs(candidates, batchResult.insertedTexts, seenQuestions, refCounts, []);
 
-    console.log(
-      `[mcq-gen] ${sop.identifier} (${language}) batch ${batch + 1}: +${inserted} in bank (${candidates.length} candidates, ${bankTotal}/${MCQ_BANK_CAP})`,
-    );
-
-    if (bankTotal >= MCQ_BANK_CAP) {
-      await pushLog(sop.identifier, `${language} · reached ${MCQ_BANK_CAP} MCQs — stopping`);
-      break;
-    }
-
-    if (inserted === 0) {
+    if (bankTotal - prev === 0) {
       emptyBatchStreak++;
-      await pushLog(
-        sop.identifier,
-        `${language} · batch ${batch + 1}: no new unique MCQs (${emptyBatchStreak}/${MCQ_MAX_EMPTY_BATCHES})`,
-      );
-      if (emptyBatchStreak >= MCQ_MAX_EMPTY_BATCHES) {
-        await pushLog(sop.identifier, `${language} · too many duplicate batches — stopping at ${bankTotal}/${MCQ_BANK_CAP}`);
-        break;
-      }
-      continue;
+      if (emptyBatchStreak >= MCQ_MAX_EMPTY_BATCHES) break;
+    } else {
+      emptyBatchStreak = 0;
     }
-
-    emptyBatchStreak = 0;
   }
+}
+
+async function generateForLanguage(
+  identifier: string,
+  sop: ISOP,
+  language: "English" | "Gujarati",
+  bankCountAtStart: number,
+  dedupAtStart: BankDedupState,
+  ctx: RunCtx,
+  onBatchDone: (p: { batchesDone: number; newMcqs: GeneratedMCQ[] }) => Promise<{ bankTotal: number; insertedTexts: string[] }>,
+  provider?: LlmProvider,
+  mode: McqGenMode = "generate",
+): Promise<void> {
+  const gap = MCQ_BANK_CAP - bankCountAtStart;
+  const batchSize = legacyBatchSize(provider, gap);
+  if (shouldUseFastFill(mode, bankCountAtStart, gap)) {
+    const estCalls = Math.max(1, Math.ceil(gap / batchSize));
+    await pushLog(
+      identifier,
+      `${language} · fast fill — ${gap} MCQs needed · ~${estCalls} API call(s) × ${batchSize} MCQs`,
+    );
+    await generateForLanguageLegacy(
+      identifier, sop, language, bankCountAtStart, dedupAtStart, ctx, onBatchDone, provider,
+    );
+    return;
+  }
+  await generateForLanguageClauseWise(
+    identifier, sop, language, bankCountAtStart, dedupAtStart, ctx, onBatchDone, provider, mode,
+  );
 }
 
 /** Pick the best SOP record per language for generation (DOCX preferred over PDF). */
@@ -420,6 +823,7 @@ export async function enqueueMcqGeneration(
   mode: McqGenMode;
   languageScope?: McqGenLanguage;
   status: "queued";
+  startedAt: string;
 }> {
   await connectDB();
   const idRegex = escapeId(identifier);
@@ -437,35 +841,38 @@ export async function enqueueMcqGeneration(
     mode = hasActive ? "regenerate" : "generate";
   }
 
-  const inFlight = await MCQGenJob.findOne({ identifier, status: { $in: ["queued", "running"] } }).lean();
+  const inFlight = await MCQGenJob.findOne({
+    ...mcqGenJobMatchFilter(identifier),
+    status: { $in: ["queued", "running"] },
+  }).lean();
   if (inFlight) {
-    throw new Error(`MCQ generation already in progress for ${identifier}`);
+    const healed = await healOrphanedMcqGenJobIfNeeded(identifier, inFlight);
+    if (!healed) {
+      throw new Error(`MCQ generation already in progress for ${identifier}`);
+    }
   }
 
-  await MCQGenJob.findOneAndUpdate(
-    { identifier },
-    {
-      $set: {
-        identifier,
-        mode,
-        languageScope: languageScope ?? null,
-        status: "queued",
-        phase: "Queued",
-        percent: 0,
-        languages: [],
-        totalInserted: 0,
-        totalSkipped: 0,
-        totalFailedBatches: 0,
-        error: null,
-        startedAt: new Date(),
-        finishedAt: null,
-      },
-    },
-    { upsert: true },
-  );
+  const startedAt = new Date();
+  beginMcqRun(identifier);
+
+  await upsertMcqGenJob(identifier, {
+    mode,
+    languageScope: languageScope ?? null,
+    status: "queued",
+    phase: "Queued",
+    percent: 0,
+    languages: [],
+    totalInserted: 0,
+    totalSkipped: 0,
+    totalFailedBatches: 0,
+    error: null,
+    cancelRequested: false,
+    startedAt,
+    finishedAt: null,
+  });
 
   triggerMcqGenerationAsync(identifier, mode, provider, languageScope);
-  return { identifier, mode, languageScope, status: "queued" };
+  return { identifier, mode, languageScope, status: "queued", startedAt: startedAt.toISOString() };
 }
 
 export async function runMcqGeneration(
@@ -474,24 +881,30 @@ export async function runMcqGeneration(
   provider?: LlmProvider,
   languageScope?: McqGenLanguage,
 ): Promise<{ identifier: string; totalApproved: number; totalRecycled: number }> {
+  const rk = mcqRunKey(identifier);
+  if (runningMcqIdentifiers.has(rk) && isMcqRunActiveInProcess(identifier)) {
+    console.warn(`[mcq-gen] ${identifier} — already running in this process, skipping duplicate`);
+    return { identifier, totalApproved: 0, totalRecycled: 0 };
+  }
+  if (runningMcqIdentifiers.has(rk)) {
+    runningMcqIdentifiers.delete(rk);
+  }
+  runningMcqIdentifiers.add(rk);
+  beginMcqRun(identifier);
+
+  try {
   await connectDB();
+  const effectiveProvider: LlmProvider = provider ?? "claude";
 
   const sops = await SOP.find({ identifier: escapeId(identifier) });
   if (!sops.length) {
-    await MCQGenJob.findOneAndUpdate(
-      { identifier },
-      {
-        $set: {
-          identifier,
-          mode: modeArg ?? "generate",
-          status: "failed",
-          phase: "SOP not found",
-          error: `SOP not found: ${identifier}`,
-          finishedAt: new Date(),
-        },
-      },
-      { upsert: true },
-    );
+    await upsertMcqGenJob(identifier, {
+      mode: modeArg ?? "generate",
+      status: "failed",
+      phase: "SOP not found",
+      error: `SOP not found: ${identifier}`,
+      finishedAt: new Date(),
+    });
     throw new Error(`SOP not found: ${identifier}`);
   }
 
@@ -515,26 +928,19 @@ export async function runMcqGeneration(
   // failed extraction. Generating from it just yields generic, ungrounded MCQs,
   // so fail fast with an actionable message instead of producing junk.
   if (!eligible.length) {
-    await MCQGenJob.findOneAndUpdate(
-      { identifier },
-      {
-        $set: {
-          identifier,
-          mode,
-          languageScope: languageScope ?? null,
-          status: "failed",
-          phase: "No readable SOP content",
-          percent: 0,
-          error:
-            languageScope
-              ? `No readable ${languageScope} SOP text found (image-only PDF or failed extraction). Upload a text-based DOCX/PDF, then try again.`
-              : "No readable SOP text found (the stored content is an image-only PDF or failed extraction). " +
-                "Upload a text-based DOCX/PDF for this SOP, then regenerate.",
-          finishedAt: new Date(),
-        },
-      },
-      { upsert: true },
-    );
+    await upsertMcqGenJob(identifier, {
+      mode,
+      languageScope: languageScope ?? null,
+      status: "failed",
+      phase: "No readable SOP content",
+      percent: 0,
+      error:
+        languageScope
+          ? `No readable ${languageScope} SOP text found (image-only PDF or failed extraction). Upload a text-based DOCX/PDF, then try again.`
+          : "No readable SOP text found (the stored content is an image-only PDF or failed extraction). " +
+            "Upload a text-based DOCX/PDF for this SOP, then regenerate.",
+      finishedAt: new Date(),
+    });
     await SOP.updateMany({ _id: { $in: sopIds } }, { pipelineStatus: "failed" });
     throw new Error("No readable SOP content to generate from");
   }
@@ -543,7 +949,7 @@ export async function runMcqGeneration(
     language: lang,
     status: "pending",
     batchesDone: 0,
-    batchesTotal: MCQ_MAX_BATCHES,
+    batchesTotal: 0,
     collected: 0,
     target: MCQ_BANK_CAP,
     inserted: 0,
@@ -553,54 +959,47 @@ export async function runMcqGeneration(
   const ctx: RunCtx = { overloadHits: 0, failedBatches: 0 };
 
   const persist = async (extra: Record<string, unknown> = {}) => {
-    await MCQGenJob.updateOne(
-      { identifier },
-      {
-        $set: {
-          identifier,
-          mode,
-          languages: langProgress,
-          percent: overallPercent(langProgress),
-          totalFailedBatches: ctx.failedBatches,
-          updatedAt: new Date(),
-          ...extra,
-        },
-      },
-      { upsert: true },
-    );
+    await updateMcqGenJob(identifier, {
+      mode,
+      languages: langProgress,
+      percent: overallPercent(langProgress),
+      totalFailedBatches: ctx.failedBatches,
+      ...extra,
+    });
   };
 
-  await MCQGenJob.findOneAndUpdate(
-    { identifier },
-    {
-      $set: {
-        identifier,
-        mode,
-        languageScope: languageScope ?? null,
-        status: "running",
-        phase: mode === "regenerate" ? "Regenerating — starting…" : mode === "continue" ? "Continuing — starting…" : "Generating — starting…",
-        percent: 0,
-        languages: langProgress,
-        totalInserted: 0,
-        totalSkipped: 0,
-        totalFailedBatches: 0,
-        error: null,
-        startedAt: new Date(),
-        finishedAt: null,
-      },
-    },
-    { upsert: true },
-  );
+  await upsertMcqGenJob(identifier, {
+    mode,
+    languageScope: languageScope ?? null,
+    status: "running",
+    phase: mode === "regenerate" ? "Regenerating — starting…" : mode === "continue" ? "Continuing — starting…" : "Generating — starting…",
+    percent: 0,
+    languages: langProgress,
+    totalInserted: 0,
+    totalSkipped: 0,
+    totalFailedBatches: 0,
+    error: null,
+    cancelRequested: false,
+    startedAt: new Date(),
+    finishedAt: null,
+  });
 
   await SOP.updateMany({ _id: { $in: sopIds } }, { pipelineStatus: "mcq_generating" });
 
-  const providerLabel =
-    provider === "ollama" ? "Ollama (gemma3:12b)" :
-    provider === "claude" ? `Claude CLI (${getMcqClaudeModel()})` :
-    "Gemini";
+  const providerLabel = mcqProviderLabel(effectiveProvider);
   const langLabels = eligible.map(([lang]) => lang).join(" + ");
   await pushLog(identifier, `Starting ${mode} · ${langLabels} · provider: ${providerLabel}`);
-  await pushLog(identifier, `Target: ${MCQ_BANK_CAP} MCQs/language · up to ${MCQ_MAX_BATCHES} batches of ${MCQ_BATCH_SIZE}`);
+  if (effectiveProvider === "claude" && !anthropicMcqApiAvailable()) {
+    await pushLog(
+      identifier,
+      `Tip: add ANTHROPIC_API_KEY to .env.local for ~10× faster generation (direct API vs Claude CLI)`,
+    );
+  }
+  const gapSample = MCQ_BANK_CAP;
+  await pushLog(
+    identifier,
+    `Target: ${MCQ_BANK_CAP} MCQs/language · bulk batches of ${legacyBatchSize(effectiveProvider, gapSample)}`,
+  );
 
   let totalApproved = 0;
   let totalRecycled = 0;
@@ -635,13 +1034,14 @@ export async function runMcqGeneration(
         continue;
       }
 
-      await persist({ phase: `${verb} ${lp.language} — batch 0/${MCQ_MAX_BATCHES}` });
+      await persist({ phase: `${verb} ${lp.language} · indexing clauses…` });
 
       const langSopIds = sops
         .filter((s) => ((s.language ?? "English") as string) === lp.language)
         .map((s) => s._id);
 
       await generateForLanguage(
+        identifier,
         sop,
         lp.language,
         bankCountAtStart,
@@ -649,7 +1049,7 @@ export async function runMcqGeneration(
         ctx,
         async ({ batchesDone, newMcqs }) => {
           const { inserted: batchInserted, skipped: batchSkipped, total: bankTotal, insertedQuestions } =
-            await appendGeneratedToBank(sop, lp.language, newMcqs, resolveMcqAiModel(provider));
+            await appendGeneratedToBank(sop, lp.language, newMcqs, resolveMcqAiModel(effectiveProvider));
 
           lp.batchesDone = batchesDone;
           lp.collected = bankTotal;
@@ -663,7 +1063,7 @@ export async function runMcqGeneration(
             `${lp.language} · batch ${batchesDone} done — +${batchInserted} new → ${bankTotal}/${MCQ_BANK_CAP} in bank`,
           );
           await persist({
-            phase: `${verb} ${lp.language} — batch ${batchesDone}/${MCQ_MAX_BATCHES} · ${bankTotal}/${MCQ_BANK_CAP} MCQs`,
+            phase: `${verb} ${lp.language} · ${bankTotal}/${MCQ_BANK_CAP} MCQs`,
             totalInserted: totalApproved,
             totalSkipped: totalRecycled,
           });
@@ -671,11 +1071,16 @@ export async function runMcqGeneration(
           await SOP.updateMany({ _id: { $in: langSopIds } }, { mcqCount: bankTotal });
           return { bankTotal, insertedTexts: insertedQuestions };
         },
-        provider,
+        effectiveProvider,
+        mode,
       );
 
+      lp.collected = await activeBankCount(identifier, lp.language);
       lp.status = "done";
-      await pushLog(identifier, `${lp.language} · complete — ${lp.inserted} MCQs in bank, ${lp.skipped} skipped`);
+      await pushLog(
+        identifier,
+        `${lp.language} · complete — ${lp.collected}/${MCQ_BANK_CAP} in bank (${lp.inserted} added this run, ${lp.skipped} skipped)`,
+      );
       await persist({ totalInserted: totalApproved, totalSkipped: totalRecycled });
     }
 
@@ -685,22 +1090,25 @@ export async function runMcqGeneration(
       { pipelineStatus: "approved", status: "completed" },
     );
 
-    await MCQGenJob.updateOne(
-      { identifier },
-      {
-        $set: {
-          status: "completed",
-          phase: `Done — +${totalApproved} MCQs added (${mode})`,
-          percent: 100,
-          languages: langProgress,
-          totalInserted: totalApproved,
-          totalSkipped: totalRecycled,
-          totalFailedBatches: ctx.failedBatches,
-          finishedAt: new Date(),
-          updatedAt: new Date(),
-        },
-      },
-    );
+    await updateMcqGenJob(identifier, {
+      status: "completed",
+      phase:
+        totalApproved === 0 && ctx.failedBatches > 0
+          ? `Finished with errors — 0 MCQs added (${ctx.failedBatches} batch error${ctx.failedBatches === 1 ? "" : "s"}). Try Continue.`
+          : totalApproved === 0 && langProgress.some((lp) => lp.collected < MCQ_BANK_CAP)
+            ? `Done — bank below ${MCQ_BANK_CAP} (0 new this run)`
+            : `Done — +${totalApproved} MCQs added (${mode})`,
+      percent: overallPercent(langProgress),
+      languages: langProgress,
+      totalInserted: totalApproved,
+      totalSkipped: totalRecycled,
+      totalFailedBatches: ctx.failedBatches,
+      error:
+        totalApproved === 0 && ctx.failedBatches > 0
+          ? `${ctx.failedBatches} batch(es) had errors — try Continue`
+          : null,
+      finishedAt: new Date(),
+    });
 
     console.log(
       `[mcq-gen] ${identifier} ${mode} complete — inserted ${totalApproved}, skipped ${totalRecycled}, failed batches ${ctx.failedBatches}`,
@@ -708,26 +1116,37 @@ export async function runMcqGeneration(
     invalidateDashboardSopsCache();
     return { identifier, totalApproved, totalRecycled };
   } catch (error) {
+    const cancelled =
+      error instanceof McqGenerationCancelledError ||
+      isMcqRunStopRequested(identifier) ||
+      (error instanceof Error && /cancel/i.test(error.message));
+    if (cancelled) {
+      await finalizeCancelledJob(identifier, langProgress, totalApproved, totalRecycled, ctx.failedBatches);
+      await SOP.updateMany(
+        { _id: { $in: sopIds } },
+        { pipelineStatus: "approved", status: "completed" },
+      );
+      invalidateDashboardSopsCache();
+      return { identifier, totalApproved, totalRecycled };
+    }
     const overloaded = error instanceof OverloadAbortError || isGeminiOverloadedError(error);
     await SOP.updateMany({ _id: { $in: sopIds } }, { pipelineStatus: "failed" });
     for (const lp of langProgress) if (lp.status === "running") lp.status = "failed";
-    await MCQGenJob.updateOne(
-      { identifier },
-      {
-        $set: {
-          status: "failed",
-          phase: overloaded ? "Aborted — service overloaded (503)" : "Failed",
-          error: error instanceof Error ? error.message : String(error),
-          languages: langProgress,
-          totalInserted: totalApproved,
-          totalSkipped: totalRecycled,
-          totalFailedBatches: ctx.failedBatches,
-          finishedAt: new Date(),
-          updatedAt: new Date(),
-        },
-      },
-    );
+    await updateMcqGenJob(identifier, {
+      status: "failed",
+      phase: overloaded ? "Aborted — service overloaded (503)" : "Failed",
+      error: error instanceof Error ? error.message : String(error),
+      languages: langProgress,
+      totalInserted: totalApproved,
+      totalSkipped: totalRecycled,
+      totalFailedBatches: ctx.failedBatches,
+      finishedAt: new Date(),
+    });
     throw error;
+  }
+  } finally {
+    runningMcqIdentifiers.delete(rk);
+    endMcqRun(identifier);
   }
 }
 

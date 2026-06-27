@@ -2,11 +2,13 @@ import type { ISOP } from "@/models/SOP";
 
 /** Max SOP excerpt chars per MCQ API call (cloud). ~8k tokens — enough for most SOPs. */
 export const MCQ_CONTENT_LIMIT = 32_000;
+/** Tighter cap for Claude — saves input tokens; chunks rotate across batches. */
+export const MCQ_CONTENT_LIMIT_CLAUDE = 10_000;
 /** Tighter cap for local Ollama context windows. */
 export const MCQ_CONTENT_LIMIT_OLLAMA = 24_000;
 /** When the normalized SOP exceeds the cap, rotate through this many section chunks
  *  across batches so we do not resend the full document every call. */
-export const MCQ_CONTENT_CHUNKS = 4;
+export const MCQ_CONTENT_CHUNKS = 8;
 
 /** Placeholder / binary blobs stored instead of real text — never send to the model. */
 export function isUnusableMcqSourceText(content?: string | null): boolean {

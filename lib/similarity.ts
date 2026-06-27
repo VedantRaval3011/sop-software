@@ -32,6 +32,10 @@ export function jaccardSimilarity(a: string, b: string): number {
 /** Stricter than the legacy viewer flag — catches paraphrases and shared stems. */
 export const SIMILARITY_THRESHOLD = 0.58;
 
+/** Tighter thresholds used while generating MCQs — reject near-duplicates before they land in the bank. */
+export const MCQ_GEN_SIMILARITY_THRESHOLD = 0.48;
+export const MCQ_GEN_WORD_OVERLAP_THRESHOLD = 0.72;
+
 /** Fraction of significant words from the shorter question found in the longer one. */
 function wordOverlapRatio(a: string, b: string): number {
   const wordsA = normalizeQuestionText(a).split(/\s+/).filter((w) => w.length > 2);
@@ -50,13 +54,24 @@ export function isDuplicateMcqQuestion(
   newQ: string,
   existingQ: string,
   threshold = SIMILARITY_THRESHOLD,
+  wordOverlapThreshold = 0.82,
 ): boolean {
   const a = normalizeQuestionText(newQ);
   const b = normalizeQuestionText(existingQ);
   if (!a || !b) return false;
   if (a === b) return true;
-  if (wordOverlapRatio(newQ, existingQ) >= 0.82) return true;
+  if (wordOverlapRatio(newQ, existingQ) >= wordOverlapThreshold) return true;
   return jaccardSimilarity(newQ, existingQ) >= threshold;
+}
+
+/** Stricter duplicate check used during MCQ generation — keeps all 100 questions distinct. */
+export function isDuplicateMcqQuestionForGeneration(newQ: string, existingQ: string): boolean {
+  return isDuplicateMcqQuestion(
+    newQ,
+    existingQ,
+    MCQ_GEN_SIMILARITY_THRESHOLD,
+    MCQ_GEN_WORD_OVERLAP_THRESHOLD,
+  );
 }
 
 /** @deprecated Use isDuplicateMcqQuestion — kept for any external callers. */
