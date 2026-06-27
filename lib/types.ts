@@ -36,6 +36,11 @@ export interface RegistrySOP {
     pdf: FileLinks;
     docxDateError?: FileLinks;
   };
+  /** Which docx/pdf record slots exist on the current version (not whether fileUrl is set). */
+  fileSlots: {
+    docx: { en: boolean; gu: boolean };
+    pdf: { en: boolean; gu: boolean };
+  };
   media: {
     videos: { en: number; gu: number };
     slides: { en: number; gu: number };
