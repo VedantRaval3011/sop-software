@@ -4,6 +4,7 @@ import MCQGenJob, { type McqGenLanguage, type McqGenMode, type IMcqGenLangProgre
 import { generateJson, isGeminiOverloadedError } from "@/lib/gemini";
 import { generateOllamaJson } from "@/lib/ollama";
 import { generateClaudeCliMcqBatch, getMcqClaudeModel } from "@/lib/claude-cli";
+import { generateCodexCliMcqBatch, getMcqCodexModel } from "@/lib/codex-cli";
 import { anthropicMcqApiAvailable, generateAnthropicMcqBatch } from "@/lib/anthropic-mcq";
 import { getOrBuildClauseIndex } from "@/lib/mcq-clause-cache";
 import {
@@ -53,6 +54,7 @@ import {
   legacyBatchSize,
   maxLegacyBatches,
   mcqContentLimitClaude,
+  mcqContentLimitCodex,
   shouldUseFastFill,
 } from "@/lib/mcq-generation-config";
 
@@ -84,7 +86,7 @@ export interface GeneratedMCQ {
   sopReference: string;
 }
 
-/** Valid JSON example — Claude must follow this shape exactly. */
+/** Valid JSON example — model must follow this shape exactly. */
 const MCQ_CLAUSE_SYSTEM = `You are an MCQ generator. Respond with ONLY a JSON object (no markdown, no extra text).
 
 Schema:
@@ -124,6 +126,13 @@ async function callMcqModel(
     });
     return { questions };
   }
+  if (provider === "codex") {
+    const questions = await generateCodexCliMcqBatch(system, user, getMcqCodexModel(), {
+      runKey: identifier,
+      signal,
+    });
+    return { questions };
+  }
   if (provider === "ollama") {
     return generateOllamaJson<{ questions: GeneratedMCQ[] }>(system, user);
   }
@@ -132,6 +141,7 @@ async function callMcqModel(
 
 function mcqProviderLabel(provider?: LlmProvider): string {
   if (provider === "ollama") return "Ollama (gemma3:12b)";
+  if (provider === "codex") return `Codex CLI (${getMcqCodexModel()})`;
   if (provider === "claude") {
     const via = anthropicMcqApiAvailable() ? "Anthropic API" : "Claude CLI";
     return `${via} (${getMcqClaudeModel()})`;
@@ -141,6 +151,7 @@ function mcqProviderLabel(provider?: LlmProvider): string {
 
 function resolveMcqAiModel(provider?: LlmProvider): string {
   if (provider === "ollama") return "gemma3:12b";
+  if (provider === "codex") return getMcqCodexModel();
   if (provider === "claude") return getMcqClaudeModel();
   return process.env.GEMINI_MODEL ?? DEFAULT_FREE_GEMINI_MODEL;
 }
@@ -166,7 +177,7 @@ async function isMcqGenerationCancelled(identifier: string): Promise<boolean> {
   return Boolean(job?.cancelRequested) || job?.status === "cancelled";
 }
 
-/** Request the in-flight MCQ run for this identifier to stop (kills Claude + sets DB flag). */
+/** Request the in-flight MCQ run for this identifier to stop (kills CLI subprocess + sets DB flag). */
 export async function requestMcqGenerationCancel(identifier: string): Promise<boolean> {
   requestMcqRunStop(identifier);
 
@@ -187,7 +198,7 @@ export async function requestMcqGenerationCancel(identifier: string): Promise<bo
   return result.modifiedCount > 0 || isMcqRunStopRequested(identifier);
 }
 
-/** Stop all active MCQ jobs (DB + in-process Claude children). */
+/** Stop all active MCQ jobs (DB + in-process CLI subprocesses). */
 export async function requestMcqGenerationCancelAll(): Promise<number> {
   requestStopAllMcqRuns();
   const result = await MCQGenJob.updateMany(
@@ -435,6 +446,7 @@ function isAcceptableMcq(
   seenQuestions: string[],
   refCounts: Map<string, number>,
   allowedClauseIds?: Set<string>,
+  options?: { skipClauseRefCap?: boolean },
 ): boolean {
   if (!q?.question?.trim()) return false;
   if (seenQuestions.some((eq) => isDuplicateMcqQuestionForGeneration(q.question, eq))) return false;
@@ -449,7 +461,13 @@ function isAcceptableMcq(
     }
     if (!ok) return false;
   }
-  if (ref && refCountForClause(refCounts, ref) >= MAX_QUESTIONS_PER_CLAUSE) return false;
+  if (
+    !options?.skipClauseRefCap &&
+    ref &&
+    refCountForClause(refCounts, ref) >= MAX_QUESTIONS_PER_CLAUSE
+  ) {
+    return false;
+  }
   return true;
 }
 
@@ -470,7 +488,9 @@ async function fetchMcqQuestions(
       ? anthropicMcqApiAvailable()
         ? 1
         : CLAUDE_BATCH_ATTEMPTS
-      : 1;
+      : provider === "codex"
+        ? CLAUDE_BATCH_ATTEMPTS
+        : 1;
   let lastErr: unknown;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     if (await isMcqGenerationCancelled(identifier)) {
@@ -484,7 +504,7 @@ async function fetchMcqQuestions(
       return result.questions ?? [];
     } catch (err) {
       lastErr = err;
-      if (provider === "claude" && attempt < maxAttempts - 1) {
+      if ((provider === "claude" || provider === "codex") && attempt < maxAttempts - 1) {
         const errMsg = err instanceof Error ? err.message.slice(0, 100) : String(err).slice(0, 100);
         await pushLog(identifier, `${language} · ${batchLabel} attempt ${attempt + 1} failed — retry (${errMsg})`);
         continue;
@@ -597,7 +617,7 @@ async function generateForLanguageClauseWise(
     } catch (err) {
       ctx.failedBatches++;
       const errMsg = err instanceof Error ? err.message.slice(0, 120) : String(err).slice(0, 120);
-      if (provider !== "ollama" && provider !== "claude" && isGeminiOverloadedError(err)) {
+      if (provider !== "ollama" && provider !== "claude" && provider !== "codex" && isGeminiOverloadedError(err)) {
         ctx.overloadHits++;
         if (ctx.overloadHits >= MCQ_MAX_OVERLOAD_ABORT) {
           throw new OverloadAbortError("Gemini is overloaded (503). Please retry in a few minutes.");
@@ -605,7 +625,7 @@ async function generateForLanguageClauseWise(
         continue;
       }
       await pushLog(identifier, `${language} · ${batchLabel} failed — ${errMsg}`);
-      if (activeWork.length > 1 && provider === "claude") {
+      if (activeWork.length > 1 && (provider === "claude" || provider === "codex")) {
         activeWork = activeWork.slice(0, Math.ceil(activeWork.length / 2));
         await pushLog(identifier, `${language} · ${batchLabel} retry with ${activeWork.length} clause(s)`);
         try {
@@ -712,6 +732,7 @@ async function generateForLanguageLegacy(
   const contentLimit =
     provider === "ollama" ? MCQ_CONTENT_LIMIT_OLLAMA :
     provider === "claude" ? mcqContentLimitClaude() :
+    provider === "codex" ? mcqContentLimitCodex() :
     MCQ_CONTENT_LIMIT;
 
   const legacyMax = maxLegacyBatches();
@@ -726,6 +747,7 @@ async function generateForLanguageLegacy(
     const excerpt = mcqPromptSopExcerpt(sop.content, batch, contentLimit, MCQ_CONTENT_CHUNKS);
     const userPrompt = `${language} · ${sop.identifier}
 Generate exactly ${batchNeed} unique MCQs from this SOP excerpt. Section ${(batch % MCQ_CONTENT_CHUNKS) + 1}/${MCQ_CONTENT_CHUNKS}. Short options.
+Each question must be clearly different from any other training question on this SOP — vary the topic and wording.
 
 SOP:
 ${excerpt}`;
@@ -744,16 +766,36 @@ ${excerpt}`;
       await handleGenerationHalt(identifier, language, "cancel", bankTotal);
     }
 
+    if (!questions?.length) {
+      await pushLog(identifier, `${language} · fill batch ${batch + 1}: model returned no questions`);
+      emptyBatchStreak++;
+      if (emptyBatchStreak >= MCQ_MAX_EMPTY_BATCHES) break;
+      continue;
+    }
+
     const candidates: BankInputMcq[] = [];
     const batchSeen = [...seenQuestions];
     const batchRefCounts = new Map(refCounts);
+    let rejectedDup = 0;
     for (const q of questions) {
       if (candidates.length >= batchNeed) break;
-      if (!isAcceptableMcq(q, batchSeen, batchRefCounts)) continue;
+      if (seenQuestions.some((eq) => isDuplicateMcqQuestionForGeneration(q.question, eq))) {
+        rejectedDup++;
+        continue;
+      }
+      if (!isAcceptableMcq(q, batchSeen, batchRefCounts, undefined, { skipClauseRefCap: true })) continue;
       batchSeen.push(q.question);
       const ref = normalizeMcqClauseRef(q.sopReference);
       if (ref) batchRefCounts.set(ref, (batchRefCounts.get(ref) ?? 0) + 1);
       candidates.push(toBankInput(q));
+    }
+
+    if (candidates.length === 0 && questions.length > 0) {
+      await pushLog(
+        identifier,
+        `${language} · fill batch ${batch + 1}: ${questions.length} parsed, 0 accepted` +
+          (rejectedDup > 0 ? ` (${rejectedDup} near-duplicates of existing bank)` : ""),
+      );
     }
 
     const prev = bankTotal;

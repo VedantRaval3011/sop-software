@@ -1,5 +1,5 @@
 /**
- * Force-stop MCQ generation from the terminal (kills Claude + marks jobs cancelled).
+ * Force-stop MCQ generation from the terminal (kills CLI subprocesses + marks jobs cancelled).
  *
  * Usage:
  *   npx tsx scripts/stop-mcq-gen.ts                  # stop ALL active jobs

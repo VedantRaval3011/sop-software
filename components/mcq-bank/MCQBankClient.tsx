@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import {
   AlertTriangle,
   BookOpen,
+  Bot,
   CheckCircle2,
   ChevronDown,
   Copy,
@@ -30,9 +31,8 @@ import { DeptDetailModal } from "./DeptDetailModal";
 import { DeptGridSkeleton } from "./MCQSkeleton";
 import { displaySopCode, displaySopTitle } from "@/lib/sop-display";
 
-// ─────────────────────────────────────────────────────────────
-// Types
-// ─────────────────────────────────────────────────────────────
+type McqGenProvider = "claude" | "codex" | "ollama";
+
 interface DeptMCQStats {
   department: string;
   sopCount: number;
@@ -1215,7 +1215,7 @@ export function MCQBankClient() {
   // UI state
   const [showDeptCards, setShowDeptCards] = useState(true);
   const [refreshKey, setRefreshKey] = useState(0);
-  const [selectedProvider, setSelectedProvider] = useState<"claude" | "ollama">("claude");
+  const [selectedProvider, setSelectedProvider] = useState<McqGenProvider>("claude");
   const [claudeStatus, setClaudeStatus] = useState<{
     ok: boolean;
     model?: string;
@@ -1223,6 +1223,15 @@ export function MCQBankClient() {
     mcqApiDirect?: boolean;
     email?: string;
     subscriptionType?: string;
+    error?: string;
+    loading?: boolean;
+  } | null>(null);
+  const [codexStatus, setCodexStatus] = useState<{
+    ok: boolean;
+    model?: string;
+    mcqModel?: string;
+    authMode?: string;
+    codexVersion?: string;
     error?: string;
     loading?: boolean;
   } | null>(null);
@@ -1311,6 +1320,39 @@ export function MCQBankClient() {
         setClaudeStatus({
           ok: false,
           error: e instanceof Error ? e.message : "Could not check Claude status",
+          loading: false,
+        });
+      });
+    return () => { cancelled = true; };
+  }, [selectedProvider]);
+
+  useEffect(() => {
+    if (selectedProvider !== "codex") {
+      setCodexStatus(null);
+      return;
+    }
+    let cancelled = false;
+    setCodexStatus({ ok: false, loading: true });
+    fetch("/api/llm/codex-status")
+      .then((res) => res.json())
+      .then((data) => {
+        if (cancelled) return;
+        const c = data.codex ?? {};
+        setCodexStatus({
+          ok: Boolean(data.success && c.loggedIn),
+          model: c.model,
+          mcqModel: c.mcqModel,
+          authMode: c.authMode,
+          codexVersion: c.codexVersion,
+          error: c.error,
+          loading: false,
+        });
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setCodexStatus({
+          ok: false,
+          error: e instanceof Error ? e.message : "Could not check Codex status",
           loading: false,
         });
       });
@@ -1516,7 +1558,7 @@ export function MCQBankClient() {
         body: JSON.stringify({
           identifier: entry.identifier,
           ...(language ? { language } : {}),
-          provider: selectedProvider === "ollama" ? "ollama" : "claude",
+          provider: selectedProvider,
         }),
       });
       if (!res.ok) {
@@ -1561,7 +1603,7 @@ export function MCQBankClient() {
           identifier: entry.identifier,
           mode: "continue",
           ...(language ? { language } : {}),
-          provider: selectedProvider === "ollama" ? "ollama" : "claude",
+          provider: selectedProvider,
         }),
       });
       if (!res.ok) {
@@ -2040,7 +2082,7 @@ export function MCQBankClient() {
                   onClick={() => void stopAllGeneration()}
                   disabled={stopAllLoading}
                   className="flex items-center gap-1.5 rounded-lg border border-rose-300 bg-rose-50 px-3 py-1.5 text-xs font-semibold text-rose-700 hover:bg-rose-100 disabled:opacity-60"
-                  title="Emergency stop — kills all in-flight Claude MCQ generation"
+                  title="Emergency stop — kills all in-flight MCQ generation"
                 >
                   {stopAllLoading ? (
                     <><Loader2 className="h-3.5 w-3.5 animate-spin" /> Stopping…</>
@@ -2077,8 +2119,35 @@ export function MCQBankClient() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => setSelectedProvider((p) => (p === "ollama" ? "claude" : "ollama"))}
-                  title={selectedProvider === "ollama" ? "Using local Ollama model (gemma3:12b) — click to switch back to Claude" : "Click to use local Ollama model (gemma3:12b) for MCQ generation"}
+                  onClick={() => setSelectedProvider("codex")}
+                  title={
+                    selectedProvider === "codex" && codexStatus?.ok
+                      ? `Codex via your ChatGPT subscription (${codexStatus.mcqModel ?? "gpt-5.4-mini"}) — local CLI, no API key`
+                      : selectedProvider === "codex" && codexStatus?.error
+                        ? `Codex not connected: ${codexStatus.error}`
+                        : "Codex gpt-5.4-mini — local CLI via ChatGPT subscription (no API key)"
+                  }
+                  className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors ${
+                    selectedProvider === "codex"
+                      ? codexStatus?.ok === false && !codexStatus?.loading
+                        ? "border border-red-600 bg-red-600 text-white hover:bg-red-700 ring-2 ring-red-300"
+                        : "border border-sky-600 bg-sky-600 text-white hover:bg-sky-700 ring-2 ring-sky-300"
+                      : "border border-slate-300 bg-white text-slate-600 hover:bg-slate-50"
+                  }`}
+                >
+                  <Bot className="h-3.5 w-3.5" />
+                  {selectedProvider === "codex"
+                    ? codexStatus?.loading
+                      ? "Codex…"
+                      : codexStatus?.ok
+                        ? "Codex ✓"
+                        : "Codex !"
+                    : "Codex"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSelectedProvider("ollama")}
+                  title={selectedProvider === "ollama" ? "Using local Ollama model (gemma3:12b)" : "Use local Ollama model (gemma3:12b) for MCQ generation"}
                   className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors ${
                     selectedProvider === "ollama"
                       ? "border border-emerald-600 bg-emerald-600 text-white hover:bg-emerald-700 ring-2 ring-emerald-300"
@@ -2150,6 +2219,31 @@ export function MCQBankClient() {
                 <>
                   Claude is not connected on this machine. Run <code className="rounded bg-red-100 px-1">claude auth login</code> in a terminal, then refresh.
                   {claudeStatus.error ? ` — ${claudeStatus.error}` : ""}
+                </>
+              )}
+            </div>
+          )}
+
+          {selectedProvider === "codex" && codexStatus && !codexStatus.loading && (
+            <div
+              className={`rounded-lg border px-4 py-3 text-sm ${
+                codexStatus.ok
+                  ? "border-sky-200 bg-sky-50 text-sky-900"
+                  : "border-red-200 bg-red-50 text-red-700"
+              }`}
+            >
+              {codexStatus.ok ? (
+                <>
+                  Codex is connected via your ChatGPT subscription
+                  {codexStatus.authMode ? ` (${codexStatus.authMode})` : ""}
+                  {" · "}MCQ model: <strong>{codexStatus.mcqModel ?? "gpt-5.4-mini"}</strong>
+                  {codexStatus.codexVersion ? ` · CLI v${codexStatus.codexVersion}` : ""}
+                  {" · "}No OpenAI API key required — uses local <code className="rounded bg-sky-100 px-1">codex exec</code>
+                </>
+              ) : (
+                <>
+                  Codex is not connected on this machine. Run <code className="rounded bg-red-100 px-1">codex login</code> in a terminal, then refresh.
+                  {codexStatus.error ? ` — ${codexStatus.error}` : ""}
                 </>
               )}
             </div>

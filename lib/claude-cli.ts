@@ -1,6 +1,6 @@
 import { spawn } from "child_process";
 import { errorMessage, isJsonParseError, parseJsonFromText, sleep } from "@/lib/llm-utils";
-import { registerMcqClaudeProc, unregisterMcqClaudeProc } from "@/lib/mcq-run-control";
+import { registerMcqSubprocess, unregisterMcqSubprocess } from "@/lib/mcq-run-control";
 import { parseMcqBatchJson, type ParsedMcq } from "@/lib/mcq-json-parse";
 
 /** Default MCQ batch (25 questions + large SOP) often exceeds 2 minutes on Sonnet. */
@@ -165,7 +165,7 @@ export async function generateClaudeCliJson<T>(
         });
 
         if (options?.runKey) {
-          registerMcqClaudeProc(options.runKey, proc);
+          registerMcqSubprocess(options.runKey, proc);
         }
 
         let stdout = "";
@@ -176,7 +176,7 @@ export async function generateClaudeCliJson<T>(
           if (settled) return;
           settled = true;
           clearTimeout(timer);
-          if (options?.runKey) unregisterMcqClaudeProc(options.runKey);
+          if (options?.runKey) unregisterMcqSubprocess(options.runKey);
           fn();
         };
 
@@ -276,10 +276,7 @@ function wrapMcqCliPrompt(system: string, user: string): string {
 
 ${user}
 
-Respond with ONLY a single JSON object — no markdown fences, no commentary before or after.
-Required shape:
-{"questions":[{"question":"...","optionA":"...","optionB":"...","optionC":"...","optionD":"...","correctAnswer":"A","difficulty":"medium","sopReference":"<exact-clause-id>"}]}
-Include at least one question for every clause id listed above.`;
+Respond with ONLY raw JSON — no markdown fences or commentary.`;
 }
 
 /** Claude CLI for MCQ batches — uses salvage parser + JSON retry hint. */
@@ -328,7 +325,7 @@ async function runClaudeCliPrompt(
       shell: true,
     });
 
-    if (options?.runKey) registerMcqClaudeProc(options.runKey, proc);
+    if (options?.runKey) registerMcqSubprocess(options.runKey, proc);
 
     let stdout = "";
     let stderr = "";
@@ -338,7 +335,7 @@ async function runClaudeCliPrompt(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      if (options?.runKey) unregisterMcqClaudeProc(options.runKey);
+      if (options?.runKey) unregisterMcqSubprocess(options.runKey);
       fn();
     };
 

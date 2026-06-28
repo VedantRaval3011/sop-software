@@ -2,7 +2,8 @@ import type { ChildProcess } from "child_process";
 import { normalizeSopIdentifierKey } from "@/lib/sopIdentifierNormalize";
 
 const cancelledKeys = new Set<string>();
-const claudeProcs = new Map<string, ChildProcess>();
+/** Child processes spawned by local CLI providers (e.g. Claude Code) — killed on cancel. */
+const subprocessProcs = new Map<string, ChildProcess>();
 const runControllers = new Map<string, AbortController>();
 
 /** Canonical key so PRCL17-05 and PRCL17-5 share one run/cancel slot. */
@@ -23,17 +24,17 @@ export function endMcqRun(identifier: string): void {
   const key = mcqRunKey(identifier);
   cancelledKeys.delete(key);
   runControllers.delete(key);
-  const proc = claudeProcs.get(key);
+  const proc = subprocessProcs.get(key);
   if (proc && !proc.killed) proc.kill();
-  claudeProcs.delete(key);
+  subprocessProcs.delete(key);
 }
 
-/** In-process stop: flag + abort signal + kill Claude CLI child if running. */
+/** In-process stop: flag + abort signal + kill CLI subprocess if running. */
 export function requestMcqRunStop(identifier: string): void {
   const key = mcqRunKey(identifier);
   cancelledKeys.add(key);
   runControllers.get(key)?.abort();
-  const proc = claudeProcs.get(key);
+  const proc = subprocessProcs.get(key);
   if (proc && !proc.killed) {
     try {
       proc.kill();
@@ -56,17 +57,22 @@ export function isMcqRunActiveInProcess(identifier: string): boolean {
   return runControllers.has(mcqRunKey(identifier));
 }
 
-export function registerMcqClaudeProc(identifier: string, proc: ChildProcess): void {
-  claudeProcs.set(mcqRunKey(identifier), proc);
+export function registerMcqSubprocess(identifier: string, proc: ChildProcess): void {
+  subprocessProcs.set(mcqRunKey(identifier), proc);
 }
 
-export function unregisterMcqClaudeProc(identifier: string): void {
-  claudeProcs.delete(mcqRunKey(identifier));
+export function unregisterMcqSubprocess(identifier: string): void {
+  subprocessProcs.delete(mcqRunKey(identifier));
 }
+
+/** @deprecated Use registerMcqSubprocess */
+export const registerMcqClaudeProc = registerMcqSubprocess;
+/** @deprecated Use unregisterMcqSubprocess */
+export const unregisterMcqClaudeProc = unregisterMcqSubprocess;
 
 /** Emergency: stop every in-process MCQ run (dev server). */
 export function requestStopAllMcqRuns(): void {
-  for (const key of new Set([...runControllers.keys(), ...claudeProcs.keys(), ...cancelledKeys])) {
+  for (const key of new Set([...runControllers.keys(), ...subprocessProcs.keys(), ...cancelledKeys])) {
     requestMcqRunStop(key);
   }
 }

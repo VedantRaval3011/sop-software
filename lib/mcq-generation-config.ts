@@ -34,6 +34,9 @@ export function clausesPerCall(provider?: LlmProvider): number {
     }
     return Number(process.env.MCQ_CLAUSES_PER_CALL_CLI) || 5;
   }
+  if (provider === "codex") {
+    return Number(process.env.MCQ_CLAUSES_PER_CALL_CODEX) || 5;
+  }
   return base;
 }
 
@@ -45,6 +48,9 @@ export function legacyBatchSize(provider?: LlmProvider, gap = 100): number {
       return Math.min(Number(process.env.MCQ_LEGACY_BATCH_API) || 40, room);
     }
     return Math.min(Number(process.env.MCQ_LEGACY_BATCH_CLI) || 15, room);
+  }
+  if (provider === "codex") {
+    return Math.min(Number(process.env.MCQ_LEGACY_BATCH_CODEX) || 12, room);
   }
   if (provider === "ollama") {
     return Math.min(Number(process.env.MCQ_LEGACY_BATCH_OLLAMA) || 20, room);
@@ -58,4 +64,8 @@ export function maxLegacyBatches(): number {
 
 export function mcqContentLimitClaude(): number {
   return Number(process.env.MCQ_CONTENT_LIMIT_CLAUDE) || 6_000;
+}
+
+export function mcqContentLimitCodex(): number {
+  return Number(process.env.MCQ_CONTENT_LIMIT_CODEX) || 6_000;
 }
