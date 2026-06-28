@@ -1,36 +1,75 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# SOP Software
 
-## Getting Started
+Pharma SOP management platform with MCQ generation for LMS training, regulatory compliance auditing, and training-matrix workflows.
 
-First, run the development server:
+**Stack:** Next.js 16, TypeScript, MongoDB, Gemini / Claude / Ollama.
+
+## Getting started
 
 ```bash
+npm install
+cp .env.example .env.local   # Windows: copy .env.example .env.local
+# Edit .env.local — at minimum set MONGODB_URI
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000). Seed an admin user with `npm run seed:admin`.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## AI coding agents (Claude Code or Codex)
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+This codebase is designed to be developed with either **Claude Code** or **OpenAI Codex** interchangeably. Both read shared instructions from [`AGENTS.md`](./AGENTS.md).
 
-## Learn More
+| Tool | Entry file | Docs |
+|------|------------|------|
+| Claude Code | [`CLAUDE.md`](./CLAUDE.md) | `claude auth login` |
+| OpenAI Codex | [`CODEX.md`](./CODEX.md) | [docs/codex-setup.md](./docs/codex-setup.md) |
 
-To learn more about Next.js, take a look at the following resources:
+Edit `AGENTS.md` for project-wide agent rules (architecture, commands, conventions). Tool-specific setup lives in the docs above.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Runtime LLM providers
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+The **application** uses LLM APIs at runtime for MCQ generation and compliance — independent of which coding agent you use.
 
-## Deploy on Vercel
+| Task | Default provider | Config |
+|------|------------------|--------|
+| MCQ generation | Claude (CLI or Anthropic API) | `LLM_PROVIDER=claude` |
+| Compliance analysis | Gemini | `LLM_COMPLIANCE_PROVIDER=gemini` |
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+Set `ANTHROPIC_API_KEY` for faster MCQ generation via the Anthropic API (no local `claude` CLI required). Set `GEMINI_API_KEY` for compliance. See [`.env.example`](./.env.example) for all variables.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## Key features
+
+- **SOP registry** — Upload DOCX/PDF, version tracking, Bunny CDN storage
+- **MCQ bank** — Async batch generation (up to 100 MCQs per SOP/language), progress polling, retry/cancel
+- **Compliance** — Audit SOPs against ICH, EU-GMP, WHO, PIC/S guidelines
+- **LMS** — Training journeys, quizzes, certificates
+- **Training matrices** — Department assignments and induction tracking
+
+## Project layout
+
+```
+app/          Next.js pages and API routes
+lib/          Business logic (MCQ, compliance, LLM, caches)
+models/       Mongoose schemas
+components/   React UI
+scripts/      Dev server, diagnostics, seeds
+memory/       Agent-oriented project notes
+```
+
+## Scripts
+
+| Command | Description |
+|---------|-------------|
+| `npm run dev` | Dev server (frees port 3000 first) |
+| `npm run dev:clean` | Clean `.next` and start |
+| `npm run build` | Production build |
+| `npm run lint` | ESLint |
+| `npm run seed:admin` | Create admin user |
+
+**MCQ diagnostics:** `npx tsx scripts/diag-mcqgen.ts` · **Force-stop jobs:** `npx tsx scripts/stop-mcq-gen.ts`
+
+## Learn more
+
+- Agent instructions: [`AGENTS.md`](./AGENTS.md)
+- Codex setup: [`docs/codex-setup.md`](./docs/codex-setup.md)
+- Cache invalidation rules: [`memory/sop-cache-instant-sync.md`](./memory/sop-cache-instant-sync.md)

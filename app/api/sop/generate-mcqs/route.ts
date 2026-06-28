@@ -22,6 +22,7 @@ export async function POST(request: NextRequest) {
     const provider =
       p === "ollama" ? "ollama" :
       p === "gemini" ? "gemini" :
+      p === "codex" ? "codex" :
       "claude";
     const modeOverride = body.mode === "continue" ? "continue" : undefined;
     const languageScope = parseMcqLanguage(body.language);
