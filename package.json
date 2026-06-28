@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "dev:clean": "node scripts/dev.mjs --clean",
-    "seed:admin": "node scripts/seed-admin.mjs",
+    "stop:compliance": "node scripts/call-compliance-cancel.mjs",
     "build": "next build",
     "start": "next start",
     "lint": "eslint"

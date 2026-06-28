@@ -137,8 +137,10 @@ sopReference MUST be the clause id exactly as shown in brackets (e.g. "${example
 
 Required clause ids (${clauses.length}): ${ids.join(", ")}
 
-Example (one question):
-{"questions":[{"question":"What is the main purpose described in clause ${exampleId}?","optionA":"Training only","optionB":"Quality control","optionC":"Documentation","optionD":"Not specified","correctAnswer":"B","difficulty":"medium","sopReference":"${exampleId}"}]}
+Example (one question — procedural, not metadata):
+{"questions":[{"question":"What must the operator do immediately after a temperature excursion is detected?","optionA":"Record only","optionB":"Notify supervisor and follow deviation steps","optionC":"Discard product at once","optionD":"Restart equipment","correctAnswer":"B","difficulty":"medium","sopReference":"${exampleId}"}]}
+
+Test procedure execution — NOT document number, dates, revision, page count, or section location.
 
 Clauses:
 ${formatClauseBatchForPrompt(clauses)}`;

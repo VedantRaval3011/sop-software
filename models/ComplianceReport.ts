@@ -38,6 +38,13 @@ export interface IComplianceFindingDetail {
   whyApplies?: string;
   whyEvidenceInsufficient?: string;
   whyScoreReduced?: string;
+
+  /** Persisted gap tracking (compliance remediation system) */
+  gapId?: string;
+  resolved?: boolean;
+  lastReviewedAt?: Date;
+  sopTextHash?: string;
+  requirementHash?: string;
 }
 
 export interface ITraceabilityMatrixEntry {
@@ -136,6 +143,12 @@ export interface IComplianceReport extends Document {
   crossSopDependencies?: ICrossSopDependency[];
   analysisEngineVersion?: string;
 
+  /** Content hashes for incremental review cache invalidation */
+  sopContentHash?: string;
+  guidelineSetHash?: string;
+  /** Per-guideline content hashes — enables skipping unchanged guidelines on re-runs */
+  guidelineHashes?: Map<string, string>;
+
   findings: IComplianceFindingDetail[];
 
   analyzedAt: Date;
@@ -230,8 +243,18 @@ const ComplianceReportSchema = new Schema<IComplianceReport>(
         whyApplies: { type: String },
         whyEvidenceInsufficient: { type: String },
         whyScoreReduced: { type: String },
+
+        gapId: { type: String, trim: true, index: true },
+        resolved: { type: Boolean, default: false },
+        lastReviewedAt: { type: Date },
+        sopTextHash: { type: String, trim: true },
+        requirementHash: { type: String, trim: true },
       },
     ],
+
+    sopContentHash: { type: String, trim: true },
+    guidelineSetHash: { type: String, trim: true },
+    guidelineHashes: { type: Map, of: String },
 
     criticalCount: { type: Number, default: 0 },
     majorCount: { type: Number, default: 0 },

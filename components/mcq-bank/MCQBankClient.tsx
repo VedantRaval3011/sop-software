@@ -30,6 +30,7 @@ import { MCQViewerModal } from "./MCQViewerModal";
 import { DeptDetailModal } from "./DeptDetailModal";
 import { DeptGridSkeleton } from "./MCQSkeleton";
 import { displaySopCode, displaySopTitle } from "@/lib/sop-display";
+import { normalizeSopIdentifierKey } from "@/lib/sopIdentifierNormalize";
 
 type McqGenProvider = "claude" | "codex" | "ollama";
 
@@ -814,6 +815,77 @@ function McqGenProgressModal({
   );
 }
 
+function genBankProgress(progress: GenProgress) {
+  const langs = progress.languages?.length
+    ? progress.languages
+    : [{
+        collected: progress.totalInserted ?? 0,
+        target: MCQ_BANK_CAP,
+      }];
+  const totalInBank = langs.reduce(
+    (s, l) => s + Math.min(l.collected ?? 0, l.target || MCQ_BANK_CAP),
+    0,
+  );
+  const totalTarget = langs.reduce((s, l) => s + (l.target || MCQ_BANK_CAP), 0) || MCQ_BANK_CAP;
+  const bankPercent = Math.min(100, Math.round((totalInBank / totalTarget) * 100));
+  const barPercent = Math.max(bankPercent, progress.percent ?? 0);
+  return { totalInBank, totalTarget, bankPercent, barPercent };
+}
+
+/** Bottom-right toast for in-flight generation — survives page refresh via active-job resume. */
+function McqGenProgressToast({
+  items,
+  onOpen,
+}: {
+  items: { entry: RegistryEntry; progress: GenProgress }[];
+  onOpen: (entry: RegistryEntry) => void;
+}) {
+  if (items.length === 0) return null;
+
+  return (
+    <div className="fixed bottom-4 right-4 z-[75] flex max-w-sm flex-col gap-2 pointer-events-none">
+      {items.map(({ entry, progress }) => {
+        const { totalInBank, totalTarget, barPercent } = genBankProgress(progress);
+        const sopCode = displaySopCode(entry.identifier);
+        return (
+          <div
+            key={entry.id}
+            className="pointer-events-auto overflow-hidden rounded-xl border border-violet-200 bg-white shadow-lg ring-1 ring-black/5 animate-in slide-in-from-bottom-2 fade-in duration-300"
+          >
+            <button
+              type="button"
+              onClick={() => onOpen(entry)}
+              className="flex w-full items-start gap-3 px-4 py-3 text-left transition-colors hover:bg-violet-50/80"
+            >
+              <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-violet-600" />
+              <div className="min-w-0 flex-1">
+                <p className="text-[11px] font-bold uppercase tracking-wide text-violet-700">
+                  Generation in progress
+                </p>
+                <p className="truncate text-xs font-semibold text-gray-800">{sopCode}</p>
+                <p className="mt-0.5 truncate text-[10px] text-gray-500">
+                  {progress.phase ?? "Running…"} · stops at {MCQ_BANK_CAP} MCQs
+                </p>
+                <div className="mt-2 flex items-center gap-2">
+                  <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-violet-100">
+                    <div
+                      className="h-full rounded-full bg-violet-600 transition-all duration-500"
+                      style={{ width: `${Math.min(100, barPercent)}%` }}
+                    />
+                  </div>
+                  <span className="shrink-0 text-[10px] font-bold tabular-nums text-violet-700">
+                    {totalInBank}/{totalTarget}
+                  </span>
+                </div>
+              </div>
+            </button>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function ActionBtn({
   label, variant, disabled, loading, icon: Icon, onClick,
 }: {
@@ -1242,6 +1314,19 @@ export function MCQBankClient() {
   const pollingRef = useRef<Set<string>>(new Set());
   const pollAbortRef = useRef<Set<string>>(new Set());
   const resumedJobsRef = useRef<Set<string>>(new Set());
+  const pendingActiveJobsRef = useRef<Array<{
+    identifier: string;
+    mode?: GenProgress["mode"];
+    languageScope?: McqLang;
+    phase?: string;
+    percent?: number;
+    totalInserted?: number;
+    totalSkipped?: number;
+    totalFailedBatches?: number;
+    languages?: GenProgress["languages"];
+    logs?: string[];
+    startedAt?: string;
+  }>>([]);
   const runStartedAtRef = useRef<Record<string, number>>({});
   const [genStopping, setGenStopping] = useState(false);
   const [stopAllLoading, setStopAllLoading] = useState(false);
@@ -1482,6 +1567,75 @@ export function MCQBankClient() {
     setTimeout(tick, 800);
   }, []);
 
+  const attachGenerationJob = useCallback((
+    entry: RegistryEntry,
+    job: {
+      mode?: GenProgress["mode"];
+      languageScope?: McqLang;
+      startedAt?: string;
+      alreadyRunning?: boolean;
+    },
+    language?: McqLang,
+    options?: { openModal?: boolean },
+  ) => {
+    const runStartedAt = job.startedAt ? new Date(job.startedAt).getTime() : Date.now();
+    runStartedAtRef.current[entry.id] = runStartedAt;
+    setGenStatus((s) => ({
+      ...s,
+      [entry.id]: {
+        status: "generating",
+        mode: job.mode,
+        languageScope: job.languageScope ?? language,
+        phase: job.alreadyRunning ? "Resuming…" : "Queued",
+        percent: 0,
+        logs: s[entry.id]?.logs ?? [],
+        runStartedAt,
+      },
+    }));
+    if (options?.openModal) setGenModalEntry(entry);
+    pollJob(entry);
+  }, [pollJob]);
+
+  const tryResumeActiveJobs = useCallback((entries: RegistryEntry[]) => {
+    if (pendingActiveJobsRef.current.length === 0) return;
+
+    const remaining: typeof pendingActiveJobsRef.current = [];
+    for (const job of pendingActiveJobsRef.current) {
+      const jobKey = normalizeSopIdentifierKey(job.identifier);
+      const entry = entries.find(
+        (e) => normalizeSopIdentifierKey(e.identifier) === jobKey,
+      );
+      if (!entry) {
+        remaining.push(job);
+        continue;
+      }
+      if (resumedJobsRef.current.has(entry.id) || pollingRef.current.has(entry.id)) {
+        continue;
+      }
+      resumedJobsRef.current.add(entry.id);
+      const runStartedAt = job.startedAt ? new Date(job.startedAt).getTime() : Date.now();
+      runStartedAtRef.current[entry.id] = runStartedAt;
+      setGenStatus((s) => ({
+        ...s,
+        [entry.id]: {
+          status: "generating",
+          mode: job.mode,
+          languageScope: job.languageScope,
+          phase: job.phase ?? "Running…",
+          percent: job.percent ?? 0,
+          totalInserted: job.totalInserted,
+          totalSkipped: job.totalSkipped,
+          totalFailedBatches: job.totalFailedBatches,
+          languages: job.languages,
+          logs: job.logs ?? [],
+          runStartedAt,
+        },
+      }));
+      pollJob(entry);
+    }
+    pendingActiveJobsRef.current = remaining;
+  }, [pollJob]);
+
   const stopGeneration = useCallback(async (entry: RegistryEntry) => {
     setGenStopping(true);
     try {
@@ -1546,7 +1700,6 @@ export function MCQBankClient() {
   }, []);
 
   const handleGenerate = useCallback(async (entry: RegistryEntry, language?: McqLang) => {
-    setGenModalEntry(entry);
     setGenStatus((s) => ({
       ...s,
       [entry.id]: { status: "generating", languageScope: language, phase: "Starting…", percent: 0, logs: [] },
@@ -1561,36 +1714,19 @@ export function MCQBankClient() {
           provider: selectedProvider,
         }),
       });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.error ?? "Generation failed");
-      }
-      const job = await res.json().catch(() => ({}));
-      const runStartedAt = job.startedAt ? new Date(job.startedAt).getTime() : Date.now();
-      runStartedAtRef.current[entry.id] = runStartedAt;
-      setGenStatus((s) => ({
-        ...s,
-        [entry.id]: {
-          status: "generating",
-          mode: job.mode,
-          languageScope: job.languageScope ?? language,
-          phase: "Queued",
-          percent: 0,
-          logs: [],
-          runStartedAt,
-        },
-      }));
-      pollJob(entry);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error ?? "Generation failed");
+      attachGenerationJob(entry, data, language, { openModal: !data.alreadyRunning });
     } catch (e) {
       setGenStatus((s) => ({
         ...s,
         [entry.id]: { status: "error", error: e instanceof Error ? e.message : "Generation failed" },
       }));
+      setGenModalEntry(entry);
     }
-  }, [pollJob, selectedProvider]);
+  }, [attachGenerationJob, selectedProvider]);
 
   const handleContinue = useCallback(async (entry: RegistryEntry, language?: McqLang) => {
-    setGenModalEntry(entry);
     setGenStatus((s) => ({
       ...s,
       [entry.id]: { status: "generating", mode: "continue", languageScope: language, phase: "Starting…", percent: 0, logs: [] },
@@ -1606,33 +1742,17 @@ export function MCQBankClient() {
           provider: selectedProvider,
         }),
       });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.error ?? "Continue generation failed");
-      }
-      const job = await res.json().catch(() => ({}));
-      const runStartedAt = job.startedAt ? new Date(job.startedAt).getTime() : Date.now();
-      runStartedAtRef.current[entry.id] = runStartedAt;
-      setGenStatus((s) => ({
-        ...s,
-        [entry.id]: {
-          ...s[entry.id],
-          status: "generating",
-          mode: "continue",
-          languageScope: language,
-          phase: "Queued",
-          percent: 0,
-          runStartedAt,
-        },
-      }));
-      pollJob(entry);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error ?? "Continue generation failed");
+      attachGenerationJob(entry, { ...data, mode: "continue" }, language, { openModal: !data.alreadyRunning });
     } catch (e) {
       setGenStatus((s) => ({
         ...s,
         [entry.id]: { status: "error", error: e instanceof Error ? e.message : "Continue generation failed" },
       }));
+      setGenModalEntry(entry);
     }
-  }, [pollJob, selectedProvider]);
+  }, [attachGenerationJob, selectedProvider]);
 
   // Open the password prompt for an SOP the user wants to regenerate.
   const requestRegenerate = useCallback((entry: RegistryEntry, language?: McqLang) => {
@@ -1708,66 +1828,39 @@ export function MCQBankClient() {
     setGenModalEntry(null);
   }, []);
 
-  // Resume polling for server-side jobs still running after page reload or modal close.
+  // Fetch in-flight jobs once on mount; attach when registry rows are available.
   useEffect(() => {
-    if (allActiveEntries.length === 0) return;
     let cancelled = false;
-
     (async () => {
       try {
         const res = await fetch("/api/sop/generate-mcqs/active");
         if (!res.ok || cancelled) return;
         const data = await res.json();
-        const jobs: Array<{
-          identifier: string;
-          mode?: GenProgress["mode"];
-          languageScope?: McqLang;
-          phase?: string;
-          percent?: number;
-          totalInserted?: number;
-          totalSkipped?: number;
-          totalFailedBatches?: number;
-          languages?: GenProgress["languages"];
-          logs?: string[];
-          startedAt?: string;
-        }> = data.jobs ?? [];
-
-        for (const job of jobs) {
-          if (cancelled) return;
-          const entry = allActiveEntries.find(
-            (e) => e.identifier.toLowerCase() === job.identifier.toLowerCase(),
-          );
-          if (!entry || resumedJobsRef.current.has(entry.id) || pollingRef.current.has(entry.id)) {
-            continue;
-          }
-          resumedJobsRef.current.add(entry.id);
-          const runStartedAt = job.startedAt ? new Date(job.startedAt).getTime() : Date.now();
-          runStartedAtRef.current[entry.id] = runStartedAt;
-          setGenStatus((s) => ({
-            ...s,
-            [entry.id]: {
-              status: "generating",
-              mode: job.mode,
-              languageScope: job.languageScope,
-              phase: job.phase ?? "Running…",
-              percent: job.percent ?? 0,
-              totalInserted: job.totalInserted,
-              totalSkipped: job.totalSkipped,
-              totalFailedBatches: job.totalFailedBatches,
-              languages: job.languages,
-              logs: job.logs ?? [],
-              runStartedAt,
-            },
-          }));
-          pollJob(entry);
-        }
+        pendingActiveJobsRef.current = data.jobs ?? [];
+        tryResumeActiveJobs(allActiveEntries);
       } catch {
-        /* ignore — will retry on next registry refresh */
+        /* registry effect retries when entries load */
       }
     })();
-
     return () => { cancelled = true; };
-  }, [allActiveEntries, pollJob]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- mount fetch only
+  }, []);
+
+  useEffect(() => {
+    tryResumeActiveJobs(allActiveEntries);
+  }, [allActiveEntries, tryResumeActiveJobs]);
+
+  const activeGenToasts = useMemo(() => {
+    const entries = [...allActiveEntries, ...allObsoleteEntries];
+    return Object.entries(genStatus)
+      .filter(([, p]) => p.status === "generating")
+      .map(([id, progress]) => {
+        const entry = entries.find((e) => e.id === id);
+        return entry ? { entry, progress } : null;
+      })
+      .filter((x): x is { entry: RegistryEntry; progress: GenProgress } => x !== null)
+      .filter(({ entry }) => genModalEntry?.id !== entry.id);
+  }, [genStatus, allActiveEntries, allObsoleteEntries, genModalEntry]);
 
   const handleSort = (field: string) => {
     if (sortCol === field) setSortDir((d) => (d === "asc" ? "desc" : "asc"));
@@ -1925,6 +2018,8 @@ export function MCQBankClient() {
           stopping={genStopping}
         />
       )}
+
+      <McqGenProgressToast items={activeGenToasts} onOpen={setGenModalEntry} />
 
       {/* Regenerate password prompt — gates the destructive "archive + regenerate"
           action behind a password so it isn't triggered by an accidental click. */}

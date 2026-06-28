@@ -53,6 +53,57 @@ export function stripMarkdownFences(text: string): string {
   return text.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
 }
 
+/** Pull the outermost JSON object or array from Codex/CLI stdout (may include prose). */
+export function extractJsonPayload(text: string): string {
+  const trimmed = stripMarkdownFences(text.trim());
+  if (!trimmed) return trimmed;
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) return trimmed;
+
+  const arrayStart = trimmed.indexOf("[");
+  const objectStart = trimmed.indexOf("{");
+  let start = -1;
+  let open = "";
+  let close = "";
+
+  if (arrayStart >= 0 && (objectStart < 0 || arrayStart < objectStart)) {
+    start = arrayStart;
+    open = "[";
+    close = "]";
+  } else if (objectStart >= 0) {
+    start = objectStart;
+    open = "{";
+    close = "}";
+  } else {
+    return trimmed;
+  }
+
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < trimmed.length; i++) {
+    const ch = trimmed[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (ch === "\\" && inString) {
+      escape = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (ch === open) depth++;
+    if (ch === close) {
+      depth--;
+      if (depth === 0) return trimmed.slice(start, i + 1);
+    }
+  }
+  return trimmed.slice(start);
+}
+
 /** Salvage complete JSON objects from truncated responses (compliance findings or MCQs). */
 export function extractCompleteObjects(text: string): unknown[] {
   const objects: unknown[] = [];
@@ -70,7 +121,10 @@ export function extractCompleteObjects(text: string): unknown[] {
         const chunk = text.slice(start, i + 1);
         const isFinding = chunk.includes('"clauseNumber"') || chunk.includes('"complianceLevel"');
         const isMcq = chunk.includes('"question"') && chunk.includes('"correctAnswer"');
-        if (isFinding || isMcq) {
+        const isFact =
+          chunk.includes('"fact"') ||
+          (chunk.includes('"topic"') && (chunk.includes('"id"') || chunk.includes('"factId"')));
+        if (isFinding || isMcq || isFact) {
           try {
             objects.push(JSON.parse(chunk));
           } catch {

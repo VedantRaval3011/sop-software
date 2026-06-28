@@ -79,6 +79,8 @@ export interface ISOP extends Document {
     | "failed";
   /** Parsed clause index for MCQ generation; invalidated when content hash changes. */
   mcqClauseCache?: IMcqClauseCache;
+  /** Parsed SOP sections + hashes for compliance incremental review. */
+  complianceStructureCache?: IComplianceStructureCache;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -86,6 +88,19 @@ export interface ISOP extends Document {
 export interface IMcqClauseCache {
   contentHash: string;
   clauses: { id: string; summary: string; text: string }[];
+  parsedAt: Date;
+}
+
+export interface IComplianceStructureCache {
+  contentHash: string;
+  sectionHashes: {
+    sectionId: string;
+    title: string;
+    hash: string;
+    lineStart: number;
+    lineEnd: number;
+  }[];
+  sectionSummary: string;
   parsedAt: Date;
 }
 
@@ -188,6 +203,20 @@ const SOPSchema = new Schema<ISOP>(
           text: { type: String },
         },
       ],
+      parsedAt: { type: Date },
+    },
+    complianceStructureCache: {
+      contentHash: { type: String, trim: true },
+      sectionHashes: [
+        {
+          sectionId: { type: String, trim: true },
+          title: { type: String, trim: true },
+          hash: { type: String, trim: true },
+          lineStart: { type: Number },
+          lineEnd: { type: Number },
+        },
+      ],
+      sectionSummary: { type: String },
       parsedAt: { type: Date },
     },
   },

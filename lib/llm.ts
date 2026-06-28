@@ -17,7 +17,8 @@ import {
   getOllamaModel,
 } from "@/lib/ollama";
 import { generateClaudeCliJson, getClaudeCliModel, getMcqClaudeModel, checkClaudeCliHealth } from "@/lib/claude-cli";
-import { checkCodexCliHealth, getMcqCodexModel } from "@/lib/codex-cli";
+import { checkCodexCliHealth, getMcqCodexModel, getComplianceCodexModel, generateCodexCliJson } from "@/lib/codex-cli";
+import { extractJsonPayload } from "@/lib/llm-utils";
 
 export type LlmProvider = "gemini" | "ollama" | "claude" | "codex";
 
@@ -101,15 +102,41 @@ export async function generateJson<T>(
   return generateGeminiJson<T>(system, user, options);
 }
 
+export type ComplianceJsonOptions = {
+  runKey?: string;
+  signal?: AbortSignal;
+};
+
 export async function generateComplianceJson<T>(
   system: string,
   user: string,
   providerOverride?: LlmProvider,
   modelOverride?: string,
+  options?: ComplianceJsonOptions,
 ): Promise<T> {
   const p = providerOverride ?? getComplianceProvider();
   if (p === "ollama") return generateOllamaComplianceJson<T>(system, user);
-  if (p === "claude") return generateClaudeCliJson<T>(system, user, modelOverride);
+  if (p === "claude") {
+    return generateClaudeCliJson<T>(system, user, modelOverride, {
+      runKey: options?.runKey,
+      signal: options?.signal,
+      subprocessScope: "compliance",
+    });
+  }
+  if (p === "codex") {
+    return generateCodexCliJson<T>(
+      system,
+      user,
+      (text) => JSON.parse(extractJsonPayload(text)) as T,
+      "compliance-json",
+      modelOverride ?? getComplianceCodexModel(),
+      {
+        runKey: options?.runKey,
+        signal: options?.signal,
+        subprocessScope: "compliance",
+      },
+    );
+  }
   return generateGeminiComplianceJson<T>(system, user);
 }
 

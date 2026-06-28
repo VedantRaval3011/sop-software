@@ -1,5 +1,9 @@
 import { spawn } from "child_process";
 import { errorMessage, isJsonParseError, parseJsonFromText, sleep } from "@/lib/llm-utils";
+import {
+  registerComplianceSubprocess,
+  unregisterComplianceSubprocess,
+} from "@/lib/compliance-run-control";
 import { registerMcqSubprocess, unregisterMcqSubprocess } from "@/lib/mcq-run-control";
 import { parseMcqBatchJson, type ParsedMcq } from "@/lib/mcq-json-parse";
 
@@ -131,11 +135,33 @@ export async function checkClaudeCliHealth(): Promise<ClaudeCliHealth> {
   }
 }
 
+export type CliSubprocessScope = "mcq" | "compliance";
+
 export type ClaudeCliJsonOptions = {
-  /** MCQ run id — enables kill on cancel (PRCL17-05 ≡ PRCL17-5). */
+  /** Run id — enables kill on cancel (MCQ identifier or compliance sopId). */
   runKey?: string;
   signal?: AbortSignal;
+  subprocessScope?: CliSubprocessScope;
 };
+
+function registerCliSubprocess(
+  runKey: string | undefined,
+  proc: import("child_process").ChildProcess,
+  scope: CliSubprocessScope = "mcq",
+): void {
+  if (!runKey) return;
+  if (scope === "compliance") registerComplianceSubprocess(runKey, proc);
+  else registerMcqSubprocess(runKey, proc);
+}
+
+function unregisterCliSubprocess(
+  runKey: string | undefined,
+  scope: CliSubprocessScope = "mcq",
+): void {
+  if (!runKey) return;
+  if (scope === "compliance") unregisterComplianceSubprocess(runKey);
+  else unregisterMcqSubprocess(runKey);
+}
 
 /**
  * Calls the local `claude` CLI (Claude Code) in non-interactive print mode.
@@ -165,7 +191,7 @@ export async function generateClaudeCliJson<T>(
         });
 
         if (options?.runKey) {
-          registerMcqSubprocess(options.runKey, proc);
+          registerCliSubprocess(options.runKey, proc, options.subprocessScope);
         }
 
         let stdout = "";
@@ -176,7 +202,7 @@ export async function generateClaudeCliJson<T>(
           if (settled) return;
           settled = true;
           clearTimeout(timer);
-          if (options?.runKey) unregisterMcqSubprocess(options.runKey);
+          if (options?.runKey) unregisterCliSubprocess(options.runKey, options.subprocessScope);
           fn();
         };
 

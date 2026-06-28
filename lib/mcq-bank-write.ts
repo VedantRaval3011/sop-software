@@ -1,5 +1,6 @@
 import MCQBank, { type IMCQ, type DifficultyLevel } from "@/models/MCQBank";
 import type { ISOP } from "@/models/SOP";
+import { enrichMcqRationale } from "@/lib/mcq-rationale";
 import { isDuplicateMcqQuestionForGeneration } from "@/lib/similarity";
 import { sopFamilyIdentifierRegex } from "@/lib/sop-utils";
 
@@ -26,6 +27,12 @@ const DIFFICULTY_MAP: Record<string, DifficultyLevel> = {
   hard: "Hard",
 };
 
+/** Normalize stored/generated difficulty to the bank display enum. */
+export function normalizeMcqDifficulty(raw: unknown): DifficultyLevel {
+  if (raw === "Easy" || raw === "Medium" || raw === "Hard") return raw;
+  return DIFFICULTY_MAP[String(raw ?? "").toLowerCase()] ?? "Medium";
+}
+
 const STARS: Record<DifficultyLevel, "⭐" | "⭐⭐" | "⭐⭐⭐"> = {
   Easy: "⭐",
   Medium: "⭐⭐",
@@ -49,9 +56,20 @@ export const MCQ_BANK_CAP = 100;
 export function toBankMcq(q: BankInputMcq, sopIdentifier: string): IMCQ {
   const options = [q.optionA, q.optionB, q.optionC, q.optionD].map((o) => (o ?? "").trim());
   const idx = LETTER_INDEX[q.correctAnswer] ?? 0;
-  const difficulty = DIFFICULTY_MAP[String(q.difficulty).toLowerCase()] ?? "Medium";
+  const difficulty = normalizeMcqDifficulty(q.difficulty);
   const correctText =
     options[idx] || options.find((o) => o.length > 0) || "N/A";
+  const { explanation, sopReference } = enrichMcqRationale({
+    question: q.question,
+    optionA: q.optionA,
+    optionB: q.optionB,
+    optionC: q.optionC,
+    optionD: q.optionD,
+    correctAnswer: q.correctAnswer,
+    explanation: q.explanation,
+    sopReference: q.sopReference,
+    topic: q.topic,
+  });
   return {
     aiIcon: "✨",
     question: (q.question ?? "").trim(),
@@ -59,10 +77,8 @@ export function toBankMcq(q: BankInputMcq, sopIdentifier: string): IMCQ {
     difficultyStars: STARS[difficulty],
     options,
     correctAnswer: correctText,
-    explanation: (q.explanation ?? "").trim() || "Refer to the SOP for details.",
-    // Prefer the model-supplied section/clause reference; fall back to the topic
-    // heading, then the SOP identifier, so this field is never empty.
-    sopReference: (q.sopReference ?? "").trim() || (q.topic ?? "").trim() || sopIdentifier,
+    explanation,
+    sopReference: sopReference || (q.topic ?? "").trim() || sopIdentifier,
     optionVariants: [],
     isChecked: false,
     isReviewed: false,

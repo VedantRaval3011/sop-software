@@ -14,6 +14,7 @@ import { requireAuth } from "@/lib/withAuth";
 import type { IComplianceFinding } from "@/models/ComplianceAnalysis";
 import type { IComplianceReport } from "@/models/ComplianceReport";
 import { enrichFindingSopContent } from "@/lib/ComplianceFindingValidator";
+import { attachGapIdsToReportFindings } from "@/lib/compliance-finding-store";
 import { parseSopStructure } from "@/lib/sopStructureParser";
 import mongoose from "mongoose";
 
@@ -59,6 +60,18 @@ async function enrichReportFindings<T extends { sopId: unknown; findings?: IComp
   return { ...report, findings: enrichedFindings };
 }
 
+async function attachGapMetadata<T extends { sopId: unknown; findings?: IComplianceReport["findings"] }>(
+  report: T,
+): Promise<T> {
+  if (!report.findings?.length || !report.sopId) return report;
+  const mapped = report.findings.map((f) => ({
+    ...f,
+    guidelineId: f.guidelineId?.toString?.() ?? f.guidelineId,
+  }));
+  const withGaps = await attachGapIdsToReportFindings(String(report.sopId), mapped as Parameters<typeof attachGapIdsToReportFindings>[1]);
+  return { ...report, findings: withGaps as unknown as IComplianceReport["findings"] };
+}
+
 export async function GET(request: NextRequest) {
   const auth = await requireAuth(["admin", "trainer", "viewer"]);
   if (auth.error) return auth.error;
@@ -71,7 +84,8 @@ export async function GET(request: NextRequest) {
       const report = await ComplianceReport.findById(reportId).lean();
       if (!report) return NextResponse.json({ success: false, error: "Report not found" }, { status: 404 });
       const enriched = await enrichReportFindings(report);
-      return NextResponse.json({ success: true, report: enriched });
+      const withGaps = await attachGapMetadata(enriched);
+      return NextResponse.json({ success: true, report: withGaps });
     }
 
     const reports = await ComplianceReport.find({})
