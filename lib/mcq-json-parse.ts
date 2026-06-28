@@ -3,6 +3,8 @@ import {
   repairTruncatedJson,
   stripMarkdownFences,
 } from "@/lib/llm-utils";
+import { isMetadataOnlyMcq } from "@/lib/mcq-generation-prompts";
+import { normalizeQuestionCategory, normalizeKnowledgeFactId, readFactIdFromMcq } from "@/lib/mcq-facts";
 
 export interface ParsedMcq {
   question: string;
@@ -15,6 +17,9 @@ export interface ParsedMcq {
   difficulty: "easy" | "medium" | "hard";
   topic?: string;
   sopReference: string;
+  factId?: string;
+  learningObjective?: string;
+  questionCategory?: "recall" | "scenario" | "application";
 }
 
 type RawMcq = Record<string, unknown>;
@@ -86,7 +91,8 @@ function readOption(raw: RawMcq, letter: "A" | "B" | "C" | "D", idx: number): st
 /** Map one raw object from the model into a generated MCQ, or null if unusable. */
 export function normalizeRawMcq(raw: RawMcq): ParsedMcq | null {
   const question = String(raw.question ?? raw.q ?? raw.stem ?? "").trim();
-  if (question.length < 5) return null;
+    if (question.length < 5) return null;
+  if (isMetadataOnlyMcq(question)) return null;
 
   let options = readOptions(raw);
   if (options.some((o) => !o)) {
@@ -105,6 +111,10 @@ export function normalizeRawMcq(raw: RawMcq): ParsedMcq | null {
   const sopReference = String(
     raw.sopReference ??
       raw.sop_reference ??
+      raw.sopExcerpt ??
+      raw.sop_excerpt ??
+      raw.sopQuote ??
+      raw.sourceText ??
       raw.clauseId ??
       raw.clause_id ??
       raw.clause ??
@@ -113,6 +123,28 @@ export function normalizeRawMcq(raw: RawMcq): ParsedMcq | null {
       "",
   ).trim();
 
+  const explanation = String(
+    raw.explanation ??
+      raw.rationale ??
+      raw.pedagogicalRationale ??
+      raw.pedagogical_rationale ??
+      raw.why ??
+      "",
+  ).trim();
+
+  const learningObjective = String(
+    raw.learning_objective ?? raw.learningObjective ?? raw.objective ?? "",
+  ).trim();
+
+  const factIdRaw = readFactIdFromMcq(raw);
+  const factId =
+    factIdRaw ||
+    (sopReference && /^F\d{3,}$/i.test(sopReference) ? normalizeKnowledgeFactId(sopReference) : undefined);
+  const questionCategory = normalizeQuestionCategory(raw.questionCategory ?? raw.question_category ?? raw.category);
+
+  const sopRefClean =
+    sopReference && factId && normalizeKnowledgeFactId(sopReference) === factId ? "" : sopReference;
+
   return {
     question,
     optionA: options[0],
@@ -120,9 +152,13 @@ export function normalizeRawMcq(raw: RawMcq): ParsedMcq | null {
     optionC: options[2],
     optionD: options[3],
     correctAnswer,
+    explanation: explanation || undefined,
+    learningObjective: learningObjective || undefined,
     difficulty: normalizeDifficulty(raw.difficulty),
-    topic: String(raw.topic ?? "").trim() || undefined,
-    sopReference: sopReference || "unknown",
+    topic: String(raw.topic ?? "").trim() || learningObjective || undefined,
+    sopReference: sopRefClean || "unknown",
+    factId: factId || undefined,
+    questionCategory,
   };
 }
 

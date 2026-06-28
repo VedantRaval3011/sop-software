@@ -69,7 +69,11 @@ export interface FindingCardProps {
     whyApplies?: string;
     whyEvidenceInsufficient?: string;
     whyScoreReduced?: string;
+    gapId?: string;
+    resolved?: boolean;
+    lastReviewedAt?: string;
   };
+  sopId?: string;
   reportContext?: {
     sopIdentifier: string;
     sopName: string;
@@ -83,12 +87,14 @@ export interface FindingCardProps {
   onToggleApplicable?: (id: string, checked: boolean) => void;
   isApplicable?: boolean;
   onReviewStatusChange?: (id: string, status: 'pending' | 'accepted' | 'disputed' | 'implemented') => void;
+  onApplyFix?: (gapId: string, finding: FindingCardProps['finding']) => Promise<void>;
+  applyingFix?: boolean;
   showCheckbox?: boolean;
   defaultExpanded?: boolean;
 }
 
 function findingId(finding: FindingCardProps['finding'], index?: number): string {
-  return finding._id ?? `finding-${index ?? finding.clauseNumber}`;
+  return finding.gapId ?? finding._id ?? `finding-${index ?? finding.clauseNumber}`;
 }
 
 function extractSectionNumber(section?: string): string {
@@ -181,6 +187,8 @@ export default function FindingCard({
   onToggleApplicable,
   isApplicable,
   onReviewStatusChange,
+  onApplyFix,
+  applyingFix = false,
   showCheckbox = false,
   defaultExpanded = false,
 }: FindingCardProps) {
@@ -578,14 +586,26 @@ export default function FindingCard({
                       <p className="text-[10px] font-black text-emerald-700 uppercase tracking-widest">
                         Proposed Verbiage
                       </p>
-                      <button
-                        type="button"
-                        onClick={handleCopyVerbiage}
-                        className="flex items-center gap-1 text-[10px] font-black text-emerald-700 hover:text-emerald-900 uppercase tracking-wide"
-                      >
-                        {copied ? <CheckCircle className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
-                        Copy
-                      </button>
+                      <div className="flex items-center gap-2">
+                        {onApplyFix && finding.gapId && !finding.resolved && (
+                          <button
+                            type="button"
+                            disabled={applyingFix}
+                            onClick={() => onApplyFix(finding.gapId!, finding)}
+                            className="flex items-center gap-1 px-2 py-1 rounded text-[10px] font-black uppercase tracking-wide bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50"
+                          >
+                            {applyingFix ? 'Applying…' : 'Apply Fix'}
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={handleCopyVerbiage}
+                          className="flex items-center gap-1 text-[10px] font-black text-emerald-700 hover:text-emerald-900 uppercase tracking-wide"
+                        >
+                          {copied ? <CheckCircle className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+                          Copy
+                        </button>
+                      </div>
                     </div>
                     <p className="text-sm text-gray-800 leading-relaxed whitespace-pre-wrap">
                       {proposedVerbiage}
@@ -606,6 +626,16 @@ export default function FindingCard({
             {onReviewStatusChange && (
               <div className="flex items-center gap-2 flex-wrap pt-1 border-t border-gray-100">
                 <span className="text-[10px] text-gray-500 font-semibold uppercase tracking-wider">Review:</span>
+                {finding.resolved && (
+                  <span className="px-2 py-1 rounded text-[10px] font-bold bg-green-100 text-green-800 border border-green-200">
+                    Resolved
+                  </span>
+                )}
+                {finding.lastReviewedAt && (
+                  <span className="text-[10px] text-gray-400">
+                    Last reviewed: {new Date(finding.lastReviewedAt).toLocaleDateString()}
+                  </span>
+                )}
                 {(['pending', 'accepted', 'disputed', 'implemented'] as const).map((s) => (
                   <button
                     key={s}

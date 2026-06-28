@@ -4,13 +4,12 @@ import MCQBank from "@/models/MCQBank";
 import SOP from "@/models/SOP";
 import { generateJson } from "@/lib/gemini";
 import { appendGeneratedToBank, MCQ_BANK_CAP, type BankInputMcq } from "@/lib/mcq-bank-write";
+import { MCQ_REPLACE_SYSTEM } from "@/lib/mcq-generation-prompts";
 import { MCQ_CONTENT_LIMIT, mcqPromptSopExcerpt } from "@/lib/mcq-source-text";
 import { invalidateDashboardSopsCache } from "@/lib/server-cache";
 import { requireAuth } from "@/lib/withAuth";
 
-const REPLACE_PROMPT = `Generate replacement MCQ questions that are NOT similar to the excluded questions.
-Return JSON: { "questions": [{ "question", "optionA", "optionB", "optionC", "optionD", "correctAnswer", "explanation", "difficulty", "topic", "sopReference" }] }
-"sopReference" is REQUIRED for every question: cite the exact SOP section/clause it is derived from, using the numbered clause as it appears in the text (e.g. "4.6.1.4"). Only if that section has no number, use its heading. Never leave it blank or invent a number not present in the SOP text.`;
+const REPLACE_PROMPT = MCQ_REPLACE_SYSTEM;
 
 export async function POST(request: NextRequest) {
   const auth = await requireAuth(["admin", "trainer"]);

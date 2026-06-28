@@ -4,6 +4,7 @@ import { connectDB } from "@/lib/mongodb";
 import { requireAuth } from "@/lib/withAuth";
 import SOP from "@/models/SOP";
 import { sopFamilyGroupKey, resolveSopVersion, versionFromIdentifier } from "@/lib/sop-utils";
+import { normalizeMcqDifficulty } from "@/lib/mcq-bank-write";
 import { getGroupedRegistryRows } from "@/lib/dashboardRegistrySource";
 
 const langCodeOf = (language: unknown): "EN" | "GU" =>
@@ -32,7 +33,13 @@ export async function GET(request: NextRequest) {
     if (!bank) return NextResponse.json({ error: "Bank not found" }, { status: 404 });
 
     // Fix stale totalQuestions
-    if (Array.isArray(bank.mcqs)) bank.totalQuestions = bank.mcqs.length;
+    if (Array.isArray(bank.mcqs)) {
+      bank.totalQuestions = bank.mcqs.length;
+      bank.mcqs = bank.mcqs.map((m) => ({
+        ...m,
+        difficulty: normalizeMcqDifficulty(m.difficulty),
+      }));
+    }
 
     // ── Sibling language banks (same SOP family) ──────────────────────────────
     // Family grouping is padding-insensitive, so compute the family key per bank

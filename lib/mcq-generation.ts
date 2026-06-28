@@ -51,16 +51,30 @@ import {
 
 import {
   clausesPerCall,
+  creativeBatchSize,
   legacyBatchSize,
+  maxCreativeBatches,
   maxLegacyBatches,
   mcqContentLimitClaude,
   mcqContentLimitCodex,
+  shouldUseFactPipeline,
   shouldUseFastFill,
 } from "@/lib/mcq-generation-config";
+import { generateForLanguageFactBased } from "@/lib/mcq-fact-generation";
+import { normalizeKnowledgeFactId } from "@/lib/mcq-facts";
+import { enrichMcqRationale } from "@/lib/mcq-rationale";
+import {
+  MCQ_CLAUSE_SYSTEM,
+  MCQ_CREATIVE_SYSTEM,
+  MCQ_LEGACY_SYSTEM,
+  isMetadataOnlyMcq,
+} from "@/lib/mcq-generation-prompts";
 
 /** Each SOP/language bank holds at most this many MCQs (see MCQ_BANK_CAP). */
 export const MCQ_TARGET_PER_LANGUAGE = MCQ_BANK_CAP;
 const MCQ_MAX_EMPTY_BATCHES = 4;
+/** Legacy fill tolerates more duplicate-only rounds while still below cap. */
+const MCQ_MAX_ZERO_INSERT_ROUNDS = 16;
 const MAX_QUESTIONS_PER_CLAUSE = 1;
 /** Abort the whole run after this many fully-overloaded (503) batches. Hammering
  *  an overloaded service just burns quota without producing MCQs. */
@@ -84,26 +98,10 @@ export interface GeneratedMCQ {
   difficulty: "easy" | "medium" | "hard";
   topic?: string;
   sopReference: string;
+  factId?: string;
+  learningObjective?: string;
+  questionCategory?: "recall" | "scenario" | "application";
 }
-
-/** Valid JSON example — model must follow this shape exactly. */
-const MCQ_CLAUSE_SYSTEM = `You are an MCQ generator. Respond with ONLY a JSON object (no markdown, no extra text).
-
-Schema:
-{"questions":[{"question":"string","optionA":"string","optionB":"string","optionC":"string","optionD":"string","correctAnswer":"A","difficulty":"easy","sopReference":"clause-id"}]}
-
-Rules:
-- correctAnswer is exactly one letter: A, B, C, or D (not option text)
-- Use double quotes for all strings; escape internal quotes with backslash
-- No trailing commas; no comments
-- One question per requested clause; sopReference must equal the clause id
-- Keep options short; omit explanation field`;
-
-const MCQ_LEGACY_SYSTEM = `You are an MCQ generator. Output ONLY valid JSON (no markdown).
-
-{"questions":[{"question":"string","optionA":"string","optionB":"string","optionC":"string","optionD":"string","correctAnswer":"A","difficulty":"medium","sopReference":"section"}]}
-
-Rules: correctAnswer = single letter A/B/C/D. Short options. Unique questions. Omit explanation.`;
 
 async function callMcqModel(
   provider: LlmProvider | undefined,
@@ -339,6 +337,8 @@ async function handleGenerationHalt(
 interface BankDedupState {
   questions: string[];
   refCounts: Map<string, number>;
+  /** Internal fact_id keys already used in the bank this run — not persisted. */
+  usedFactIds: Set<string>;
 }
 
 async function loadBankDedupState(
@@ -362,36 +362,31 @@ async function loadBankDedupState(
       if (ref) refCounts.set(ref, (refCounts.get(ref) ?? 0) + 1);
     }
   }
-  return { questions, refCounts };
-}
-
-function recordAcceptedMcq(
-  q: GeneratedMCQ,
-  seenQuestions: string[],
-  refCounts: Map<string, number>,
-): void {
-  seenQuestions.push(q.question);
-  const ref = normalizeMcqClauseRef(q.sopReference);
-  if (ref) refCounts.set(ref, (refCounts.get(ref) ?? 0) + 1);
+  return { questions, refCounts, usedFactIds: new Set<string>() };
 }
 
 function syncInsertedMcqs(
-  candidates: GeneratedMCQ[],
+  accepted: GeneratedMCQ[],
   insertedTexts: string[],
   seenQuestions: string[],
   refCounts: Map<string, number>,
-  acceptedThisRun: GeneratedMCQ[],
+  usedFactIds: Set<string>,
 ): void {
   const pending = new Set(insertedTexts);
-  for (const q of candidates) {
+  for (const q of accepted) {
     if (!pending.has(q.question)) continue;
     pending.delete(q.question);
-    recordAcceptedMcq(q, seenQuestions, refCounts);
-    acceptedThisRun.push(q);
+    seenQuestions.push(q.question);
+    const ref = normalizeMcqClauseRef(q.sopReference ?? "");
+    if (ref) refCounts.set(ref, (refCounts.get(ref) ?? 0) + 1);
+    const fid = q.factId ? normalizeKnowledgeFactId(q.factId) : "";
+    if (fid) usedFactIds.add(fid);
   }
 }
 
 function toBankInput(q: GeneratedMCQ): BankInputMcq {
+  const { explanation, sopReference } = enrichMcqRationale(q);
+  const topic = q.topic?.trim() || q.learningObjective?.trim() || sopReference.slice(0, 80);
   return {
     question: q.question,
     optionA: q.optionA,
@@ -399,10 +394,10 @@ function toBankInput(q: GeneratedMCQ): BankInputMcq {
     optionC: q.optionC,
     optionD: q.optionD,
     correctAnswer: q.correctAnswer,
-    explanation: q.explanation?.trim() || "Refer to the SOP.",
+    explanation,
     difficulty: q.difficulty,
-    topic: q.topic?.trim() || q.sopReference,
-    sopReference: q.sopReference,
+    topic,
+    sopReference,
   };
 }
 
@@ -446,10 +441,15 @@ function isAcceptableMcq(
   seenQuestions: string[],
   refCounts: Map<string, number>,
   allowedClauseIds?: Set<string>,
-  options?: { skipClauseRefCap?: boolean },
+  options?: { skipClauseRefCap?: boolean; usedFactIds?: Set<string>; allowFactReuse?: boolean },
 ): boolean {
   if (!q?.question?.trim()) return false;
+  if (isMetadataOnlyMcq(q.question)) return false;
   if (seenQuestions.some((eq) => isDuplicateMcqQuestionForGeneration(q.question, eq))) return false;
+
+  const fid = q.factId ? normalizeKnowledgeFactId(q.factId) : "";
+  if (fid && options?.usedFactIds?.has(fid) && !options?.allowFactReuse) return false;
+
   const ref = normalizeMcqClauseRef(q.sopReference);
     if (allowedClauseIds && ref) {
     let ok = false;
@@ -523,7 +523,7 @@ async function generateForLanguageClauseWise(
   bankCountAtStart: number,
   dedupAtStart: BankDedupState,
   ctx: RunCtx,
-  onBatchDone: (p: { batchesDone: number; newMcqs: GeneratedMCQ[] }) => Promise<{ bankTotal: number; insertedTexts: string[] }>,
+  onBatchDone: (p: { batchesDone: number; newMcqs: BankInputMcq[] }) => Promise<{ bankTotal: number; insertedTexts: string[] }>,
   provider?: LlmProvider,
   mode: McqGenMode = "generate",
 ): Promise<void> {
@@ -531,6 +531,7 @@ async function generateForLanguageClauseWise(
 
   let seenQuestions = [...dedupAtStart.questions];
   let refCounts = new Map(dedupAtStart.refCounts);
+  let usedFactIds = new Set(dedupAtStart.usedFactIds);
   let bankTotal = bankCountAtStart;
 
   const { clauses: allClauses, fromCache } = await getOrBuildClauseIndex(sop);
@@ -569,6 +570,7 @@ async function generateForLanguageClauseWise(
       const fresh = await loadBankDedupState(identifier, language);
       seenQuestions = [...fresh.questions];
       refCounts = new Map(fresh.refCounts);
+      usedFactIds = new Set(fresh.usedFactIds);
       bankTotal = await activeBankCount(identifier, language);
       pending = countPending();
       if (pending.length === 0) {
@@ -669,14 +671,19 @@ async function generateForLanguageClauseWise(
     if (insertRoom <= 0) return;
 
     const candidates: BankInputMcq[] = [];
+    const accepted: GeneratedMCQ[] = [];
     const batchSeen = [...seenQuestions];
     const batchRefCounts = new Map(refCounts);
+    const batchFactIds = new Set(usedFactIds);
     for (const q of questions) {
       if (!clauseRefMatchesBatch(q.sopReference ?? "", activeWork)) continue;
-      if (!isAcceptableMcq(q, batchSeen, batchRefCounts, activeIds)) continue;
+      if (!isAcceptableMcq(q, batchSeen, batchRefCounts, activeIds, { usedFactIds: batchFactIds })) continue;
       batchSeen.push(q.question);
       const ref = normalizeMcqClauseRef(q.sopReference);
       if (ref) batchRefCounts.set(ref, (batchRefCounts.get(ref) ?? 0) + 1);
+      const fid = q.factId ? normalizeKnowledgeFactId(q.factId) : "";
+      if (fid) batchFactIds.add(fid);
+      accepted.push(q);
       candidates.push(toBankInput(q));
       if (candidates.length >= insertRoom) break;
     }
@@ -691,7 +698,7 @@ async function generateForLanguageClauseWise(
     const prevBankTotal = bankTotal;
     const batchResult = await onBatchDone({ batchesDone: batchNum, newMcqs: candidates });
     bankTotal = batchResult.bankTotal;
-    syncInsertedMcqs(candidates, batchResult.insertedTexts, seenQuestions, refCounts, []);
+    syncInsertedMcqs(accepted, batchResult.insertedTexts, seenQuestions, refCounts, usedFactIds);
 
     await pushLog(
       identifier,
@@ -713,7 +720,61 @@ async function generateForLanguageClauseWise(
   );
 }
 
-/** Legacy excerpt batches — only when clause index is insufficient. */
+function formatAvoidQuestionHint(questions: string[], max = 15): string {
+  if (!questions.length) return "";
+  const sample = questions.slice(-max);
+  return `\n\nDo NOT repeat or closely paraphrase these existing questions — use a different scenario or angle:\n${sample
+    .map((q, i) => `${i + 1}. ${q.slice(0, 120)}`)
+    .join("\n")}`;
+}
+
+const CREATIVE_ANGLES = [
+  "a deviation or abnormal condition the operator must handle correctly",
+  "choosing the correct immediate action when something is out of spec",
+  "supervisor review, escalation, or approval decision",
+  "correct step sequence when two steps could be confused",
+  "documentation or recording requirement in a realistic context",
+  "safety, GMP, or compliance judgment call",
+  "equipment reading at a limit — what should happen next",
+  "why a critical step matters (purpose / risk if skipped)",
+] as const;
+
+function buildCreativeUserPrompt(
+  language: string,
+  sop: ISOP,
+  batchNeed: number,
+  bankTotal: number,
+  batch: number,
+  excerpt: string,
+  avoidHint: string,
+): string {
+  const gap = MCQ_BANK_CAP - bankTotal;
+  const angle = CREATIVE_ANGLES[batch % CREATIVE_ANGLES.length];
+  return `${language} · ${sop.identifier}
+The bank has ${bankTotal}/${MCQ_BANK_CAP} MCQs — ${gap} more needed. Standard coverage is exhausted.
+
+Generate exactly ${batchNeed} NEW scenario-based MCQs. Focus this batch on: ${angle}.
+Each question must be answerable from the SOP below but use a fresh scenario stem — not verbatim recall.
+${avoidHint}
+
+SOP:
+${excerpt}`;
+}
+
+function sopExcerptForMcqBatch(
+  raw: string,
+  batch: number,
+  maxChars: number,
+  preferFull: boolean,
+): string {
+  const normalized = normalizeSopTextForMcq(raw);
+  if (!normalized) return "";
+  if (preferFull && normalized.length <= maxChars) return normalized;
+  if (preferFull && normalized.length > maxChars) return normalized.slice(0, maxChars);
+  return mcqPromptSopExcerpt(raw, batch, maxChars, MCQ_CONTENT_CHUNKS);
+}
+
+/** Legacy excerpt batches — bulk fill toward MCQ_BANK_CAP. */
 async function generateForLanguageLegacy(
   identifier: string,
   sop: ISOP,
@@ -721,13 +782,15 @@ async function generateForLanguageLegacy(
   bankCountAtStart: number,
   dedupAtStart: BankDedupState,
   ctx: RunCtx,
-  onBatchDone: (p: { batchesDone: number; newMcqs: GeneratedMCQ[] }) => Promise<{ bankTotal: number; insertedTexts: string[] }>,
+  onBatchDone: (p: { batchesDone: number; newMcqs: BankInputMcq[] }) => Promise<{ bankTotal: number; insertedTexts: string[] }>,
   provider?: LlmProvider,
 ): Promise<void> {
   const seenQuestions = [...dedupAtStart.questions];
   const refCounts = new Map(dedupAtStart.refCounts);
+  const usedFactIds = new Set(dedupAtStart.usedFactIds);
   let bankTotal = bankCountAtStart;
-  let emptyBatchStreak = 0;
+  let emptyResponseStreak = 0;
+  let zeroInsertStreak = 0;
 
   const contentLimit =
     provider === "ollama" ? MCQ_CONTENT_LIMIT_OLLAMA :
@@ -735,19 +798,27 @@ async function generateForLanguageLegacy(
     provider === "codex" ? mcqContentLimitCodex() :
     MCQ_CONTENT_LIMIT;
 
-  const legacyMax = maxLegacyBatches();
-  for (let batch = 0; batch < legacyMax; batch++) {
+  const gap = MCQ_BANK_CAP - bankCountAtStart;
+  const batchSize = legacyBatchSize(provider, gap);
+  const legacyMax = maxLegacyBatches(gap, batchSize);
+
+  for (let batch = 0; batch < legacyMax && bankTotal < MCQ_BANK_CAP; batch++) {
     if (await isMcqGenerationCancelled(identifier)) {
       await handleGenerationHalt(identifier, language, "cancel", bankTotal);
     }
+
+    bankTotal = await activeBankCount(identifier, language);
     if (bankTotal >= MCQ_BANK_CAP) return;
 
     const batchNeed = legacyBatchSize(provider, MCQ_BANK_CAP - bankTotal);
     if (batchNeed <= 0) break;
+
     const excerpt = mcqPromptSopExcerpt(sop.content, batch, contentLimit, MCQ_CONTENT_CHUNKS);
+    const avoidHint = formatAvoidQuestionHint(seenQuestions);
     const userPrompt = `${language} · ${sop.identifier}
 Generate exactly ${batchNeed} unique MCQs from this SOP excerpt. Section ${(batch % MCQ_CONTENT_CHUNKS) + 1}/${MCQ_CONTENT_CHUNKS}. Short options.
-Each question must be clearly different from any other training question on this SOP — vary the topic and wording.
+Each question must test a different fact or procedure — no overlap with existing bank questions.
+${avoidHint}
 
 SOP:
 ${excerpt}`;
@@ -768,14 +839,20 @@ ${excerpt}`;
 
     if (!questions?.length) {
       await pushLog(identifier, `${language} · fill batch ${batch + 1}: model returned no questions`);
-      emptyBatchStreak++;
-      if (emptyBatchStreak >= MCQ_MAX_EMPTY_BATCHES) break;
+      emptyResponseStreak++;
+      if (emptyResponseStreak >= MCQ_MAX_EMPTY_BATCHES) {
+        await pushLog(identifier, `${language} · stopping fill — ${emptyResponseStreak} empty responses in a row`);
+        break;
+      }
       continue;
     }
+    emptyResponseStreak = 0;
 
     const candidates: BankInputMcq[] = [];
+    const accepted: GeneratedMCQ[] = [];
     const batchSeen = [...seenQuestions];
     const batchRefCounts = new Map(refCounts);
+    const batchFactIds = new Set(usedFactIds);
     let rejectedDup = 0;
     for (const q of questions) {
       if (candidates.length >= batchNeed) break;
@@ -783,10 +860,16 @@ ${excerpt}`;
         rejectedDup++;
         continue;
       }
-      if (!isAcceptableMcq(q, batchSeen, batchRefCounts, undefined, { skipClauseRefCap: true })) continue;
+      if (!isAcceptableMcq(q, batchSeen, batchRefCounts, undefined, {
+        skipClauseRefCap: true,
+        usedFactIds: batchFactIds,
+      })) continue;
       batchSeen.push(q.question);
       const ref = normalizeMcqClauseRef(q.sopReference);
       if (ref) batchRefCounts.set(ref, (batchRefCounts.get(ref) ?? 0) + 1);
+      const fid = q.factId ? normalizeKnowledgeFactId(q.factId) : "";
+      if (fid) batchFactIds.add(fid);
+      accepted.push(q);
       candidates.push(toBankInput(q));
     }
 
@@ -801,14 +884,186 @@ ${excerpt}`;
     const prev = bankTotal;
     const batchResult = await onBatchDone({ batchesDone: batch + 1, newMcqs: candidates });
     bankTotal = batchResult.bankTotal;
-    syncInsertedMcqs(candidates, batchResult.insertedTexts, seenQuestions, refCounts, []);
+    syncInsertedMcqs(accepted, batchResult.insertedTexts, seenQuestions, refCounts, usedFactIds);
 
     if (bankTotal - prev === 0) {
-      emptyBatchStreak++;
-      if (emptyBatchStreak >= MCQ_MAX_EMPTY_BATCHES) break;
+      zeroInsertStreak++;
+      const nearCap = MCQ_BANK_CAP - bankTotal <= 15;
+      const maxZero = nearCap
+        ? 2
+        : bankTotal < MCQ_BANK_CAP / 2
+          ? MCQ_MAX_ZERO_INSERT_ROUNDS
+          : MCQ_MAX_EMPTY_BATCHES;
+      if (zeroInsertStreak >= maxZero) {
+        await pushLog(
+          identifier,
+          nearCap
+            ? `${language} · standard fill stalled at ${bankTotal}/${MCQ_BANK_CAP} — switching to creative scenarios`
+            : `${language} · stopping fill at ${bankTotal}/${MCQ_BANK_CAP} — ${zeroInsertStreak} rounds with no new MCQs`,
+        );
+        break;
+      }
     } else {
-      emptyBatchStreak = 0;
+      zeroInsertStreak = 0;
     }
+  }
+
+  bankTotal = await activeBankCount(identifier, language);
+  if (bankTotal >= MCQ_BANK_CAP) return;
+
+  const freshDedup = await loadBankDedupState(identifier, language);
+  await generateForLanguageCreative(
+    identifier, sop, language, bankTotal, freshDedup, ctx, onBatchDone, provider,
+  );
+}
+
+/** Scenario-based creative fill when standard excerpt/clause passes cannot add more unique MCQs. */
+async function generateForLanguageCreative(
+  identifier: string,
+  sop: ISOP,
+  language: "English" | "Gujarati",
+  bankCountAtStart: number,
+  dedupAtStart: BankDedupState,
+  ctx: RunCtx,
+  onBatchDone: (p: { batchesDone: number; newMcqs: BankInputMcq[] }) => Promise<{ bankTotal: number; insertedTexts: string[] }>,
+  provider?: LlmProvider,
+): Promise<void> {
+  if (bankCountAtStart >= MCQ_BANK_CAP) return;
+
+  const seenQuestions = [...dedupAtStart.questions];
+  const refCounts = new Map(dedupAtStart.refCounts);
+  const usedFactIds = new Set(dedupAtStart.usedFactIds);
+  let bankTotal = bankCountAtStart;
+  let emptyResponseStreak = 0;
+  let zeroInsertStreak = 0;
+
+  const contentLimit =
+    provider === "ollama" ? MCQ_CONTENT_LIMIT_OLLAMA :
+    provider === "claude" ? mcqContentLimitClaude() :
+    provider === "codex" ? mcqContentLimitCodex() :
+    MCQ_CONTENT_LIMIT;
+
+  const gap = MCQ_BANK_CAP - bankCountAtStart;
+  const creativeMax = maxCreativeBatches(gap);
+  await pushLog(
+    identifier,
+    `${language} · creative fill — ${gap} MCQs needed · up to ${creativeMax} scenario rounds`,
+  );
+
+  for (let batch = 0; batch < creativeMax && bankTotal < MCQ_BANK_CAP; batch++) {
+    if (await isMcqGenerationCancelled(identifier)) {
+      await handleGenerationHalt(identifier, language, "cancel", bankTotal);
+    }
+
+    bankTotal = await activeBankCount(identifier, language);
+    if (bankTotal >= MCQ_BANK_CAP) return;
+
+    const batchNeed = creativeBatchSize(provider, MCQ_BANK_CAP - bankTotal);
+    if (batchNeed <= 0) break;
+
+    const preferFull = MCQ_BANK_CAP - bankTotal <= 15;
+    const excerpt = sopExcerptForMcqBatch(sop.content, batch, contentLimit, preferFull);
+    const avoidMax = preferFull ? 25 : 18;
+    const avoidHint = formatAvoidQuestionHint(seenQuestions, avoidMax);
+    const userPrompt = buildCreativeUserPrompt(
+      language, sop, batchNeed, bankTotal, batch, excerpt, avoidHint,
+    );
+
+    let questions: GeneratedMCQ[];
+    try {
+      questions = await fetchMcqQuestions(
+        provider,
+        MCQ_CREATIVE_SYSTEM,
+        userPrompt,
+        identifier,
+        language,
+        `creative ${batch + 1}`,
+      );
+    } catch (err) {
+      ctx.failedBatches++;
+      const errMsg = err instanceof Error ? err.message.slice(0, 120) : String(err).slice(0, 120);
+      await pushLog(identifier, `${language} · creative batch ${batch + 1} failed — ${errMsg}`);
+      continue;
+    }
+
+    if (await isMcqGenerationCancelled(identifier)) {
+      await handleGenerationHalt(identifier, language, "cancel", bankTotal);
+    }
+
+    if (!questions?.length) {
+      await pushLog(identifier, `${language} · creative batch ${batch + 1}: model returned no questions`);
+      emptyResponseStreak++;
+      if (emptyResponseStreak >= MCQ_MAX_EMPTY_BATCHES) {
+        await pushLog(identifier, `${language} · stopping creative fill — ${emptyResponseStreak} empty responses`);
+        break;
+      }
+      continue;
+    }
+    emptyResponseStreak = 0;
+
+    const candidates: BankInputMcq[] = [];
+    const accepted: GeneratedMCQ[] = [];
+    const batchSeen = [...seenQuestions];
+    const batchRefCounts = new Map(refCounts);
+    const batchFactIds = new Set(usedFactIds);
+    let rejectedDup = 0;
+    for (const q of questions) {
+      if (candidates.length >= batchNeed) break;
+      if (seenQuestions.some((eq) => isDuplicateMcqQuestionForGeneration(q.question, eq))) {
+        rejectedDup++;
+        continue;
+      }
+      if (!isAcceptableMcq(q, batchSeen, batchRefCounts, undefined, {
+        skipClauseRefCap: true,
+        usedFactIds: batchFactIds,
+      })) continue;
+      batchSeen.push(q.question);
+      const ref = normalizeMcqClauseRef(q.sopReference);
+      if (ref) batchRefCounts.set(ref, (batchRefCounts.get(ref) ?? 0) + 1);
+      const fid = q.factId ? normalizeKnowledgeFactId(q.factId) : "";
+      if (fid) batchFactIds.add(fid);
+      accepted.push(q);
+      candidates.push(toBankInput(q));
+    }
+
+    if (candidates.length === 0 && questions.length > 0) {
+      await pushLog(
+        identifier,
+        `${language} · creative batch ${batch + 1}: ${questions.length} parsed, 0 accepted` +
+          (rejectedDup > 0 ? ` (${rejectedDup} near-duplicates)` : ""),
+      );
+    }
+
+    const prev = bankTotal;
+    const batchResult = await onBatchDone({ batchesDone: batch + 1, newMcqs: candidates });
+    bankTotal = batchResult.bankTotal;
+    syncInsertedMcqs(accepted, batchResult.insertedTexts, seenQuestions, refCounts, usedFactIds);
+
+    await pushLog(
+      identifier,
+      `${language} · creative batch ${batch + 1}: +${bankTotal - prev} → ${bankTotal}/${MCQ_BANK_CAP}`,
+    );
+
+    if (bankTotal - prev === 0) {
+      zeroInsertStreak++;
+      if (zeroInsertStreak >= MCQ_MAX_ZERO_INSERT_ROUNDS) {
+        await pushLog(
+          identifier,
+          `${language} · creative fill ended at ${bankTotal}/${MCQ_BANK_CAP} — could not add more unique questions`,
+        );
+        break;
+      }
+    } else {
+      zeroInsertStreak = 0;
+    }
+  }
+
+  bankTotal = await activeBankCount(identifier, language);
+  if (bankTotal < MCQ_BANK_CAP) {
+    await pushLog(
+      identifier,
+      `${language} · finished at ${bankTotal}/${MCQ_BANK_CAP} — use Continue to retry creative fill`,
+    );
   }
 }
 
@@ -819,17 +1074,42 @@ async function generateForLanguage(
   bankCountAtStart: number,
   dedupAtStart: BankDedupState,
   ctx: RunCtx,
-  onBatchDone: (p: { batchesDone: number; newMcqs: GeneratedMCQ[] }) => Promise<{ bankTotal: number; insertedTexts: string[] }>,
+  onBatchDone: (p: { batchesDone: number; newMcqs: BankInputMcq[] }) => Promise<{ bankTotal: number; insertedTexts: string[] }>,
   provider?: LlmProvider,
   mode: McqGenMode = "generate",
 ): Promise<void> {
+  if (shouldUseFactPipeline(provider) && mode !== "continue") {
+    await pushLog(identifier, `${language} · fact-based pipeline (extract → one MCQ/fact → local dedup)`);
+    await generateForLanguageFactBased(
+      identifier,
+      sop,
+      language,
+      bankCountAtStart,
+      dedupAtStart,
+      ctx,
+      onBatchDone,
+      {
+        pushLog,
+        shouldHaltGeneration,
+        handleGenerationHalt,
+        activeBankCount,
+        fetchMcqQuestions,
+        generateForLanguageLegacy,
+        generateForLanguageCreative,
+        toBankInput,
+      },
+      provider,
+    );
+    return;
+  }
+
   const gap = MCQ_BANK_CAP - bankCountAtStart;
   const batchSize = legacyBatchSize(provider, gap);
-  if (shouldUseFastFill(mode, bankCountAtStart, gap)) {
-    const estCalls = Math.max(1, Math.ceil(gap / batchSize));
+  if (shouldUseFastFill(mode, bankCountAtStart, gap, provider)) {
+    const maxRounds = maxLegacyBatches(gap, batchSize);
     await pushLog(
       identifier,
-      `${language} · fast fill — ${gap} MCQs needed · ~${estCalls} API call(s) × ${batchSize} MCQs`,
+      `${language} · fast fill — ${gap} MCQs needed · ${batchSize}/call · up to ${maxRounds} rounds`,
     );
     await generateForLanguageLegacy(
       identifier, sop, language, bankCountAtStart, dedupAtStart, ctx, onBatchDone, provider,
@@ -864,8 +1144,9 @@ export async function enqueueMcqGeneration(
   identifier: string;
   mode: McqGenMode;
   languageScope?: McqGenLanguage;
-  status: "queued";
+  status: "queued" | "running";
   startedAt: string;
+  alreadyRunning?: boolean;
 }> {
   await connectDB();
   const idRegex = escapeId(identifier);
@@ -890,7 +1171,14 @@ export async function enqueueMcqGeneration(
   if (inFlight) {
     const healed = await healOrphanedMcqGenJobIfNeeded(identifier, inFlight);
     if (!healed) {
-      throw new Error(`MCQ generation already in progress for ${identifier}`);
+      return {
+        identifier: String(inFlight.identifier ?? identifier),
+        mode: (inFlight.mode ?? mode) as McqGenMode,
+        languageScope: (inFlight.languageScope ?? undefined) as McqGenLanguage | undefined,
+        status: inFlight.status as "queued" | "running",
+        startedAt: new Date(inFlight.startedAt ?? Date.now()).toISOString(),
+        alreadyRunning: true,
+      };
     }
   }
 
@@ -1040,7 +1328,9 @@ export async function runMcqGeneration(
   const gapSample = MCQ_BANK_CAP;
   await pushLog(
     identifier,
-    `Target: ${MCQ_BANK_CAP} MCQs/language · bulk batches of ${legacyBatchSize(effectiveProvider, gapSample)}`,
+    shouldUseFactPipeline(effectiveProvider)
+      ? `Target: ${MCQ_BANK_CAP} MCQs/language · fact pipeline (extract facts → 1 MCQ/fact)`
+      : `Target: ${MCQ_BANK_CAP} MCQs/language · bulk batches of ${legacyBatchSize(effectiveProvider, gapSample)}`,
   );
 
   let totalApproved = 0;
@@ -1066,7 +1356,7 @@ export async function runMcqGeneration(
         mode === "regenerate" ? 0 : await activeBankCount(identifier, lp.language);
       const dedupAtStart =
         mode === "regenerate"
-          ? { questions: [] as string[], refCounts: new Map<string, number>() }
+          ? { questions: [] as string[], refCounts: new Map<string, number>(), usedFactIds: new Set<string>() }
           : await loadBankDedupState(identifier, lp.language);
       if (bankCountAtStart >= MCQ_BANK_CAP) {
         lp.status = "done";
@@ -1138,8 +1428,10 @@ export async function runMcqGeneration(
         totalApproved === 0 && ctx.failedBatches > 0
           ? `Finished with errors — 0 MCQs added (${ctx.failedBatches} batch error${ctx.failedBatches === 1 ? "" : "s"}). Try Continue.`
           : totalApproved === 0 && langProgress.some((lp) => lp.collected < MCQ_BANK_CAP)
-            ? `Done — bank below ${MCQ_BANK_CAP} (0 new this run)`
-            : `Done — +${totalApproved} MCQs added (${mode})`,
+            ? `Done — ${langProgress.map((lp) => `${lp.collected}/${MCQ_BANK_CAP}`).join(", ")} — creative fill could not add unique questions`
+            : langProgress.some((lp) => lp.collected < MCQ_BANK_CAP)
+              ? `Done — +${totalApproved} added, bank at ${langProgress.map((lp) => `${lp.collected}/${MCQ_BANK_CAP}`).join(", ")}`
+              : `Done — +${totalApproved} MCQs added (${mode})`,
       percent: overallPercent(langProgress),
       languages: langProgress,
       totalInserted: totalApproved,

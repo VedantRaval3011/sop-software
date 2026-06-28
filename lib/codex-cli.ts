@@ -1,5 +1,9 @@
 import { spawn } from "child_process";
-import { errorMessage, isJsonParseError, sleep } from "@/lib/llm-utils";
+import { errorMessage, extractJsonPayload, isJsonParseError, sleep } from "@/lib/llm-utils";
+import {
+  registerComplianceSubprocess,
+  unregisterComplianceSubprocess,
+} from "@/lib/compliance-run-control";
 import { registerMcqSubprocess, unregisterMcqSubprocess } from "@/lib/mcq-run-control";
 import { parseMcqBatchJson, type ParsedMcq } from "@/lib/mcq-json-parse";
 
@@ -11,6 +15,11 @@ const DEFAULT_MCQ_CODEX_MODEL = "gpt-5.4-mini";
 
 export function getMcqCodexModel(): string {
   return process.env.MCQ_CODEX_MODEL ?? DEFAULT_MCQ_CODEX_MODEL;
+}
+
+/** Compliance uses a separate model — defaults to gpt-4.1 (not the MCQ mini model). */
+export function getComplianceCodexModel(): string {
+  return process.env.COMPLIANCE_CODEX_MODEL ?? "gpt-4.1";
 }
 
 export interface CodexCliHealth {
@@ -94,7 +103,27 @@ export async function checkCodexCliHealth(): Promise<CodexCliHealth> {
 export type CodexCliJsonOptions = {
   runKey?: string;
   signal?: AbortSignal;
+  subprocessScope?: "mcq" | "compliance";
 };
+
+function registerCliSubprocess(
+  runKey: string | undefined,
+  proc: import("child_process").ChildProcess,
+  scope: "mcq" | "compliance" = "mcq",
+): void {
+  if (!runKey) return;
+  if (scope === "compliance") registerComplianceSubprocess(runKey, proc);
+  else registerMcqSubprocess(runKey, proc);
+}
+
+function unregisterCliSubprocess(
+  runKey: string | undefined,
+  scope: "mcq" | "compliance" = "mcq",
+): void {
+  if (!runKey) return;
+  if (scope === "compliance") unregisterComplianceSubprocess(runKey);
+  else unregisterMcqSubprocess(runKey);
+}
 
 function runCodex(
   args: string[],
@@ -141,7 +170,10 @@ function runCodex(
 }
 
 const MCQ_JSON_RETRY =
-  "\n\nIMPORTANT: Your last reply had no usable questions. Return ONLY raw JSON with at least one question per clause. sopReference = bracketed clause id. correctAnswer = A, B, C, or D.";
+  "\n\nIMPORTANT: Your last reply had no usable questions. Return ONLY raw JSON. Each question needs explanation (why the correct option is right) and sopReference (SOP quote). correctAnswer = A, B, C, or D.";
+
+const FACT_JSON_RETRY =
+  '\n\nIMPORTANT: Return ONLY raw JSON — no markdown. Use {"facts":[{"id":"F001","topic":"...","fact":"..."}]} with at least 10 facts.';
 
 function isMcqEmptyError(error: unknown): boolean {
   const msg = errorMessage(error).toLowerCase();
@@ -149,14 +181,7 @@ function isMcqEmptyError(error: unknown): boolean {
 }
 
 function extractCodexStdout(text: string): string {
-  const trimmed = text.trim();
-  if (!trimmed) return trimmed;
-  if (trimmed.startsWith("{")) return trimmed;
-  const matches = [...trimmed.matchAll(/\{[\s\S]*?\}(?=\s*$|\s*\{)/g)];
-  if (matches.length > 0) return matches[matches.length - 1][0];
-  const lastBrace = trimmed.lastIndexOf("{");
-  if (lastBrace >= 0) return trimmed.slice(lastBrace);
-  return trimmed;
+  return extractJsonPayload(text);
 }
 function wrapMcqCodexPrompt(system: string, user: string): string {
   return `${system}
@@ -185,7 +210,7 @@ async function runCodexExecPrompt(
 
     const proc = spawn("codex", args, { stdio: ["pipe", "pipe", "pipe"], shell: true });
 
-    if (options?.runKey) registerMcqSubprocess(options.runKey, proc);
+    if (options?.runKey) registerCliSubprocess(options.runKey, proc, options.subprocessScope);
 
     let stdout = "";
     let stderr = "";
@@ -195,13 +220,17 @@ async function runCodexExecPrompt(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      if (options?.runKey) unregisterMcqSubprocess(options.runKey);
+      if (options?.runKey) unregisterCliSubprocess(options.runKey, options.subprocessScope);
       fn();
     };
 
     const onAbort = () => {
       try {
-        proc.kill();
+        if (process.platform === "win32" && proc.pid) {
+          spawn("taskkill", ["/F", "/T", "/PID", String(proc.pid)], { shell: true, stdio: "ignore" });
+        } else {
+          proc.kill();
+        }
       } catch {
         /* ignore */
       }
@@ -247,6 +276,46 @@ async function runCodexExecPrompt(
     proc.stdin.write(prompt, "utf8");
     proc.stdin.end();
   });
+}
+
+/** Codex CLI for arbitrary JSON tasks (fact extraction, etc.). */
+export async function generateCodexCliJson<T>(
+  system: string,
+  user: string,
+  parse: (text: string) => T,
+  label: string,
+  modelOverride?: string,
+  options?: CodexCliJsonOptions,
+): Promise<T> {
+  const model = modelOverride ?? getMcqCodexModel();
+  let lastError: unknown;
+  let userBlock = user;
+
+  for (let attempt = 0; attempt < CODEX_CLI_MAX_ATTEMPTS + 1; attempt++) {
+    if (options?.signal?.aborted) throw new Error("Generation cancelled");
+    try {
+      const prompt = wrapMcqCodexPrompt(system, userBlock);
+      const raw = await runCodexExecPrompt(prompt, model, options);
+      const text = extractCodexStdout(raw);
+      return parse(text);
+    } catch (error) {
+      lastError = error;
+      if (attempt < CODEX_CLI_MAX_ATTEMPTS && isMcqEmptyError(error)) {
+        userBlock =
+          user +
+          (label.includes("fact")
+            ? FACT_JSON_RETRY
+            : "\n\nIMPORTANT: Return ONLY raw JSON. No markdown fences or commentary.");
+        await sleep(2000);
+        continue;
+      }
+      throw new Error(
+        `Codex (${model}) ${label} failed: ${errorMessage(lastError).slice(0, 220)}`,
+      );
+    }
+  }
+
+  throw lastError ?? new Error(`Codex CLI ${label} request failed`);
 }
 
 /** Codex CLI for MCQ batches — uses local ChatGPT subscription via `codex exec`. */

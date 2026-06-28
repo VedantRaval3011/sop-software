@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { checkCodexCliHealth, getMcqCodexModel } from "@/lib/codex-cli";
+import { checkCodexCliHealth, getComplianceCodexModel, getMcqCodexModel } from "@/lib/codex-cli";
 import { requireAuth } from "@/lib/withAuth";
 
 /** Verify the server can reach the local Codex CLI and subscription auth. */
@@ -10,6 +10,10 @@ export async function GET() {
   const health = await checkCodexCliHealth();
   return NextResponse.json({
     success: health.ok,
-    codex: { ...health, mcqModel: getMcqCodexModel() },
+    codex: {
+      ...health,
+      mcqModel: getMcqCodexModel(),
+      complianceModel: getComplianceCodexModel(),
+    },
   });
 }

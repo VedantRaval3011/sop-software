@@ -21,7 +21,7 @@ import {
 
 interface MCQ {
   question: string;
-  difficulty: "Easy" | "Medium" | "Hard";
+  difficulty?: "Easy" | "Medium" | "Hard" | string;
   difficultyStars?: string;
   options: string[];
   correctAnswer: string;
@@ -30,6 +30,14 @@ interface MCQ {
   isChecked?: boolean;
   isReviewed?: boolean;
   isSimilar?: boolean;
+}
+
+function displayDifficulty(raw: unknown): "Easy" | "Medium" | "Hard" {
+  const s = String(raw ?? "").toLowerCase();
+  if (s === "easy") return "Easy";
+  if (s === "hard") return "Hard";
+  if (raw === "Easy" || raw === "Medium" || raw === "Hard") return raw;
+  return "Medium";
 }
 
 interface MCQBank {
@@ -73,6 +81,7 @@ interface QuestionCardProps {
 
 function QuestionCard({ mcq, originalIndex, bankId, searchTerm, onUpdated, onOpen }: QuestionCardProps) {
   const [updating, setUpdating] = useState<string | null>(null);
+  const difficulty = displayDifficulty(mcq.difficulty);
 
   async function toggle(field: "isChecked" | "isReviewed" | "isSimilar") {
     setUpdating(field);
@@ -89,9 +98,9 @@ function QuestionCard({ mcq, originalIndex, bankId, searchTerm, onUpdated, onOpe
   }
 
   const diffBadge =
-    mcq.difficulty === "Easy"
+    difficulty === "Easy"
       ? "bg-blue-50 text-blue-600 border-blue-200"
-      : mcq.difficulty === "Medium"
+      : difficulty === "Medium"
       ? "bg-amber-50 text-amber-600 border-amber-200"
       : "bg-rose-50 text-rose-600 border-rose-200";
 
@@ -120,8 +129,8 @@ function QuestionCard({ mcq, originalIndex, bankId, searchTerm, onUpdated, onOpe
           <div className="mb-1.5 flex items-center justify-between">
             <div className="flex flex-wrap items-center gap-2">
               <span className={`flex h-6 w-6 items-center justify-center rounded border text-[11px] font-black ${diffBadge}`}
-                title={mcq.difficulty}>
-                {mcq.difficulty[0]}
+                title={difficulty}>
+                {difficulty[0]}
               </span>
             </div>
             <div className="flex items-center gap-1.5">

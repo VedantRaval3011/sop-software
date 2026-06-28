@@ -1,0 +1,306 @@
+import type { LlmProvider } from "@/lib/llm";
+import type { ComplianceFinding } from "@/lib/complianceEngine";
+import { analyzeSOPComplianceV5, type SopLibraryEntry } from "@/lib/complianceEngineV5";
+import { saveComplianceReport } from "@/lib/complianceReportStorage";
+import {
+  attachGapIdsToReportFindings,
+  persistComplianceFindings,
+} from "@/lib/compliance-finding-store";
+import { runIncrementalComplianceReview } from "@/lib/compliance-incremental";
+import { getOrBuildComplianceStructure } from "@/lib/compliance-sop-cache";
+import { hashGuidelineSet, hashSingleGuideline, hashSopContent } from "@/lib/compliance-hashes";
+import type { IComplianceFindingDetail } from "@/models/ComplianceReport";
+import ComplianceGapFinding from "@/models/ComplianceGapFinding";
+import ComplianceReport from "@/models/ComplianceReport";
+import type { ISOP } from "@/models/SOP";
+
+export type GuidelineClauseInput = {
+  clauseNumber: string;
+  clauseTitle: string;
+  clauseText: string;
+  guidelineName: string;
+  folderName: string;
+  pdfName?: string;
+  guidelineId: string;
+};
+
+export type ComplianceReviewMode = "initial" | "incremental" | "auto";
+
+export type RunComplianceReviewInput = {
+  sop: ISOP;
+  guidelineClauses: GuidelineClauseInput[];
+  sopLibrary: SopLibraryEntry[];
+  provider?: LlmProvider;
+  model?: string;
+  mode?: ComplianceReviewMode;
+  forceRefresh?: boolean;
+  runEpoch?: number;
+};
+
+export type ComplianceReviewOutput = {
+  mode: "initial" | "incremental" | "cached";
+  overallScore: number;
+  complianceStatus: string;
+  compliantCount: number;
+  partialCount: number;
+  nonCompliantCount: number;
+  criticalCount: number;
+  majorCount: number;
+  minorCount: number;
+  improvementCount: number;
+  clauseCoveragePct: number;
+  totalGuidelinesChecked: number;
+  processingTimeMs: number;
+  findingsPersisted?: number;
+  findingsSkipped?: number;
+  findingsMerged?: number;
+  incrementalReviewed?: number;
+  incrementalResolved?: number;
+};
+
+/** Map a stored DB finding back to the engine's ComplianceFinding shape. */
+function fromStoredFinding(f: IComplianceFindingDetail): ComplianceFinding {
+  return {
+    clauseNumber: f.clauseNumber,
+    clauseTitle: f.clauseTitle,
+    complianceLevel: f.complianceLevel,
+    matchConfidence: f.matchConfidence,
+    issueSeverity: f.issueSeverity,
+    sopSectionAffected: f.sopSectionAffected,
+    mismatchExplanation: f.mismatchExplanation,
+    sopTextSnippet: f.sopTextSnippet,
+    guidelineRequirement: f.guidelineRequirement,
+    suggestedAction: f.suggestedAction,
+    suggestedText: f.suggestedText,
+    impactAnalysis: f.impactAnalysis,
+    highlightedIssue: f.mismatchExplanation,
+    estimatedEffort: f.estimatedEffort,
+    guidelineName: f.guidelineName,
+    folderName: f.folderName,
+    guidelineId: f.guidelineId?.toString(),
+    findingType: f.findingType as ComplianceFinding["findingType"],
+    guidelineReference: f.guidelineReference,
+    evidenceFound: f.evidenceFound,
+    evidenceMissing: f.evidenceMissing,
+    pageNumber: f.pageNumber,
+    paragraphNumber: f.paragraphNumber,
+    rootCauseKey: f.rootCauseKey,
+    applicability: f.applicability as ComplianceFinding["applicability"],
+    scopeOwner: f.scopeOwner as ComplianceFinding["scopeOwner"],
+    requirementCriticality: f.requirementCriticality as ComplianceFinding["requirementCriticality"],
+    whyApplies: f.whyApplies,
+    whyEvidenceInsufficient: f.whyEvidenceInsufficient,
+    findingCategory: f.findingCategory,
+    riskLevel: f.riskLevel,
+    evidenceStrength: f.evidenceStrength,
+    requiresManualReview: f.requiresManualReview,
+    mergedClauseRefs: f.mergedClauseRefs,
+  };
+}
+
+function deriveComplianceStatus(score: number): string {
+  if (score >= 8) return "Fully Compliant";
+  if (score >= 5) return "Partially Compliant";
+  return "Non-Compliant";
+}
+
+export async function runComplianceReview(
+  input: RunComplianceReviewInput,
+): Promise<ComplianceReviewOutput> {
+  const start = Date.now();
+  const sopContentHash = hashSopContent(input.sop.content ?? "");
+  const guidelineHash = hashGuidelineSet(input.guidelineClauses);
+  const structure = await getOrBuildComplianceStructure(input.sop);
+
+  const existingReport = await ComplianceReport.findOne({
+    sopId: input.sop._id,
+    analysisStatus: "completed",
+  })
+    .sort({ analyzedAt: -1 })
+    .lean();
+
+  const existingGaps = await ComplianceGapFinding.countDocuments({ sopId: input.sop._id });
+  const unresolvedGaps = await ComplianceGapFinding.countDocuments({
+    sopId: input.sop._id,
+    resolved: false,
+  });
+
+  const wantIncremental =
+    input.mode === "incremental" ||
+    (input.mode !== "initial" &&
+      !input.forceRefresh &&
+      existingReport &&
+      existingGaps > 0 &&
+      unresolvedGaps > 0);
+
+  if (wantIncremental && !input.forceRefresh) {
+    const prevHashes = input.sop.complianceStructureCache?.sectionHashes;
+    const inc = await runIncrementalComplianceReview(input.sop, {
+      provider: input.provider,
+      previousStructure: prevHashes,
+    });
+
+    return {
+      mode: "incremental",
+      overallScore: inc.overallScore,
+      complianceStatus: deriveComplianceStatus(inc.overallScore),
+      compliantCount: existingReport?.compliantCount ?? 0,
+      partialCount: existingReport?.partialCount ?? 0,
+      nonCompliantCount: existingReport?.nonCompliantCount ?? 0,
+      criticalCount: inc.criticalCount,
+      majorCount: inc.majorCount,
+      minorCount: inc.minorCount,
+      improvementCount: inc.improvementCount,
+      clauseCoveragePct: existingReport?.clauseCoveragePct ?? 0,
+      totalGuidelinesChecked: existingReport?.totalGuidelinesChecked ?? 0,
+      processingTimeMs: Date.now() - start,
+      incrementalReviewed: inc.reviewed,
+      incrementalResolved: inc.resolved,
+    };
+  }
+
+  if (!input.forceRefresh && existingReport && existingGaps > 0) {
+    const reportGuidelineHash = (existingReport as { guidelineSetHash?: string }).guidelineSetHash;
+    if (reportGuidelineHash === guidelineHash) {
+      return {
+        mode: "cached",
+        overallScore: existingReport.overallScore,
+        complianceStatus: existingReport.complianceStatus,
+        compliantCount: existingReport.compliantCount,
+        partialCount: existingReport.partialCount,
+        nonCompliantCount: existingReport.nonCompliantCount,
+        criticalCount: existingReport.criticalCount ?? 0,
+        majorCount: existingReport.majorCount ?? 0,
+        minorCount: existingReport.minorCount ?? 0,
+        improvementCount: existingReport.improvementCount ?? 0,
+        clauseCoveragePct: existingReport.clauseCoveragePct ?? 0,
+        totalGuidelinesChecked: existingReport.totalGuidelinesChecked,
+        processingTimeMs: Date.now() - start,
+      };
+    }
+  }
+
+  // Per-guideline cache: only re-analyze guidelines whose content changed.
+  // Fresh guidelines reuse findings stored in the last completed report.
+  const staleClauses: GuidelineClauseInput[] = [];
+  const cachedFindings: ComplianceFinding[] = [];
+  const newGuidelineHashes = new Map<string, string>();
+
+  const byGuideline = new Map<string, GuidelineClauseInput[]>();
+  for (const c of input.guidelineClauses) {
+    const id = c.guidelineId;
+    if (!byGuideline.has(id)) byGuideline.set(id, []);
+    byGuideline.get(id)!.push(c);
+  }
+
+  // Mongoose .lean() returns Maps as plain objects — normalize to a real Map.
+  const storedHashesRaw =
+    !input.forceRefresh && existingReport?.sopContentHash === sopContentHash
+      ? ((existingReport as Record<string, unknown>).guidelineHashes as Record<string, string> | Map<string, string> | undefined)
+      : undefined;
+  const storedHashes: Map<string, string> | undefined = storedHashesRaw
+    ? storedHashesRaw instanceof Map
+      ? storedHashesRaw
+      : new Map(Object.entries(storedHashesRaw))
+    : undefined;
+
+  for (const [id, clauses] of byGuideline) {
+    const hash = hashSingleGuideline(clauses);
+    newGuidelineHashes.set(id, hash);
+
+    if (storedHashes?.get(id) === hash && existingReport) {
+      const fresh = (existingReport.findings as IComplianceFindingDetail[])
+        .filter((f) => f.guidelineId?.toString() === id)
+        .map(fromStoredFinding);
+      cachedFindings.push(...fresh);
+      console.log(`[orchestrator] guideline ${id}: cache hit (${fresh.length} findings reused)`);
+    } else {
+      staleClauses.push(...clauses);
+    }
+  }
+
+  const hasStalework = staleClauses.length > 0;
+  if (!hasStalework && cachedFindings.length > 0) {
+    // All guidelines are fresh — return cached report directly.
+    return {
+      mode: "cached",
+      overallScore: existingReport!.overallScore,
+      complianceStatus: existingReport!.complianceStatus,
+      compliantCount: existingReport!.compliantCount,
+      partialCount: existingReport!.partialCount,
+      nonCompliantCount: existingReport!.nonCompliantCount,
+      criticalCount: existingReport!.criticalCount ?? 0,
+      majorCount: existingReport!.majorCount ?? 0,
+      minorCount: existingReport!.minorCount ?? 0,
+      improvementCount: existingReport!.improvementCount ?? 0,
+      clauseCoveragePct: existingReport!.clauseCoveragePct ?? 0,
+      totalGuidelinesChecked: existingReport!.totalGuidelinesChecked,
+      processingTimeMs: Date.now() - start,
+    };
+  }
+
+  const result = await analyzeSOPComplianceV5({
+    sopIdentifier: input.sop.identifier,
+    sopName: input.sop.name,
+    department: input.sop.department,
+    sopContent: input.sop.content,
+    sopId: input.sop._id.toString(),
+    runEpoch: input.runEpoch,
+    guidelineClauses: staleClauses,
+    cachedFindings,
+    allClauses: input.guidelineClauses,
+    sopLibrary: input.sopLibrary,
+    provider: input.provider,
+    model: input.model,
+  });
+
+  const saved = await saveComplianceReport({
+    sopId: input.sop._id.toString(),
+    sopIdentifier: input.sop.identifier,
+    sopName: input.sop.name,
+    sopVersion: input.sop.version ?? "1.0",
+    department: input.sop.department,
+    findings: result.findings,
+    overallScore: result.overallScore,
+    complianceStatus: result.complianceStatus,
+    scoreBreakdown: result.scoreBreakdown,
+    traceabilityMatrix: result.traceabilityMatrix,
+    crossSopDependencies: result.crossSopDependencies,
+    clauseCoveragePct: result.clauseCoveragePct,
+    auditCompleteness: result.auditCompleteness,
+    analysisEngineVersion: result.analysisEngineVersion,
+  });
+
+  await ComplianceReport.updateOne(
+    { _id: saved?._id },
+    { $set: { sopContentHash, guidelineSetHash: guidelineHash, guidelineHashes: newGuidelineHashes } },
+  );
+
+  const persistResult = await persistComplianceFindings({
+    sopId: input.sop._id.toString(),
+    reportId: saved?._id?.toString(),
+    findings: result.findings,
+    structure,
+  });
+
+  return {
+    mode: "initial",
+    overallScore: result.overallScore,
+    complianceStatus: result.complianceStatus,
+    compliantCount: result.compliantCount,
+    partialCount: result.partialCount,
+    nonCompliantCount: result.nonCompliantCount,
+    criticalCount: result.criticalCount ?? 0,
+    majorCount: result.majorCount ?? 0,
+    minorCount: result.minorCount ?? 0,
+    improvementCount: result.improvementCount ?? 0,
+    clauseCoveragePct: result.clauseCoveragePct ?? 0,
+    totalGuidelinesChecked: result.totalGuidelinesChecked ?? 0,
+    processingTimeMs: result.processingTimeMs ?? Date.now() - start,
+    findingsPersisted: persistResult.persisted,
+    findingsSkipped: persistResult.skipped,
+    findingsMerged: persistResult.merged,
+  };
+}
+
+export { attachGapIdsToReportFindings };

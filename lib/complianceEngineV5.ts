@@ -19,7 +19,14 @@
  * Built on the resilient batching/AI infrastructure proven in V3.
  */
 
-import { generateComplianceJson } from "@/lib/gemini";
+import { generateComplianceJson } from "@/lib/llm";
+import {
+  assertComplianceRunActive,
+  ComplianceAnalysisCancelledError,
+  getComplianceRunSignal,
+  isComplianceRunCancelled,
+  isComplianceRunStopRequested,
+} from "@/lib/compliance-run-control";
 import { isGeminiDailyQuotaError } from "@/lib/gemini-client";
 import { getComplianceProvider, type LlmProvider } from "@/lib/llm";
 import {
@@ -87,15 +94,21 @@ function envInt(key: string, fallback: number): number {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
 }
 
-/** Per-run context — set by analyzeSOPComplianceV5, cleared after. Allows the
- *  UI to pass a per-request provider/model without mutating env vars. */
-let _runCtx: { provider?: LlmProvider; model?: string } = {};
+/** Per-run context — set by analyzeSOPComplianceV5, cleared after. */
+let _runCtx: { provider?: LlmProvider; model?: string; sopId?: string; runEpoch?: number } = {};
+
+function shouldAbortRun(): boolean {
+  if (_runCtx.runEpoch !== undefined && isComplianceRunCancelled(_runCtx.runEpoch)) return true;
+  if (_runCtx.sopId && isComplianceRunStopRequested(_runCtx.sopId)) return true;
+  return false;
+}
 
 function runProvider(): LlmProvider {
   return _runCtx.provider ?? getComplianceProvider();
 }
 function isRunOllama(): boolean { return runProvider() === "ollama"; }
 function isRunClaude(): boolean { return runProvider() === "claude"; }
+function isRunCodex(): boolean { return runProvider() === "codex"; }
 function isRunGeminiFreeTier(): boolean {
   return runProvider() === "gemini" && process.env.GEMINI_FREE_TIER !== "false";
 }
@@ -104,16 +117,19 @@ function isRunGeminiFreeTier(): boolean {
 function getRunConfig() {
   const ollama = isRunOllama();
   const claude = isRunClaude();
+  const codex = isRunCodex();
+  const cli = claude || codex;
   const free   = isRunGeminiFreeTier();
   return {
-    maxClausesPerBatch:    envInt("COMPLIANCE_MAX_CLAUSES_PER_BATCH",    ollama ? 3  : claude ? 15 : free ? 80  : 40),
+    maxClausesPerBatch:    envInt("COMPLIANCE_MAX_CLAUSES_PER_BATCH",    ollama ? 3  : cli ? 15 : free ? 80  : 40),
     maxClausesDeepBatch:   envInt("COMPLIANCE_MAX_CLAUSES_DEEP_BATCH",   ollama ? 2  : 8),
-    maxDeepGapClauses:     envInt("COMPLIANCE_MAX_DEEP_GAP_CLAUSES",     (ollama || free) ? 0 : claude ? 40 : 120),
+    maxDeepGapClauses:     envInt("COMPLIANCE_MAX_DEEP_GAP_CLAUSES",     (ollama || free) ? 0 : cli ? 40 : 120),
     skipDeepEnrichment:    ollama || free || process.env.COMPLIANCE_SKIP_DEEP_ENRICHMENT === "true",
-    batchConcurrency:      envInt("COMPLIANCE_BATCH_CONCURRENCY",        (ollama || claude) ? 1 : free ? 1 : 8),
-    deepBatchConcurrency:  envInt("COMPLIANCE_DEEP_BATCH_CONCURRENCY",   (ollama || claude) ? 1 : free ? 1 : 6),
-    batchDelayMs:          ollama ? 500 : claude ? 0 : free ? 0 : 300,
-    maxSopCharsPerBatch:   envInt("COMPLIANCE_MAX_SOP_CHARS_PER_BATCH",  ollama ? 4_000 : claude ? 40_000 : 55_000),
+    batchConcurrency:      envInt("COMPLIANCE_BATCH_CONCURRENCY",        (ollama || cli) ? 1 : free ? 1 : 8),
+    deepBatchConcurrency:  envInt("COMPLIANCE_DEEP_BATCH_CONCURRENCY",   (ollama || cli) ? 1 : free ? 1 : 6),
+    batchDelayMs:          ollama ? 500 : cli ? 0 : free ? 0 : 300,
+    maxSopCharsPerBatch:   envInt("COMPLIANCE_MAX_SOP_CHARS_PER_BATCH",  ollama ? 4_000 : cli ? 40_000 : 55_000),
+    maxSopCharsScreen:     envInt("COMPLIANCE_MAX_SOP_CHARS_SCREEN",     ollama ? 2_000 : cli ? 8_000 : 12_000),
     maxSectionSummaryChars: ollama ? envInt("COMPLIANCE_MAX_SECTION_SUMMARY_CHARS", 400) : Number.MAX_SAFE_INTEGER,
     maxClauseTextChars:    ollama ? envInt("COMPLIANCE_MAX_CLAUSE_TEXT_CHARS", 180) : 350,
     maxClauseTextDeep:     ollama ? 800 : 1_500,
@@ -400,7 +416,7 @@ async function analyzeBatch(
     )
     .join("\n\n");
 
-  const sopBlock = indexedSopContent.slice(0, cfg.maxSopCharsPerBatch);
+  const sopBlock = indexedSopContent.slice(0, options?.deep ? cfg.maxSopCharsPerBatch : cfg.maxSopCharsScreen);
   const summaryBlock =
     sectionSummary.length > cfg.maxSectionSummaryChars
       ? `${sectionSummary.slice(0, cfg.maxSectionSummaryChars)}…`
@@ -451,6 +467,9 @@ Return exactly ${batch.length} findings in the same order. Include guidelineName
     userPrompt,
     runProvider(),
     _runCtx.model,
+    _runCtx.sopId
+      ? { runKey: _runCtx.sopId, signal: getComplianceRunSignal(_runCtx.sopId) }
+      : undefined,
   );
 
   if (isOllamaProvider()) {
@@ -571,6 +590,14 @@ async function runBatchesParallel(
       const i = nextIndex++;
       if (i >= batches.length) return;
       const label = `${phase} ${i + 1}/${batches.length}`;
+
+      if (shouldAbortRun()) {
+        if (!quotaAbortMessage) quotaAbortMessage = "Analysis cancelled by user";
+        results[i] = markBatchFailed(batches[i], "Analysis cancelled by user");
+        completed++;
+        continue;
+      }
+
       const t0 = Date.now();
 
       if (quotaAbortMessage) {
@@ -584,6 +611,7 @@ async function runBatchesParallel(
       }
 
       try {
+        if (_runCtx.sopId) assertComplianceRunActive(_runCtx.sopId, _runCtx.runEpoch);
         results[i] = await analyzeBatchResilient(
           ctx.sopIdentifier,
           ctx.sopName,
@@ -596,6 +624,20 @@ async function runBatchesParallel(
         );
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
+        if (msg.toLowerCase().includes("cancel")) {
+          quotaAbortMessage = "Analysis cancelled by user";
+          results[i] = markBatchFailed(batches[i], "Analysis cancelled by user");
+          completed++;
+          console.log(`[complianceV5] ${label} cancelled`);
+          continue;
+        }
+        if (err instanceof ComplianceAnalysisCancelledError) {
+          quotaAbortMessage = err.message;
+          results[i] = markBatchFailed(batches[i], "Analysis cancelled by user");
+          completed++;
+          console.log(`[complianceV5] ${label} cancelled`);
+          continue;
+        }
         if (isGeminiDailyQuotaError(err)) {
           if (!quotaAbortMessage) {
             quotaAbortMessage = msg;
@@ -800,17 +842,35 @@ export async function analyzeSOPComplianceV5(request: {
   sopContent: string;
   guidelineClauses: GuidelineClauseInput[];
   sopLibrary?: SopLibraryEntry[];
+  /** Mongo SOP id — used for cancel/stop during long runs. */
+  sopId?: string;
+  /** Epoch from beginComplianceRun — checked on every batch. */
+  runEpoch?: number;
   /** Override the compliance provider for this run (e.g. "claude"). */
   provider?: LlmProvider;
   /** Override the model for this run (e.g. "claude-haiku-4-5-20251001"). */
   model?: string;
+  /** Pre-analyzed findings for unchanged guidelines — merged before post-processing, skipping AI. */
+  cachedFindings?: ComplianceFinding[];
+  /** Full clause set for the traceability matrix (defaults to guidelineClauses). */
+  allClauses?: GuidelineClauseInput[];
 }): Promise<ComplianceAnalysisResult> {
-  _runCtx = { provider: request.provider, model: request.model };
+  _runCtx = {
+    provider: request.provider,
+    model: request.model,
+    sopId: request.sopId,
+    runEpoch: request.runEpoch,
+  };
   const startTime = Date.now();
 
   if (!request.sopContent || request.sopContent.trim().length < 50) {
+    _runCtx = {};
     return emptyResult(startTime);
   }
+
+  try {
+    if (request.sopId) assertComplianceRunActive(request.sopId, request.runEpoch);
+    if (shouldAbortRun()) throw new ComplianceAnalysisCancelledError();
 
   const parsedSop = parseSopStructure(request.sopContent);
   const sectionSummary = buildSectionSummary(parsedSop);
@@ -842,6 +902,10 @@ export async function analyzeSOPComplianceV5(request: {
     "screen",
     batchCtx,
   );
+
+  if (shouldAbortRun()) {
+    throw new ComplianceAnalysisCancelledError();
+  }
 
   const findingByKey = new Map<string, ComplianceFinding>();
   for (const f of screeningFindings) {
@@ -885,14 +949,16 @@ export async function analyzeSOPComplianceV5(request: {
     for (const f of deepFindings) {
       findingByKey.set(clauseKey(f), f);
     }
+
+    if (shouldAbortRun()) {
+      throw new ComplianceAnalysisCancelledError();
+    }
   } else if (gapClauses.length > 0 && cfg.skipDeepEnrichment) {
     const reason = isRunOllama() ? "Ollama" : isRunGeminiFreeTier() ? "Gemini free tier" : "env override";
     console.log(
       `[complianceV5] ${request.sopIdentifier}: skipping phase 2 deep enrichment (${gapClauses.length} gaps kept at screening detail — ${reason})`,
     );
   }
-
-  _runCtx = {}; // clear after run
 
   // Preserve original clause order for traceability and scoring.
   const clauseFindings: ComplianceFinding[] = request.guidelineClauses.map((c) => {
@@ -904,17 +970,24 @@ export async function analyzeSOPComplianceV5(request: {
     return f;
   });
 
+  // Merge pre-analyzed findings for unchanged guidelines (from per-guideline cache).
+  const allClauseFindings = request.cachedFindings?.length
+    ? [...clauseFindings, ...request.cachedFindings]
+    : clauseFindings;
+
+  const allClausesForMatrix = request.allClauses ?? request.guidelineClauses;
+
   // 2. Evidence validation (verifies cited SOP text, downgrades false positives).
   const validatedClauseFindings = validateAllFindings(
-    clauseFindings,
-    request.guidelineClauses,
+    allClauseFindings,
+    allClausesForMatrix,
     request.sopContent,
     parsedSop,
     { identifier: request.sopIdentifier, name: request.sopName },
   );
 
   // 3. Traceability matrix is built from the full clause set (every clause reviewed).
-  const traceabilityMatrix = buildTraceabilityMatrix(request.guidelineClauses, validatedClauseFindings);
+  const traceabilityMatrix = buildTraceabilityMatrix(allClausesForMatrix, validatedClauseFindings);
 
   // 4. GMP Intelligence Layer — expectations beyond literal clause wording.
   const topics = detectSopTopics(request.sopName, request.sopContent);
@@ -998,6 +1071,9 @@ export async function analyzeSOPComplianceV5(request: {
     auditCompleteness,
     analysisEngineVersion: "v5",
   };
+  } finally {
+    _runCtx = {};
+  }
 }
 
 /**
