@@ -99,11 +99,13 @@ async function resolveLibraryDocumentPath(
 ): Promise<string | null> {
   await connectDB();
   const wantGuj = language === 'Gujarati';
-  const libs = await SOPLibrary.find(sopIdentifierMatchFilter(identifier, 'sopIdentifier'))
+  const libs = await SOPLibrary.find(sopIdentifierMatchFilter(identifier, 'identifier'))
     .select('sopDocuments language')
     .lean();
-  const row = pickLibraryRow(libs, wantGuj);
-  const allDocs = row?.sopDocuments || [];
+  // Aggregate sopDocuments across every matching row (ordered by language preference).
+  // The master records live in the `sops` collection where each row carries only its own
+  // file in sopDocuments, so the requested DOCX/PDF may sit in a sibling row, not the first.
+  const allDocs = orderLibraryRowsByLanguage(libs, wantGuj).flatMap((r) => r.sopDocuments || []);
   if (!allDocs.length) return null;
 
   // CRITICAL FIX: Filter documents by language BEFORE scanning
@@ -150,7 +152,7 @@ async function resolveLibraryPathByBasename(
   const wantGuj = language === 'Gujarati';
   const tb = targetBasename.trim().toLowerCase();
   if (!tb) return null;
-  const libs = await SOPLibrary.find(sopIdentifierMatchFilter(identifier, 'sopIdentifier'))
+  const libs = await SOPLibrary.find(sopIdentifierMatchFilter(identifier, 'identifier'))
     .select('sopDocuments language')
     .lean();
   const row = pickLibraryRow(libs, wantGuj);
@@ -313,7 +315,7 @@ async function findFirstReachablePathForIdentifiers(
     return docLang !== 'gujarati' && docLang !== 'guj' && !pathSuggestsGujarati(docPath);
   };
   for (const id of ids) {
-    const libs = await SOPLibrary.find(sopIdentifierMatchFilter(id, 'sopIdentifier'))
+    const libs = await SOPLibrary.find(sopIdentifierMatchFilter(id, 'identifier'))
       .select('sopDocuments language')
       .lean();
     /** Pass 1: only docs whose own language matches. Pass 2: any doc (legacy rows with no per-doc language). */
@@ -447,21 +449,23 @@ async function resolveFromVersionArtifacts(
 
   // Try exact language first, then the other as fallback (with logging)
   for (const [langIndex, langTry] of [[0, lang], [1, fallbackLang]].map(([idx, l]) => [idx as number, l as string])) {
-    if (langIndex === 1) {
-      // This is the fallback attempt — log it
+    const vaFilter: Record<string, unknown> = {
+      ...sopIdentifierMatchFilter(identifier, 'identifier'),
+      language: langTry,
+    };
+    const docs = await SOPVersionArtifacts.find(vaFilter)
+      .select('entries')
+      .lean();
+
+    // Only announce a language fallback when artifacts for the requested language are genuinely
+    // absent — never when the collection simply has no rows for this identifier at all.
+    if (langIndex === 1 && docs.length > 0) {
       console.warn(
         `[FILE_LANG_FALLBACK] Requested ${lang} ${wantKind} for "${identifier}" not found in ` +
         `SOPVersionArtifacts. Falling back to ${fallbackLang}.`
       );
       usedFallback = true;
     }
-
-    const docs = await SOPVersionArtifacts.find({
-      ...sopIdentifierMatchFilter(identifier, 'identifier'),
-      language: langTry,
-    })
-      .select('entries')
-      .lean();
 
     for (const doc of docs) {
       const sorted = [...(doc.entries || [])].sort((a, b) => b.version - a.version);

@@ -769,7 +769,16 @@ function buildPriorVersions(group: ISOP[], currentVersion: string, language = "E
       headerDatesValid?: boolean;
     }
   >();
+  // An active family may carry obsolete leftovers that share a (versionNum, language)
+  // with a live record — e.g. a stale zero-padded duplicate (PREG21-00 vs PREG21-0) from
+  // before a department/version reconcile. These collide on the `${num}-${lang}` key below
+  // and, because the merge is last-write-wins, an obsolete record iterated later overwrites
+  // the live file link AND its header-date flag — surfacing as a stale preview and a false
+  // "Version Date Missing". Skip obsolete records here so only live files supply prior slots.
+  // (Fully-obsolete families keep their records so the Obsolete view still shows prior files.)
+  const familyHasActive = group.some((r) => !r.isObsolete);
   for (const record of group) {
+    if (familyHasActive && record.isObsolete) continue;
     const num = recordVersionNum(record);
     if (num >= currentNum) continue;
     const lang = record.language === "Gujarati" ? "GUJ" : "ENG";

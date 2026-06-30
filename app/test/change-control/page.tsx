@@ -1,0 +1,296 @@
+'use client';
+
+import { useState, useEffect } from 'react';
+import { useRouter } from 'next/navigation';
+import { useAuthGuard } from '@/hooks/useAuthGuard';
+import { useSession } from 'next-auth/react';
+import QuestionBasisSelection from '@/components/QuestionBasisSelection';
+import TestRunner from '@/components/TestRunner';
+import { ArrowLeft, ChevronRight, Loader2, Search } from 'lucide-react';
+
+type Step = 'selection' | 'difficulty' | 'criteria' | 'testing';
+
+const DIFFICULTIES = ['Easy', 'Medium', 'Hard', 'Any'] as const;
+
+interface RegistryEntry {
+  id: string;
+  identifier: string;
+  sopName: string;
+  department: string;
+  language: string;
+  totalMcqs: number;
+  banks: { id: string; langCode: string }[];
+  hasMcq: boolean;
+}
+
+export default function ChangeControlTestPage() {
+  useAuthGuard();
+  const router = useRouter();
+  const { data: session } = useSession();
+
+  const [step, setStep] = useState<Step>('selection');
+  const [basis, setBasis] = useState<'ai' | 'manual'>('ai');
+  const [difficulty, setDifficulty] = useState<string>('Any');
+  const [selectedBankIds, setSelectedBankIds] = useState<string[]>([]);
+  const [questionCount, setQuestionCount] = useState(20);
+  const [entries, setEntries] = useState<RegistryEntry[]>([]);
+  const [search, setSearch] = useState('');
+  const [questions, setQuestions] = useState<any[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [fetchingBanks, setFetchingBanks] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    setFetchingBanks(true);
+    fetch('/api/mcq-bank/registry?all=1')
+      .then((r) => r.json())
+      .then((d) => {
+        const active: RegistryEntry[] = (d.active || []).filter(
+          (e: RegistryEntry) => e.totalMcqs > 0 && e.banks?.length > 0,
+        );
+        setEntries(active);
+      })
+      .catch(() => {})
+      .finally(() => setFetchingBanks(false));
+  }, []);
+
+  const handleBasisSelect = (type: 'ai' | 'manual') => {
+    setBasis(type);
+    setStep(type === 'ai' ? 'criteria' : 'difficulty');
+  };
+
+  const toggleEntry = (entry: RegistryEntry) => {
+    const ids = entry.banks.map((b) => b.id);
+    setSelectedBankIds((prev) => {
+      const alreadySelected = ids.some((id) => prev.includes(id));
+      return alreadySelected ? prev.filter((id) => !ids.includes(id)) : [...prev, ...ids];
+    });
+  };
+
+  const isEntrySelected = (entry: RegistryEntry) =>
+    entry.banks.some((b) => selectedBankIds.includes(b.id));
+
+  const generate = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const res = await fetch('/api/test/change-control', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mode: basis,
+          difficulty: basis === 'manual' ? difficulty : undefined,
+          bankIds: basis === 'manual' ? selectedBankIds : [],
+          questionCount,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to generate questions');
+      setQuestions(data.questions || []);
+      setStep('testing');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unknown error');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleComplete = async (
+    _score: number,
+    _total: number,
+    answers?: Record<number, string>,
+    timeTaken?: number,
+  ) => {
+    if (!session?.user || !questions.length) return;
+    const bankId = questions[0]?.mcqBankId;
+    if (!bankId) return;
+    try {
+      await fetch('/api/mcq-tests', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: (session.user as any).id || session.user.email,
+          username: (session.user as any).username || session.user.email,
+          userFullName: session.user.name,
+          mcqBankId: bankId,
+          answers: Object.entries(answers || {}).map(([qi, ans]) => ({
+            questionIndex: parseInt(qi),
+            selectedAnswer: ans,
+          })),
+          timeTaken: timeTaken || 0,
+          startedAt: new Date(Date.now() - (timeTaken || 0) * 1000).toISOString(),
+          testName: 'Change Control Training Test',
+        }),
+      });
+    } catch {
+      /* non-fatal */
+    }
+  };
+
+  if (step === 'testing') {
+    return (
+      <TestRunner
+        questions={questions}
+        title="Change Control Training Test"
+        onExit={() => setStep('selection')}
+        onComplete={handleComplete}
+      />
+    );
+  }
+
+  if (step === 'selection') {
+    return (
+      <QuestionBasisSelection
+        onSelect={handleBasisSelect}
+        onBack={() => router.push('/test')}
+        title="Change Control Test — Choose Question Basis"
+      />
+    );
+  }
+
+  const filteredEntries = entries.filter(
+    (e) =>
+      !search ||
+      e.sopName?.toLowerCase().includes(search.toLowerCase()) ||
+      e.identifier?.toLowerCase().includes(search.toLowerCase()),
+  );
+
+  return (
+    <div className="min-h-screen bg-slate-900 p-4 md:p-8">
+      <div className="max-w-3xl mx-auto">
+        <button
+          onClick={() => setStep(step === 'difficulty' ? 'selection' : 'difficulty')}
+          className="flex items-center gap-2 text-slate-400 hover:text-white transition-colors mb-6"
+        >
+          <ArrowLeft className="w-4 h-4" />
+          Back
+        </button>
+
+        <h2 className="text-2xl font-bold text-white mb-6">
+          {step === 'difficulty' ? 'Select Difficulty' : 'Configure Change Control Test'}
+        </h2>
+
+        {step === 'difficulty' && (
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            {DIFFICULTIES.map((d) => (
+              <button
+                key={d}
+                onClick={() => { setDifficulty(d); setStep('criteria'); }}
+                className={`py-4 rounded-2xl border text-sm font-semibold transition-all ${
+                  difficulty === d
+                    ? 'bg-orange-600/30 border-orange-400 text-orange-200'
+                    : 'bg-white/5 border-white/20 text-slate-300 hover:bg-white/10'
+                }`}
+              >
+                {d}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {step === 'criteria' && (
+          <div className="space-y-5">
+            {basis === 'manual' && (
+              <>
+                <div className="relative">
+                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                  <input
+                    value={search}
+                    onChange={(e) => setSearch(e.target.value)}
+                    placeholder="Search SOPs…"
+                    className="w-full bg-white/10 border border-white/20 rounded-xl pl-9 pr-4 py-2.5 text-white placeholder-slate-400 text-sm focus:outline-none focus:border-orange-400"
+                  />
+                </div>
+
+                {fetchingBanks ? (
+                  <div className="flex items-center justify-center py-10">
+                    <Loader2 className="w-6 h-6 text-orange-400 animate-spin" />
+                  </div>
+                ) : (
+                  <div className="max-h-72 overflow-y-auto custom-scrollbar space-y-2">
+                    {filteredEntries.map((entry) => {
+                      const selected = isEntrySelected(entry);
+                      return (
+                        <button
+                          key={entry.id}
+                          onClick={() => toggleEntry(entry)}
+                          className={`w-full text-left px-4 py-3 rounded-xl border text-sm transition-all ${
+                            selected
+                              ? 'bg-orange-600/20 border-orange-400 text-orange-200'
+                              : 'bg-white/5 border-white/15 text-slate-300 hover:bg-white/10'
+                          }`}
+                        >
+                          <div className="font-medium">
+                            {entry.identifier} — {entry.sopName}
+                          </div>
+                          <div className="text-xs text-slate-500 mt-0.5">
+                            {entry.totalMcqs} questions · {entry.department}
+                          </div>
+                        </button>
+                      );
+                    })}
+                    {filteredEntries.length === 0 && !fetchingBanks && (
+                      <p className="text-center text-slate-500 py-6 text-sm">
+                        No SOP banks found. Generate MCQ banks from the SOP dashboard first.
+                      </p>
+                    )}
+                  </div>
+                )}
+
+                {selectedBankIds.length > 0 && (
+                  <p className="text-xs text-orange-400">
+                    {entries.filter(isEntrySelected).length} SOP(s) selected
+                  </p>
+                )}
+              </>
+            )}
+
+            {basis === 'ai' && (
+              <div className="bg-white/5 border border-white/10 rounded-2xl p-5 text-center">
+                <p className="text-slate-300 mb-2">
+                  AI mode samples from all {entries.length} available SOP banks.
+                </p>
+                <p className="text-slate-500 text-sm">
+                  {entries.reduce((s, e) => s + e.totalMcqs, 0)} total questions available
+                </p>
+              </div>
+            )}
+
+            <div className="bg-white/5 border border-white/10 rounded-2xl p-5">
+              <div className="flex justify-between items-center mb-2">
+                <span className="text-white font-medium text-sm">Number of Questions</span>
+                <span className="text-orange-300 font-bold">{questionCount}</span>
+              </div>
+              <input
+                type="range" min={5} max={50} step={5} value={questionCount}
+                onChange={(e) => setQuestionCount(parseInt(e.target.value))}
+                className="w-full accent-orange-500"
+              />
+              <div className="flex justify-between text-xs text-slate-500 mt-1">
+                <span>5</span><span>50</span>
+              </div>
+            </div>
+
+            {error && (
+              <div className="bg-rose-500/10 border border-rose-400/30 rounded-xl p-3 text-rose-300 text-sm">
+                {error}
+              </div>
+            )}
+
+            <button
+              onClick={generate}
+              disabled={loading || (basis === 'manual' && selectedBankIds.length === 0)}
+              className="w-full py-3.5 rounded-2xl bg-orange-600 hover:bg-orange-500 text-white font-semibold disabled:opacity-50 disabled:cursor-not-allowed transition-all flex items-center justify-center gap-2"
+            >
+              {loading ? (
+                <><Loader2 className="w-5 h-5 animate-spin" />Generating…</>
+              ) : (
+                <>Generate {questionCount} Questions<ChevronRight className="w-5 h-5" /></>
+              )}
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
