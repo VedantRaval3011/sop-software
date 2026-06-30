@@ -131,8 +131,13 @@ export default function SpecificTrainingTestPage() {
                         )}
                       </div>
                       <div className="flex-1 min-w-0">
-                        <div className="font-medium truncate">
-                          {formatSOPDisplayName(bank.sopName, bank.sopIdentifier)}
+                        <div className="font-medium truncate flex items-center gap-2">
+                          {bank.language && (
+                            <span className={`text-xs font-bold px-1.5 py-0.5 rounded shrink-0 ${bank.language.toLowerCase() === 'gujarati' ? 'bg-amber-500/20 text-amber-400' : 'bg-blue-500/20 text-blue-400'}`}>
+                              {bank.language.toLowerCase() === 'gujarati' ? 'GU' : 'EN'}
+                            </span>
+                          )}
+                          <span className="truncate">{formatSOPDisplayName(bank.sopName, bank.sopIdentifier)}</span>
                         </div>
                         <div className="text-xs text-slate-500 mt-0.5 flex items-center gap-2">
                           <span>{bank.totalQuestions} questions</span>

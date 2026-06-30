@@ -16,9 +16,12 @@ interface RegistryEntry {
   id: string;
   identifier: string;
   sopName: string;
+  sopNameGujarati?: string | null;
   department: string;
   language: string;
   totalMcqs: number;
+  enMcqCount?: number;
+  guMcqCount?: number;
   banks: { id: string; langCode: string }[];
   hasMcq: boolean;
 }
@@ -48,7 +51,18 @@ export default function InterviewTestPage() {
         const active: RegistryEntry[] = (d.active || []).filter(
           (e: RegistryEntry) => e.totalMcqs > 0 && e.banks?.length > 0,
         );
-        setEntries(active);
+        const split: RegistryEntry[] = [];
+        for (const entry of active) {
+          const engBanks = entry.banks.filter((b) => b.langCode === 'ENG');
+          const gujBanks = entry.banks.filter((b) => b.langCode === 'GUJ');
+          if (engBanks.length > 0 && (entry.enMcqCount ?? 0) > 0) {
+            split.push({ ...entry, id: entry.id + '_ENG', banks: engBanks, totalMcqs: entry.enMcqCount ?? 0, language: 'ENG' });
+          }
+          if (gujBanks.length > 0 && (entry.guMcqCount ?? 0) > 0) {
+            split.push({ ...entry, id: entry.id + '_GUJ', banks: gujBanks, totalMcqs: entry.guMcqCount ?? 0, language: 'GUJ' });
+          }
+        }
+        setEntries(split);
       })
       .catch(() => {})
       .finally(() => setFetchingBanks(false));
@@ -152,7 +166,8 @@ export default function InterviewTestPage() {
     (e) =>
       !search ||
       e.sopName?.toLowerCase().includes(search.toLowerCase()) ||
-      e.identifier?.toLowerCase().includes(search.toLowerCase()),
+      e.identifier?.toLowerCase().includes(search.toLowerCase()) ||
+      e.sopNameGujarati?.toLowerCase().includes(search.toLowerCase()),
   );
 
   return (
@@ -220,8 +235,11 @@ export default function InterviewTestPage() {
                               : 'bg-white/5 border-white/15 text-slate-300 hover:bg-white/10'
                           }`}
                         >
-                          <div className="font-medium">
-                            {entry.identifier} — {entry.sopName}
+                          <div className="font-medium flex items-center gap-2">
+                            <span className={`text-xs font-bold px-1.5 py-0.5 rounded shrink-0 ${entry.language === 'GUJ' ? 'bg-amber-500/20 text-amber-400' : 'bg-blue-500/20 text-blue-400'}`}>
+                              {entry.language === 'GUJ' ? 'GU' : 'EN'}
+                            </span>
+                            {entry.identifier} — {entry.language === 'GUJ' && entry.sopNameGujarati ? entry.sopNameGujarati : entry.sopName}
                           </div>
                           <div className="text-xs text-slate-500 mt-0.5">
                             {entry.totalMcqs} questions · {entry.department}
