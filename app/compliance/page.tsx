@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import FindingCard from './components/FindingCard';
 import { getScoreColorClass } from '@/lib/complianceFormatter';
-import { BookOpen, FileText, Layers, CheckCircle, Copy, X, Upload, Sparkles, Cpu } from 'lucide-react';
+import { BookOpen, FileText, Layers, CheckCircle, Copy, X, Upload, Sparkles, Cpu, Bot } from 'lucide-react';
 
 interface Guideline {
   _id: string;
@@ -65,6 +65,9 @@ interface ComplianceFinding {
   whyApplies?: string;
   whyEvidenceInsufficient?: string;
   whyScoreReduced?: string;
+  gapId?: string;
+  resolved?: boolean;
+  lastReviewedAt?: string;
 }
 
 interface TraceabilityMatrixEntry {
@@ -127,6 +130,7 @@ interface AuditCompleteness {
 
 interface ComplianceReport {
   _id: string;
+  sopId?: string;
   sopIdentifier: string;
   sopName: string;
   department: string;
@@ -554,6 +558,9 @@ export default function ComplianceEnginePage() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   const pauseRef = useRef(false);
+  const stopRequestedRef = useRef(false);
+  const currentAnalyzingSopIdRef = useRef<string | null>(null);
+  const analyzeAbortRef = useRef<AbortController | null>(null);
   const [analysisStats, setAnalysisStats] = useState({ total: 0, completed: 0, cached: 0, failed: 0, currentSopName: '', currentSopIdentifier: '' });
   const [sopLists, setSopLists] = useState<{
     completed: { identifier: string; name: string; score: number | null; status: string }[];
@@ -567,6 +574,8 @@ export default function ComplianceEnginePage() {
   const [selectedReport, setSelectedReport] = useState<ComplianceReport | null>(null);
   const [loadingFullReport, setLoadingFullReport] = useState(false);
   const [filterDepartment, setFilterDepartment] = useState('all');
+  const [sopSortKey, setSopSortKey] = useState<'identifier' | 'version' | 'name' | 'location' | 'department'>('identifier');
+  const [sopSortDir, setSopSortDir] = useState<'asc' | 'desc'>('asc');
   const [filterStatus, setFilterStatus] = useState<'all' | 'compliant' | 'partial' | 'non-compliant' | 'not-applicable'>('all');
   const [hideNotApplicable, setHideNotApplicable] = useState(true);
   const [hideFailedFindings, setHideFailedFindings] = useState(true);
@@ -577,20 +586,32 @@ export default function ComplianceEnginePage() {
   const [showConsolidatedSummary, setShowConsolidatedSummary] = useState(false);
   const [applicableFindings, setApplicableFindings] = useState<Set<string>>(new Set());
   const [submittingApplicable, setSubmittingApplicable] = useState(false);
+  const [applyingFixGapId, setApplyingFixGapId] = useState<string | null>(null);
+  const [forceFullReanalysis, setForceFullReanalysis] = useState(false);
   const [expandedGuideline, setExpandedGuideline] = useState<string | null>(null);
   const [llmInfo, setLlmInfo] = useState<{
-    provider: 'gemini' | 'ollama' | 'claude';
+    provider: 'gemini' | 'ollama' | 'claude' | 'codex';
     model: string;
     complianceModel: string;
     label: string;
   } | null>(null);
-  const [selectedProvider, setSelectedProvider] = useState<'claude' | 'gemini' | 'ollama' | null>('claude');
+  const [selectedProvider, setSelectedProvider] = useState<'claude' | 'codex' | 'gemini' | 'ollama' | null>('claude');
   const [selectedModel, setSelectedModel] = useState('claude-sonnet-4-6');
   const [claudeStatus, setClaudeStatus] = useState<{
     ok: boolean;
     model?: string;
     email?: string;
     subscriptionType?: string;
+    error?: string;
+    loading?: boolean;
+  } | null>(null);
+  const [codexStatus, setCodexStatus] = useState<{
+    ok: boolean;
+    model?: string;
+    mcqModel?: string;
+    complianceModel?: string;
+    authMode?: string;
+    codexVersion?: string;
     error?: string;
     loading?: boolean;
   } | null>(null);
@@ -680,10 +701,25 @@ export default function ComplianceEnginePage() {
 
   useEffect(() => { if (currentStep === 'review') runPreflightCheck(); }, [currentStep, selectedSopId]);
 
+  const handleStopAnalysis = async () => {
+    stopRequestedRef.current = true;
+    pauseRef.current = false;
+    setIsPaused(false);
+    try {
+      await fetch('/api/compliance/cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ stopAll: true }),
+      });
+    } catch { /* ignore */ }
+    analyzeAbortRef.current?.abort();
+  };
+
   const runAnalysis = async () => {
     const candidates = selectedSopId === 'all' ? sops : sops.filter(s => s._id === selectedSopId);
     if (!candidates.length || !guidelines.length) return;
     pauseRef.current = false;
+    stopRequestedRef.current = false;
     setIsPaused(false);
     setIsAnalyzing(true);
     setAnalysisComplete(false);
@@ -701,20 +737,29 @@ export default function ComplianceEnginePage() {
     let lastAnalyzedSopId: string | null = null;
 
     for (const sop of candidates) {
+      if (stopRequestedRef.current) break;
       await waitIfPaused();
+      if (stopRequestedRef.current) break;
       setAnalysisStats(prev => ({ ...prev, currentSopName: sop.name, currentSopIdentifier: sop.identifier }));
+      currentAnalyzingSopIdRef.current = sop._id;
+      const abortController = new AbortController();
+      analyzeAbortRef.current = abortController;
       try {
         const res = await fetch('/api/compliance/analyze-v5', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             sopId: sop._id,
-            forceRefresh: true,
+            forceRefresh: forceFullReanalysis,
+            mode: forceFullReanalysis ? 'initial' : 'auto',
             ...(selectedProvider ? { provider: selectedProvider } : {}),
             ...(selectedProvider === 'claude' ? { model: selectedModel } : {}),
+            ...(selectedProvider === 'codex' ? { model: codexStatus?.complianceModel ?? 'gpt-4.1' } : {}),
           }),
+          signal: abortController.signal,
         });
         const data = await res.json().catch(() => ({ success: false, error: 'Parse error' }));
+        if (data.cancelled || stopRequestedRef.current) break;
         if (data.success) {
           const entry = { identifier: sop.identifier, name: sop.name, score: data.overallScore ?? null, status: data.complianceStatus ?? '' };
           if (data.cached) {
@@ -730,16 +775,23 @@ export default function ComplianceEnginePage() {
           setSopLists(prev => ({ ...prev, failed: [...prev.failed, { identifier: sop.identifier, name: sop.name, error: data.error }] }));
         }
       } catch (err) {
+        if (stopRequestedRef.current || (err instanceof DOMException && err.name === 'AbortError')) break;
         setAnalysisStats(prev => ({ ...prev, failed: prev.failed + 1 }));
         setSopLists(prev => ({ ...prev, failed: [...prev.failed, { identifier: sop.identifier, name: sop.name, error: err instanceof Error ? err.message : 'Network error' }] }));
+      } finally {
+        currentAnalyzingSopIdRef.current = null;
+        analyzeAbortRef.current = null;
       }
+      if (stopRequestedRef.current) break;
       await new Promise(r => setTimeout(r, 2000));
     }
 
+    const wasStopped = stopRequestedRef.current;
     setIsAnalyzing(false);
     setIsPaused(false);
     pauseRef.current = false;
-    setAnalysisComplete(true);
+    stopRequestedRef.current = false;
+    setAnalysisComplete(!wasStopped);
     await fetchReports();
     fetch('/api/compliance/guideline-stats').then(r => r.json()).then(d => { if (d.success) setGuidelineStats(d.stats ?? {}); }).catch(() => {});
 
@@ -855,7 +907,114 @@ export default function ComplianceEnginePage() {
     return () => { cancelled = true; };
   }, [selectedProvider]);
 
+  useEffect(() => {
+    if (selectedProvider !== 'codex') {
+      setCodexStatus(null);
+      return;
+    }
+    let cancelled = false;
+    setCodexStatus({ ok: false, loading: true });
+    fetch('/api/llm/codex-status')
+      .then((res) => res.json())
+      .then((data) => {
+        if (cancelled) return;
+        const c = data.codex ?? {};
+        setCodexStatus({
+          ok: Boolean(data.success && c.loggedIn),
+          model: c.model,
+          mcqModel: c.mcqModel,
+          complianceModel: c.complianceModel,
+          authMode: c.authMode,
+          codexVersion: c.codexVersion,
+          error: c.error,
+          loading: false,
+        });
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setCodexStatus({
+          ok: false,
+          error: e instanceof Error ? e.message : 'Could not check Codex status',
+          loading: false,
+        });
+      });
+    return () => { cancelled = true; };
+  }, [selectedProvider]);
+
   const totalClauses = guidelines.reduce((s, g) => s + (g.clauses?.length ?? 0), 0);
+
+  const filteredSops = useMemo(
+    () => sops.filter((s) => filterDepartment === 'all' || s.department === filterDepartment),
+    [sops, filterDepartment],
+  );
+
+  const sortedSops = useMemo(() => {
+    const dir = sopSortDir === 'asc' ? 1 : -1;
+    const norm = (v?: string) => (v ?? '').trim().toLowerCase();
+    const versionNum = (v?: string) => {
+      const n = parseFloat(String(v ?? '').replace(/^v/i, ''));
+      return Number.isFinite(n) ? n : 0;
+    };
+    return [...filteredSops].sort((a, b) => {
+      switch (sopSortKey) {
+        case 'identifier':
+          return dir * norm(a.identifier).localeCompare(norm(b.identifier));
+        case 'version':
+          return dir * (versionNum(a.version) - versionNum(b.version)) ||
+            dir * norm(a.version).localeCompare(norm(b.version));
+        case 'name':
+          return dir * norm(a.name).localeCompare(norm(b.name));
+        case 'location':
+          return dir * norm(a.location).localeCompare(norm(b.location));
+        case 'department':
+          return dir * norm(a.department).localeCompare(norm(b.department));
+        default:
+          return 0;
+      }
+    });
+  }, [filteredSops, sopSortKey, sopSortDir]);
+
+  const toggleSopSort = (key: typeof sopSortKey) => {
+    if (sopSortKey === key) setSopSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+    else {
+      setSopSortKey(key);
+      setSopSortDir('asc');
+    }
+  };
+
+  const handleSopRowSelect = (sop: SOP) => {
+    setSelectedSopId(sop._id);
+    setPreflightData({ checked: false, existingCount: 0, newCount: 0 });
+    setCurrentStep('fetch-guidelines');
+  };
+
+  const SopSortHeader = ({
+    label,
+    sortKey,
+    className = '',
+  }: {
+    label: string;
+    sortKey: typeof sopSortKey;
+    className?: string;
+  }) => {
+    const active = sopSortKey === sortKey;
+    return (
+      <th className={`px-4 py-3 text-left ${className}`}>
+        <button
+          type="button"
+          onClick={() => toggleSopSort(sortKey)}
+          className={`inline-flex items-center gap-1 text-[11px] font-bold uppercase tracking-wider transition-colors ${
+            active ? 'text-purple-700' : 'text-gray-500 hover:text-purple-600'
+          }`}
+        >
+          {label}
+          <span className={`text-[10px] ${active ? 'text-purple-600' : 'text-gray-300'}`}>
+            {active ? (sopSortDir === 'asc' ? '▲' : '▼') : '↕'}
+          </span>
+        </button>
+      </th>
+    );
+  };
 
   const getStepStyle = (id: string) => {
     const isActive = currentStep === id;
@@ -880,6 +1039,68 @@ export default function ComplianceEnginePage() {
       const data = await res.json();
       if (data.success) setSelectedReport(data.report);
     } catch { /* silent */ } finally { setLoadingFullReport(false); }
+  };
+
+  const resolveSopIdForReport = useCallback((): string | null => {
+    if (selectedReport?.sopId) return selectedReport.sopId;
+    const match = sops.find((s) => s.identifier === selectedReport?.sopIdentifier);
+    return match?._id ?? null;
+  }, [selectedReport, sops]);
+
+  const handleReviewStatusChange = async (gapId: string, status: 'pending' | 'accepted' | 'disputed' | 'implemented') => {
+    try {
+      await fetch('/api/compliance/findings', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ gapId, reviewStatus: status }),
+      });
+      if (selectedReport) {
+        setSelectedReport({
+          ...selectedReport,
+          findings: selectedReport.findings.map((f) =>
+            (f.gapId ?? f._id) === gapId
+              ? { ...f, reviewStatus: status, resolved: status === 'implemented' }
+              : f,
+          ),
+        });
+      }
+    } catch { /* silent */ }
+  };
+
+  const handleApplyFix = async (gapId: string, finding: ComplianceFinding) => {
+    const sopId = resolveSopIdForReport();
+    if (!sopId) {
+      alert('Could not resolve SOP for this report.');
+      return;
+    }
+    if (!confirm('Apply this fix to the SOP? Only the targeted text will be modified.')) return;
+
+    setApplyingFixGapId(gapId);
+    try {
+      const res = await fetch('/api/compliance/apply-fix', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          gapId,
+          sopId,
+          originalText: finding.sopTextSnippet,
+          replacementText: finding.suggestedText,
+        }),
+      });
+      const data = await res.json();
+      if (!data.success) {
+        alert(data.error ?? 'Apply fix failed');
+        return;
+      }
+      alert(`Fix applied.\n\n${data.changeSummary}`);
+      if (selectedReport) {
+        await handleSelectReport(selectedReport);
+      }
+    } catch (err) {
+      alert(err instanceof Error ? err.message : 'Apply fix failed');
+    } finally {
+      setApplyingFixGapId(null);
+    }
   };
 
   const handleDeleteReport = async (reportId: string, e?: React.MouseEvent) => {
@@ -986,21 +1207,28 @@ export default function ComplianceEnginePage() {
                       ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
                       : selectedProvider === 'claude'
                       ? 'bg-violet-50 text-violet-700 border border-violet-200'
+                      : selectedProvider === 'codex'
+                      ? 'bg-sky-50 text-sky-700 border border-sky-200'
                       : 'bg-purple-50 text-purple-700 border border-purple-200'
                   }`}
                   title={
                     selectedProvider === 'claude'
                       ? `Claude model: ${selectedModel}`
+                      : selectedProvider === 'codex'
+                      ? `Codex model: ${codexStatus?.complianceModel ?? 'gpt-4.1'}`
                       : `Compliance model: ${llmInfo.complianceModel}`
                   }
                 >
                   <span className={`w-1.5 h-1.5 rounded-full ${
                     selectedProvider === 'ollama' ? 'bg-emerald-500'
                     : selectedProvider === 'claude' ? 'bg-violet-500'
+                    : selectedProvider === 'codex' ? 'bg-sky-500'
                     : 'bg-purple-500'
                   }`} />
                   {selectedProvider === 'claude'
                     ? `Claude · ${selectedModel.includes('haiku') ? 'Haiku' : 'Sonnet'}`
+                    : selectedProvider === 'codex'
+                    ? `Codex · ${codexStatus?.complianceModel ?? 'gpt-4.1'}`
                     : selectedProvider === 'ollama'
                     ? 'Ollama (local)'
                     : selectedProvider === 'gemini'
@@ -1037,6 +1265,33 @@ export default function ComplianceEnginePage() {
                     ? 'Claude ✓'
                     : 'Claude !'
                 : 'Claude'}
+            </button>
+            <button
+              type="button"
+              onClick={() => setSelectedProvider('codex')}
+              title={
+                selectedProvider === 'codex' && codexStatus?.ok
+                  ? `Codex via your ChatGPT subscription (${codexStatus.complianceModel ?? 'gpt-4.1'}) — local CLI, no API key`
+                  : selectedProvider === 'codex' && codexStatus?.error
+                    ? `Codex not connected: ${codexStatus.error}`
+                    : 'Codex — local CLI via ChatGPT subscription (no API key)'
+              }
+              className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors ${
+                selectedProvider === 'codex'
+                  ? codexStatus?.ok === false && !codexStatus?.loading
+                    ? 'border border-red-600 bg-red-600 text-white hover:bg-red-700 ring-2 ring-red-300'
+                    : 'border border-sky-600 bg-sky-600 text-white hover:bg-sky-700 ring-2 ring-sky-300'
+                  : 'border border-slate-300 bg-white text-slate-600 hover:bg-slate-50'
+              }`}
+            >
+              <Bot className="h-3.5 w-3.5" />
+              {selectedProvider === 'codex'
+                ? codexStatus?.loading
+                  ? 'Codex…'
+                  : codexStatus?.ok
+                    ? 'Codex ✓'
+                    : 'Codex !'
+                : 'Codex'}
             </button>
             <button
               type="button"
@@ -1102,6 +1357,30 @@ export default function ComplianceEnginePage() {
               <>
                 Claude is not connected. Run <code className="rounded bg-red-100 px-1">claude auth login</code> in a terminal, then refresh.
                 {claudeStatus.error ? ` — ${claudeStatus.error}` : ''}
+              </>
+            )}
+          </div>
+        )}
+        {selectedProvider === 'codex' && codexStatus && !codexStatus.loading && (
+          <div
+            className={`mb-6 rounded-lg border px-4 py-3 text-sm ${
+              codexStatus.ok
+                ? 'border-sky-200 bg-sky-50 text-sky-900'
+                : 'border-red-200 bg-red-50 text-red-700'
+            }`}
+          >
+            {codexStatus.ok ? (
+              <>
+                Compliance will use your ChatGPT subscription via Codex CLI
+                {codexStatus.authMode ? ` (${codexStatus.authMode})` : ''}
+                {' · '}model: <strong>{codexStatus.complianceModel ?? 'gpt-4.1'}</strong>
+                {codexStatus.codexVersion ? ` · CLI v${codexStatus.codexVersion}` : ''}
+                {' · '}No OpenAI API key required — uses local <code className="rounded bg-sky-100 px-1">codex exec</code>
+              </>
+            ) : (
+              <>
+                Codex is not connected. Run <code className="rounded bg-red-100 px-1">codex login</code> in a terminal, then refresh.
+                {codexStatus.error ? ` — ${codexStatus.error}` : ''}
               </>
             )}
           </div>
@@ -1351,24 +1630,92 @@ export default function ComplianceEnginePage() {
                 <p className="text-gray-500">Loading SOPs...</p>
               </div>
             ) : (
-              <div className="max-h-[600px] overflow-y-auto space-y-3 pr-2">
-                {sops.filter(s => filterDepartment === 'all' || s.department === filterDepartment).map(sop => (
-                  <div key={sop._id} className="p-5 bg-gray-50 border border-gray-100 rounded-xl hover:border-purple-200 hover:bg-purple-50/30 transition-all group">
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <div className="flex items-center gap-2 mb-1">
-                          <span className="text-purple-700 font-bold text-sm bg-purple-50 px-2 py-0.5 rounded border border-purple-100">{sop.identifier}</span>
-                          {sop.version && <span className="text-gray-400 text-xs">v{sop.version}</span>}
-                        </div>
-                        <h3 className="text-gray-800 font-medium group-hover:text-purple-700 transition-colors">{sop.name}</h3>
-                      </div>
-                      <div className="flex flex-wrap items-center gap-3">
-                        {sop.location && <span className="px-3 py-1.5 bg-white border border-gray-200 text-gray-500 rounded-lg text-xs font-bold shadow-sm">📍 {sop.location}</span>}
-                        <span className="px-3 py-1.5 bg-white border border-gray-200 text-gray-500 rounded-lg text-xs font-medium shadow-sm">🏢 {sop.department}</span>
-                      </div>
-                    </div>
-                  </div>
-                ))}
+              <div className="max-h-[600px] overflow-auto rounded-xl border border-gray-200">
+                <table className="w-full min-w-[720px] text-sm">
+                  <thead className="sticky top-0 z-10 bg-gray-50 border-b border-gray-200">
+                    <tr>
+                      <SopSortHeader label="SOP ID" sortKey="identifier" className="w-[140px]" />
+                      <SopSortHeader label="Version" sortKey="version" className="w-[90px]" />
+                      <SopSortHeader label="Title" sortKey="name" />
+                      <SopSortHeader label="Location / Area" sortKey="location" className="w-[220px]" />
+                      <SopSortHeader label="Department" sortKey="department" className="w-[140px]" />
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-100 bg-white">
+                    {sortedSops.length === 0 ? (
+                      <tr>
+                        <td colSpan={5} className="px-4 py-16 text-center text-gray-500">
+                          No SOPs match the selected department filter.
+                        </td>
+                      </tr>
+                    ) : (
+                      sortedSops.map((sop) => {
+                        const isSelected = selectedSopId === sop._id;
+                        return (
+                        <tr
+                          key={sop._id}
+                          role="button"
+                          tabIndex={0}
+                          onClick={() => handleSopRowSelect(sop)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' || e.key === ' ') {
+                              e.preventDefault();
+                              handleSopRowSelect(sop);
+                            }
+                          }}
+                          title={`Select ${sop.identifier} and continue to Guidelines`}
+                          className={`cursor-pointer transition-colors group ${
+                            isSelected
+                              ? 'bg-purple-50 ring-1 ring-inset ring-purple-300'
+                              : 'hover:bg-purple-50/40'
+                          }`}
+                        >
+                          <td className="px-4 py-3 align-top">
+                            <span className="inline-block text-purple-700 font-bold text-xs bg-purple-50 px-2 py-0.5 rounded border border-purple-100 font-mono">
+                              {sop.identifier}
+                            </span>
+                          </td>
+                          <td className="px-4 py-3 align-top text-gray-500 text-xs whitespace-nowrap">
+                            {sop.version ? `v${sop.version}` : '—'}
+                          </td>
+                          <td className="px-4 py-3 align-top">
+                            <p className={`font-medium transition-colors leading-snug ${
+                              isSelected ? 'text-purple-700' : 'text-gray-800 group-hover:text-purple-700'
+                            }`}>
+                              {sop.name}
+                            </p>
+                            <span className="mt-1 inline-block text-[10px] font-semibold uppercase tracking-wide text-gray-400">
+                              {sop.language === 'Gujarati' ? 'GUJ' : 'ENG'}
+                            </span>
+                          </td>
+                          <td className="px-4 py-3 align-top text-gray-600 text-xs leading-snug">
+                            {sop.location ? (
+                              <span className="inline-flex items-start gap-1">
+                                <span className="text-gray-400 flex-shrink-0">📍</span>
+                                <span>{sop.location}</span>
+                              </span>
+                            ) : (
+                              <span className="text-gray-300">—</span>
+                            )}
+                          </td>
+                          <td className="px-4 py-3 align-top">
+                            <span className="inline-flex items-center gap-1 px-2.5 py-1 bg-gray-50 border border-gray-200 text-gray-600 rounded-lg text-xs font-medium whitespace-nowrap">
+                              🏢 {sop.department}
+                            </span>
+                          </td>
+                        </tr>
+                        );
+                      })
+                    )}
+                  </tbody>
+                </table>
+                <div className="sticky bottom-0 border-t border-gray-100 bg-gray-50 px-4 py-2 text-xs text-gray-500 flex items-center justify-between gap-4">
+                  <span>
+                    Showing {sortedSops.length} of {sopTotal || sops.length} SOPs
+                    {filterDepartment !== 'all' ? ` in ${filterDepartment}` : ''}
+                  </span>
+                  <span className="text-purple-600 font-medium">Click a row to select an SOP and continue →</span>
+                </div>
               </div>
             )}
 
@@ -1579,6 +1926,9 @@ export default function ComplianceEnginePage() {
                 {selectedProvider === 'claude' && (
                   <>Using <strong>Claude {selectedModel.includes('haiku') ? 'Haiku' : 'Sonnet'}</strong> via your Claude Code subscription. Switch provider in the header.</>
                 )}
+                {selectedProvider === 'codex' && (
+                  <>Using <strong>Codex</strong> ({codexStatus?.complianceModel ?? 'gpt-4.1'}) via your ChatGPT subscription. Switch provider in the header.</>
+                )}
                 {selectedProvider === 'gemini' && (
                   <>Using <strong>Gemini</strong> ({llmInfo?.complianceModel ?? 'cloud'}). Switch provider in the header.</>
                 )}
@@ -1588,6 +1938,16 @@ export default function ComplianceEnginePage() {
               </p>
             </div>
 
+            <label className="flex items-center gap-2 text-sm text-gray-600 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={forceFullReanalysis}
+                onChange={(e) => setForceFullReanalysis(e.target.checked)}
+                className="rounded border-gray-300"
+              />
+              Force full re-analysis (skip incremental review — use when guidelines or SOP changed significantly)
+            </label>
+
             <div className="flex justify-between">
               <button onClick={() => setCurrentStep('fetch-guidelines')} className="px-6 py-2.5 bg-gray-100 text-gray-600 rounded-xl font-semibold hover:bg-gray-200 transition-all">← Back</button>
               <button
@@ -1596,10 +1956,13 @@ export default function ComplianceEnginePage() {
                   sops.length === 0
                   || guidelines.length === 0
                   || (selectedProvider === 'claude' && claudeStatus !== null && !claudeStatus.loading && !claudeStatus.ok)
+                  || (selectedProvider === 'codex' && codexStatus !== null && !codexStatus.loading && !codexStatus.ok)
                 }
                 className={`px-10 py-3.5 rounded-xl font-bold text-base text-white disabled:opacity-50 disabled:cursor-not-allowed transition-all shadow-lg ${
                   selectedProvider === 'claude'
                     ? 'bg-violet-600 hover:bg-violet-700 shadow-violet-200'
+                    : selectedProvider === 'codex'
+                    ? 'bg-sky-600 hover:bg-sky-700 shadow-sky-200'
                     : selectedProvider === 'ollama'
                     ? 'bg-emerald-600 hover:bg-emerald-700 shadow-emerald-200'
                     : 'bg-purple-600 hover:bg-purple-700 shadow-purple-200'
@@ -1608,6 +1971,8 @@ export default function ComplianceEnginePage() {
                 🚀 Start Analysis
                 {selectedProvider === 'claude'
                   ? ` · ${selectedModel.includes('haiku') ? 'Haiku' : 'Sonnet'}`
+                  : selectedProvider === 'codex'
+                  ? ` · Codex`
                   : selectedProvider === 'gemini'
                   ? ' · Gemini'
                   : selectedProvider === 'ollama'
@@ -1633,12 +1998,20 @@ export default function ComplianceEnginePage() {
                 </div>
                 <div className="flex items-center gap-3">
                   {isAnalyzing && (
-                    <button
-                      onClick={() => { pauseRef.current = !isPaused; setIsPaused(v => !v); }}
-                      className={`flex items-center gap-2 px-4 py-2 rounded-xl border font-semibold text-sm transition-all ${isPaused ? 'bg-purple-600 text-white border-purple-500' : 'bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-100'}`}
-                    >
-                      {isPaused ? '▶ Resume' : '⏸ Pause'}
-                    </button>
+                    <>
+                      <button
+                        onClick={() => { pauseRef.current = !isPaused; setIsPaused(v => !v); }}
+                        className={`flex items-center gap-2 px-4 py-2 rounded-xl border font-semibold text-sm transition-all ${isPaused ? 'bg-purple-600 text-white border-purple-500' : 'bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-100'}`}
+                      >
+                        {isPaused ? '▶ Resume' : '⏸ Pause'}
+                      </button>
+                      <button
+                        onClick={handleStopAnalysis}
+                        className="flex items-center gap-2 px-4 py-2 rounded-xl border font-semibold text-sm transition-all bg-rose-50 text-rose-700 border-rose-200 hover:bg-rose-100"
+                      >
+                        ⏹ Stop
+                      </button>
+                    </>
                   )}
                   <div className={`px-4 py-2 rounded-xl border font-black text-sm ${isAnalyzing ? 'bg-purple-100 text-purple-700 border-purple-200' : analysisComplete ? 'bg-emerald-100 text-emerald-700 border-emerald-200' : 'bg-gray-100 text-gray-600 border-gray-200'}`}>
                     {progressPct}% DONE
@@ -1957,7 +2330,7 @@ export default function ComplianceEnginePage() {
                       <p className="text-sm font-semibold text-gray-600">{visibleFindings.length} findings shown</p>
                       {visibleFindings.map(({ f, i }) => (
                         <FindingCard
-                          key={i}
+                          key={f.gapId ?? i}
                           finding={f}
                           reportContext={selectedReport ? {
                             sopIdentifier: selectedReport.sopIdentifier,
@@ -1981,8 +2354,11 @@ export default function ComplianceEnginePage() {
                           onToggleApplicable={(id, checked) => {
                             setApplicableFindings(prev => { const s = new Set(prev); if (checked) s.add(id); else s.delete(id); return s; });
                           }}
-                          isApplicable={applicableFindings.has(f._id ?? `finding-${i}`)}
+                          isApplicable={applicableFindings.has(f.gapId ?? f._id ?? `finding-${i}`)}
                           showCheckbox
+                          onReviewStatusChange={f.gapId ? handleReviewStatusChange : undefined}
+                          onApplyFix={f.gapId ? handleApplyFix : undefined}
+                          applyingFix={applyingFixGapId === f.gapId}
                         />
                       ))}
                     </div>

@@ -17,8 +17,10 @@ import {
   getOllamaModel,
 } from "@/lib/ollama";
 import { generateClaudeCliJson, getClaudeCliModel, getMcqClaudeModel, checkClaudeCliHealth } from "@/lib/claude-cli";
+import { checkCodexCliHealth, getMcqCodexModel, getComplianceCodexModel, generateCodexCliJson } from "@/lib/codex-cli";
+import { extractJsonPayload } from "@/lib/llm-utils";
 
-export type LlmProvider = "gemini" | "ollama" | "claude";
+export type LlmProvider = "gemini" | "ollama" | "claude" | "codex";
 
 export interface LlmInfo {
   provider: LlmProvider;
@@ -31,6 +33,7 @@ export function getProvider(): LlmProvider {
   const provider = (process.env.LLM_PROVIDER ?? "claude").toLowerCase();
   if (provider === "ollama") return "ollama";
   if (provider === "claude") return "claude";
+  if (provider === "codex") return "codex";
   return "gemini";
 }
 
@@ -38,7 +41,7 @@ export function getProvider(): LlmProvider {
  *  even when MCQ uses Claude CLI — compliance does not run through Claude Code. */
 export function getComplianceProvider(): LlmProvider {
   const override = process.env.LLM_COMPLIANCE_PROVIDER?.toLowerCase();
-  if (override === "ollama" || override === "gemini" || override === "claude") {
+  if (override === "ollama" || override === "gemini" || override === "claude" || override === "codex") {
     return override;
   }
   return "gemini";
@@ -52,6 +55,10 @@ function providerLabel(p: LlmProvider, role: "mcq" | "compliance"): { model: str
   if (p === "claude") {
     const model = role === "mcq" ? getMcqClaudeModel() : getClaudeCliModel();
     return { model, label: `Claude CLI (${model})` };
+  }
+  if (p === "codex") {
+    const model = getMcqCodexModel();
+    return { model, label: `Codex CLI (${model})` };
   }
   const geminiModel =
     role === "compliance"
@@ -95,15 +102,41 @@ export async function generateJson<T>(
   return generateGeminiJson<T>(system, user, options);
 }
 
+export type ComplianceJsonOptions = {
+  runKey?: string;
+  signal?: AbortSignal;
+};
+
 export async function generateComplianceJson<T>(
   system: string,
   user: string,
   providerOverride?: LlmProvider,
   modelOverride?: string,
+  options?: ComplianceJsonOptions,
 ): Promise<T> {
   const p = providerOverride ?? getComplianceProvider();
   if (p === "ollama") return generateOllamaComplianceJson<T>(system, user);
-  if (p === "claude") return generateClaudeCliJson<T>(system, user, modelOverride);
+  if (p === "claude") {
+    return generateClaudeCliJson<T>(system, user, modelOverride, {
+      runKey: options?.runKey,
+      signal: options?.signal,
+      subprocessScope: "compliance",
+    });
+  }
+  if (p === "codex") {
+    return generateCodexCliJson<T>(
+      system,
+      user,
+      (text) => JSON.parse(extractJsonPayload(text)) as T,
+      "compliance-json",
+      modelOverride ?? getComplianceCodexModel(),
+      {
+        runKey: options?.runKey,
+        signal: options?.signal,
+        subprocessScope: "compliance",
+      },
+    );
+  }
   return generateGeminiComplianceJson<T>(system, user);
 }
 
@@ -119,5 +152,5 @@ export async function* streamComplianceAnalysis(
   yield* streamGeminiComplianceAnalysis(system, user);
 }
 
-export { checkOllamaHealth, checkClaudeCliHealth, isGeminiOverloadedError, DEFAULT_FREE_GEMINI_MODEL as MODEL };
+export { checkOllamaHealth, checkClaudeCliHealth, checkCodexCliHealth, isGeminiOverloadedError, DEFAULT_FREE_GEMINI_MODEL as MODEL };
 export type { GeminiJsonOptions };

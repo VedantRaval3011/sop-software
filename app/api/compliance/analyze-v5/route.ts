@@ -2,13 +2,18 @@ import { NextRequest, NextResponse } from "next/server";
 import { connectDB } from "@/lib/mongodb";
 import SOP from "@/models/SOP";
 import SOPGuideline from "@/models/SOPGuideline";
-import ComplianceReport from "@/models/ComplianceReport";
-import { analyzeSOPComplianceV5, type SopLibraryEntry } from "@/lib/complianceEngineV5";
-import { saveComplianceReport } from "@/lib/complianceReportStorage";
+import { type SopLibraryEntry } from "@/lib/complianceEngineV5";
+import { runComplianceReview } from "@/lib/compliance-review-orchestrator";
 import { extractClauses } from "@/lib/ocrProcessor";
 import { requireAuth } from "@/lib/withAuth";
-import { getComplianceProvider, checkClaudeCliHealth, type LlmProvider } from "@/lib/llm";
+import { getComplianceProvider, checkClaudeCliHealth, checkCodexCliHealth, type LlmProvider } from "@/lib/llm";
 import { warmupOllamaComplianceModel } from "@/lib/ollama-warmup";
+import {
+  beginComplianceRun,
+  endComplianceRun,
+  isComplianceAnalysisCancelledError,
+  isComplianceRunActiveInProcess,
+} from "@/lib/compliance-run-control";
 
 const MAX_CLAUSE_TEXT = 4000;
 
@@ -63,10 +68,10 @@ export async function POST(request: NextRequest) {
   try {
     await connectDB();
     const body = await request.json();
-    const { sopId, forceRefresh = false } = body;
+    const { sopId, forceRefresh = false, mode } = body;
     const p = body.provider as string | undefined;
     const providerOverride: LlmProvider | undefined =
-      p === "claude" ? "claude" : p === "ollama" ? "ollama" : p === "gemini" ? "gemini" : undefined;
+      p === "claude" ? "claude" : p === "codex" ? "codex" : p === "ollama" ? "ollama" : p === "gemini" ? "gemini" : undefined;
     const modelOverride: string | undefined =
       typeof body.model === "string" && body.model.trim() ? body.model.trim() : undefined;
 
@@ -82,27 +87,6 @@ export async function POST(request: NextRequest) {
         { success: false, error: `SOP "${sop.identifier}" has no parseable content. Re-upload the PDF.` },
         { status: 422 },
       );
-    }
-
-    if (!forceRefresh) {
-      const existing = await ComplianceReport.findOne({ sopId, analysisStatus: "completed" })
-        .sort({ analyzedAt: -1 })
-        .lean();
-      if (existing) {
-        return NextResponse.json({
-          success: true,
-          cached: true,
-          sopIdentifier: existing.sopIdentifier,
-          sopName: existing.sopName,
-          overallScore: existing.overallScore,
-          complianceStatus: existing.complianceStatus,
-          compliantCount: existing.compliantCount,
-          partialCount: existing.partialCount,
-          nonCompliantCount: existing.nonCompliantCount,
-          totalGuidelinesChecked: existing.totalGuidelinesChecked,
-          analyzedAt: existing.analyzedAt,
-        });
-      }
     }
 
     const guidelines = await SOPGuideline.find({ ocrStatus: "completed" })
@@ -158,61 +142,86 @@ export async function POST(request: NextRequest) {
         );
       }
     }
+    if (effectiveProvider === "codex") {
+      const health = await checkCodexCliHealth();
+      if (!health.ok) {
+        return NextResponse.json(
+          { success: false, error: health.error ?? "Codex CLI is not connected. Run: codex login" },
+          { status: 503 },
+        );
+      }
+    }
 
-    const result = await analyzeSOPComplianceV5({
-      sopIdentifier: sop.identifier,
-      sopName: sop.name,
-      department: sop.department,
-      sopContent: sop.content,
-      guidelineClauses,
-      sopLibrary,
-      provider: providerOverride,
-      model: modelOverride,
-    });
+    if (isComplianceRunActiveInProcess(sopId)) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: "Compliance analysis already running for this SOP. Click Stop first or wait for it to finish.",
+        },
+        { status: 409 },
+      );
+    }
 
-    await saveComplianceReport({
-      sopId: sop._id.toString(),
-      sopIdentifier: sop.identifier,
-      sopName: sop.name,
-      sopVersion: sop.version ?? "1.0",
-      department: sop.department,
-      findings: result.findings,
-      overallScore: result.overallScore,
-      complianceStatus: result.complianceStatus,
-      scoreBreakdown: result.scoreBreakdown,
-      traceabilityMatrix: result.traceabilityMatrix,
-      crossSopDependencies: result.crossSopDependencies,
-      clauseCoveragePct: result.clauseCoveragePct,
-      auditCompleteness: result.auditCompleteness,
-      analysisEngineVersion: result.analysisEngineVersion,
-    });
+    const reviewMode =
+      mode === "initial" || mode === "incremental" || mode === "auto" ? mode : "auto";
 
-    await SOP.updateMany(
-      { identifier: sop.identifier },
-      {
-        complianceStatus:
-          result.overallScore >= 8 ? "compliant" : result.overallScore >= 5 ? "partial" : "non-compliant",
-      },
-    );
+    const { runEpoch } = beginComplianceRun(sopId);
+    try {
+      const result = await runComplianceReview({
+        sop,
+        guidelineClauses,
+        sopLibrary,
+        provider: providerOverride,
+        model: modelOverride,
+        mode: reviewMode,
+        forceRefresh: Boolean(forceRefresh),
+        runEpoch,
+      });
 
-    return NextResponse.json({
-      success: true,
-      cached: false,
-      sopIdentifier: sop.identifier,
-      sopName: sop.name,
-      overallScore: result.overallScore,
-      complianceStatus: result.complianceStatus,
-      compliantCount: result.compliantCount,
-      partialCount: result.partialCount,
-      nonCompliantCount: result.nonCompliantCount,
-      criticalCount: result.criticalCount,
-      majorCount: result.majorCount,
-      minorCount: result.minorCount,
-      improvementCount: result.improvementCount,
-      clauseCoveragePct: result.clauseCoveragePct,
-      totalGuidelinesChecked: result.totalGuidelinesChecked,
-      processingTimeMs: result.processingTimeMs,
-    });
+      await SOP.updateMany(
+        { identifier: sop.identifier },
+        {
+          complianceStatus:
+            result.overallScore >= 8 ? "compliant" : result.overallScore >= 5 ? "partial" : "non-compliant",
+        },
+      );
+
+      return NextResponse.json({
+        success: true,
+        cached: result.mode === "cached",
+        reviewMode: result.mode,
+        sopIdentifier: sop.identifier,
+        sopName: sop.name,
+        overallScore: result.overallScore,
+        complianceStatus: result.complianceStatus,
+        compliantCount: result.compliantCount,
+        partialCount: result.partialCount,
+        nonCompliantCount: result.nonCompliantCount,
+        criticalCount: result.criticalCount,
+        majorCount: result.majorCount,
+        minorCount: result.minorCount,
+        improvementCount: result.improvementCount,
+        clauseCoveragePct: result.clauseCoveragePct,
+        totalGuidelinesChecked: result.totalGuidelinesChecked,
+        processingTimeMs: result.processingTimeMs,
+        findingsPersisted: result.findingsPersisted,
+        findingsSkipped: result.findingsSkipped,
+        findingsMerged: result.findingsMerged,
+        incrementalReviewed: result.incrementalReviewed,
+        incrementalResolved: result.incrementalResolved,
+      });
+    } catch (error) {
+      if (isComplianceAnalysisCancelledError(error)) {
+        return NextResponse.json({
+          success: false,
+          cancelled: true,
+          error: "Analysis stopped by user",
+        });
+      }
+      throw error;
+    } finally {
+      endComplianceRun(sopId);
+    }
   } catch (error) {
     return NextResponse.json(
       { success: false, error: error instanceof Error ? error.message : "Analysis failed" },

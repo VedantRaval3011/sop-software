@@ -15,7 +15,7 @@ import {
 
 interface MCQ {
   question: string;
-  difficulty: "Easy" | "Medium" | "Hard";
+  difficulty?: "Easy" | "Medium" | "Hard" | string;
   options: string[];
   correctAnswer: string;
   explanation?: string;
@@ -23,6 +23,14 @@ interface MCQ {
   isChecked?: boolean;
   isReviewed?: boolean;
   isSimilar?: boolean;
+}
+
+function displayDifficulty(raw: unknown): "Easy" | "Medium" | "Hard" {
+  const s = String(raw ?? "").toLowerCase();
+  if (s === "easy") return "Easy";
+  if (s === "hard") return "Hard";
+  if (raw === "Easy" || raw === "Medium" || raw === "Hard") return raw;
+  return "Medium";
 }
 
 interface QuestionAnalyticsModalProps {
@@ -49,7 +57,8 @@ export function QuestionAnalyticsModal({
   } | null>(null);
   const [editSaving, setEditSaving] = useState(false);
 
-  const diffLabel = mcq.difficulty === "Easy" ? "E" : mcq.difficulty === "Medium" ? "M" : "H";
+  const difficulty = displayDifficulty(mcq.difficulty);
+  const diffLabel = difficulty === "Easy" ? "E" : difficulty === "Medium" ? "M" : "H";
 
   function enterEdit() {
     setEditDraft({
@@ -146,8 +155,8 @@ export function QuestionAnalyticsModal({
           {/* Difficulty + Edit button row */}
           <div className="flex items-center justify-between">
             <span
-              className={`w-8 h-8 flex items-center justify-center rounded-xl text-sm font-black border ${DIFF_BADGE[mcq.difficulty] ?? DIFF_BADGE.Medium}`}
-              title={mcq.difficulty}
+              className={`w-8 h-8 flex items-center justify-center rounded-xl text-sm font-black border ${DIFF_BADGE[difficulty] ?? DIFF_BADGE.Medium}`}
+              title={difficulty}
             >
               {diffLabel}
             </span>

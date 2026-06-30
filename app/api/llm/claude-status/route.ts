@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { checkClaudeCliHealth } from "@/lib/claude-cli";
+import { checkClaudeCliHealth, getMcqClaudeModel } from "@/lib/claude-cli";
+import { anthropicMcqApiAvailable } from "@/lib/anthropic-mcq";
 import { requireAuth } from "@/lib/withAuth";
 
 /** Verify the server can reach the local Claude Code CLI and which account is logged in. */
@@ -8,5 +9,8 @@ export async function GET() {
   if (auth.error) return auth.error;
 
   const health = await checkClaudeCliHealth();
-  return NextResponse.json({ success: health.ok, claude: health });
+  return NextResponse.json({
+    success: health.ok,
+    claude: { ...health, mcqModel: getMcqClaudeModel(), mcqApiDirect: anthropicMcqApiAvailable() },
+  });
 }

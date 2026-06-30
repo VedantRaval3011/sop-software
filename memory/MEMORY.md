@@ -1,1 +1,2 @@
 - [SOP cache instant sync](sop-cache-instant-sync.md) — SOP edits must propagate to matrices + LMS via invalidateSopDerivedCaches
+- Agent instructions live in [`AGENTS.md`](../AGENTS.md) — shared by Claude Code and OpenAI Codex
