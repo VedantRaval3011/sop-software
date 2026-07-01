@@ -5,9 +5,15 @@
 
 const GUJARATI_SCRIPT = /[઀-૿]/;
 
+// Matches GUJ/Gujarati when preceded by start-of-string or a separator (- or _)
+// and followed by a separator, dot, or end-of-string.
+// Plain \b fails when GUJ is sandwiched between underscores (e.g. _GUJ-) because
+// _ is a word character, so there is no word boundary on the left.
+const GUJ_KEYWORD = /(^|[-_])(?:guj|gujarati)(?:[-_.]|$)/i;
+
 export function detectLanguageFromFilename(filename: string): "English" | "Gujarati" {
   if (GUJARATI_SCRIPT.test(filename)) return "Gujarati";
-  if (/\b(guj|gujarati|_gu|_guj)\b/i.test(filename)) return "Gujarati";
+  if (GUJ_KEYWORD.test(filename)) return "Gujarati";
   return "English";
 }
 
@@ -21,7 +27,7 @@ export function resolveUploadLanguage(
   // documents never carry Gujarati characters in their names, and scanned PDFs
   // have no extractable text for the content-based check to correct with later.
   if (GUJARATI_SCRIPT.test(haystack)) return "Gujarati";
-  if (/\b(gujarati|guj)\b/i.test(haystack)) return "Gujarati";
+  if (GUJ_KEYWORD.test(haystack)) return "Gujarati";
   if (/\b(english|eng)\b/i.test(haystack)) return "English";
   const fileName = haystack.split("/").pop() ?? haystack;
   if (detectLanguageFromFilename(fileName) === "Gujarati") return "Gujarati";

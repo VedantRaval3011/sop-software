@@ -75,6 +75,19 @@ function mediaSummary(url: string, index: number): string {
   }
 }
 
+// Infer display language from URL path/filename when the URL itself carries an
+// explicit language marker. This corrects labels for videos that were stored
+// under the wrong language key before the upload regex was fixed (e.g. a
+// _GUJ-Brief.mp4 that landed in videos.en shows "GUJ" not "ENG").
+function langLabelFromUrl(url: string, fallback: string): string {
+  try {
+    const path = decodeURIComponent(url.split("?")[0]).toLowerCase();
+    if (/(^|[-_/])(?:guj|gujarati)(?:[-_./]|$)/.test(path)) return "GUJ";
+    if (/(^|[-_/])(?:eng|english)(?:[-_./]|$)/.test(path)) return "ENG";
+  } catch { /* ignore */ }
+  return fallback;
+}
+
 /* ─── Branding-free video player ──────────────────────────────────────────
    NotebookLM "Video Overview" MP4s carry a visible NotebookLM logo in the
    bottom-right corner (persists the whole video) and a "Made with Google"
@@ -635,13 +648,14 @@ function MediaPill({
   const isVideo = kind === "video";
   const urlLower = url.toLowerCase();
   const videoTypeLabel = urlLower.includes("explainer") ? "EX" : urlLower.includes("brief") ? "BR" : null;
-  const displayLabel = isVideo ? (videoTypeLabel ?? `${langLabel}·${index + 1}`) : langLabel;
+  const effectiveLangLabel = langLabelFromUrl(url, langLabel);
+  const displayLabel = isVideo ? (videoTypeLabel ?? `${effectiveLangLabel}·${index + 1}`) : effectiveLangLabel;
 
   const pillCls = isVideo
     ? "inline-flex items-center gap-0.5 rounded border border-emerald-200 bg-emerald-50 px-1 py-px text-[8px] font-semibold text-emerald-700 hover:bg-emerald-100 cursor-pointer transition-colors max-w-full"
     : "inline-flex items-center gap-0.5 rounded border border-indigo-200 bg-indigo-50 px-1 py-px text-[8px] font-semibold text-indigo-700 hover:bg-indigo-100 cursor-pointer transition-colors max-w-full";
 
-  const label = `${langLabel} — ${summary}`;
+  const label = `${effectiveLangLabel} — ${summary}`;
 
   return (
     <>
