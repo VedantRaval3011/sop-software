@@ -70,19 +70,41 @@ export function getScoreColorClass(score: number): string {
   return "text-rose-600";
 }
 
+function truncateAtSentenceBoundary(text: string, maxLength: number): string {
+  if (text.length <= maxLength) return text;
+  const slice = text.slice(0, maxLength);
+  // Find the last sentence-ending punctuation followed by a space or end-of-slice
+  const lastEnd = Math.max(
+    slice.lastIndexOf('. '),
+    slice.lastIndexOf('? '),
+    slice.lastIndexOf('! '),
+    // also handle a sentence that ends right at the slice boundary
+    slice.endsWith('.') || slice.endsWith('?') || slice.endsWith('!') ? slice.length - 1 : -1,
+  );
+  if (lastEnd > maxLength * 0.4) {
+    return slice.slice(0, lastEnd + 1).trimEnd() + '…';
+  }
+  // No good sentence boundary — fall back to word boundary
+  const lastSpace = slice.lastIndexOf(' ');
+  return (lastSpace > 0 ? slice.slice(0, lastSpace) : slice).trimEnd() + '…';
+}
+
 export function buildImpactAnalysis(
   finding: {
     mismatchExplanation?: string;
     issueSeverity?: string;
     clauseNumber?: string;
+    clauseTitle?: string;
     guidelineName?: string;
+    folderName?: string;
+    pdfName?: string;
+    guidelineReference?: string;
+    pageNumber?: string;
+    paragraphNumber?: string;
+    sopSectionAffected?: string;
   },
   requirement: string,
 ): string {
-  const clauseRef = finding.guidelineName
-    ? `Clause ${finding.clauseNumber} of ${finding.guidelineName}`
-    : `Clause ${finding.clauseNumber ?? "requirement"}`;
-
   const risk =
     finding.issueSeverity === "critical"
       ? "critical audit findings, product quality risk, or regulatory action"
@@ -90,11 +112,41 @@ export function buildImpactAnalysis(
         ? "audit findings, batch failure, or a mandatory Corrective and Preventive Action (CAPA)"
         : "documentation gaps during internal or regulatory inspection";
 
-  const reqPart = requirement
-    ? ` The guideline requires: '${requirement.length > 220 ? `${requirement.slice(0, 220)}...` : requirement}' — this must be explicitly demonstrated in the SOP text.`
+  // Build a precise, traceable source reference
+  const docName = finding.pdfName || finding.folderName || finding.guidelineName || "the guideline";
+  const clauseLabel = finding.clauseNumber
+    ? `§ ${finding.clauseNumber}${finding.clauseTitle ? ` — "${finding.clauseTitle}"` : ""}`
     : "";
 
-  return `This may result in ${risk} by not fully addressing ${clauseRef}.${reqPart}`;
+  // Prefer explicit guidelineReference if the AI already set it; otherwise compose from parts
+  const baseRef = finding.guidelineReference && finding.guidelineReference !== `${finding.guidelineName} Clause ${finding.clauseNumber}`
+    ? finding.guidelineReference
+    : [docName, clauseLabel].filter(Boolean).join(", ");
+
+  const locationParts: string[] = [];
+  if (finding.pageNumber?.trim()) locationParts.push(`p. ${finding.pageNumber.trim()}`);
+  if (finding.paragraphNumber?.trim()) locationParts.push(`¶ ${finding.paragraphNumber.trim()}`);
+
+  const preciseSource = locationParts.length > 0
+    ? `${baseRef} (${locationParts.join(", ")})`
+    : baseRef;
+
+  // SOP section where the gap exists
+  const sopSection = finding.sopSectionAffected?.trim();
+
+  // Build as discrete points separated by \n so the UI can render them as bullets
+  const points: string[] = [];
+  points.push(`Risk: This may result in ${risk}.`);
+  points.push(`Source: ${preciseSource}`);
+  if (requirement) {
+    points.push(`Requirement: "${truncateAtSentenceBoundary(requirement, 500)}"`);
+  }
+  if (sopSection && sopSection !== "Not Found" && sopSection !== "N/A") {
+    points.push(`Gap in: SOP ${sopSection}`);
+  }
+  points.push("Must be explicitly demonstrated in the SOP text.");
+
+  return points.join("\n");
 }
 
 export function calculateCompliancePercentage(

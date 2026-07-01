@@ -61,6 +61,14 @@ function buildJourneySteps(
       completed: s.completed ?? false,
     });
   }
+  if (content.sopPdfUrlGu) {
+    const s = (stepData.sopPdfGu || {}) as { completed?: boolean };
+    journeySteps.push({
+      id: 'sopPdfGu', type: 'pdf', label: 'SOP Document (Gujarati)', url: content.sopPdfUrlGu,
+      fileType: content.sopFileTypeGu,
+      completed: s.completed ?? false,
+    });
+  }
   if (content.slidesEn.length > 0) {
     const s = (stepData.slidesEn || {}) as { completed?: boolean };
     journeySteps.push({
@@ -79,6 +87,15 @@ function buildJourneySteps(
     const s = (stepData.quiz || {}) as { completed?: boolean; passed?: boolean; score?: number; attempts?: number };
     journeySteps.push({
       id: 'quiz', type: 'quiz', label: 'Assessment', questionCount: content.mcqCount,
+      completed: s.completed ?? false,
+      percentage: s.score,
+      attempts: s.attempts ?? 0,
+    });
+  }
+  if (content.mcqCountGu > 0) {
+    const s = (stepData.quizGu || {}) as { completed?: boolean; passed?: boolean; score?: number; attempts?: number };
+    journeySteps.push({
+      id: 'quizGu', type: 'quiz', label: 'Assessment (Gujarati)', questionCount: content.mcqCountGu,
       completed: s.completed ?? false,
       percentage: s.score,
       attempts: s.attempts ?? 0,

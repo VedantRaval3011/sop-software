@@ -163,5 +163,6 @@ export function requestStopAllComplianceRuns(): number {
 
 export function listActiveComplianceRunIds(): string[] {
   const s = store();
-  return [...new Set([...s.runControllers.keys(), ...s.subprocessProcs.keys(), ...s.runEpochs.keys()])];
+  // Only in-flight runs — runEpochs can linger after HMR/crashes and falsely report active.
+  return [...new Set([...s.runControllers.keys(), ...s.subprocessProcs.keys()])];
 }

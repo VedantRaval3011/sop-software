@@ -29,6 +29,7 @@ type SopLean = {
   department: string;
   fileUrl?: string;
   fileType?: string;
+  language?: string;
   mediaLinks?: {
     videos?: { en?: string | string[]; gu?: string | string[] };
     slides?: { en?: string | string[]; gu?: string | string[] };
@@ -54,23 +55,38 @@ export interface JourneyContent {
   slidesGu: string[];
   sopPdfUrl: string | null;
   sopFileType: 'pdf' | 'docx';
+  /** Gujarati SOP document, when a distinct Gujarati-language record exists. */
+  sopPdfUrlGu: string | null;
+  sopFileTypeGu: 'pdf' | 'docx';
   mcqCount: number;
+  /** Question count of the Gujarati MCQ bank, if one exists. */
+  mcqCountGu: number;
 }
 
-function buildJourneyContent(sop: SopLean | null, mcqCount: number): JourneyContent {
+function buildJourneyContent(
+  sop: SopLean | null,
+  gujSop: SopLean | null,
+  mcqCount: number,
+  mcqCountGu: number,
+): JourneyContent {
   const videosEn = sop ? toArray(sop.mediaLinks?.videos?.en) : [];
   const videosGu = sop ? toArray(sop.mediaLinks?.videos?.gu) : [];
   const slidesEn = sop ? toArray(sop.mediaLinks?.slides?.en) : [];
   const slidesGu = sop ? toArray(sop.mediaLinks?.slides?.gu) : [];
   const sopPdfUrl = sop?.fileUrl || null;
+  // Only surface a Gujarati doc when it is a separate file from the primary one.
+  const sopPdfUrlGu =
+    gujSop?.fileUrl && gujSop.fileUrl !== sopPdfUrl ? gujSop.fileUrl : null;
 
   const availableStepIds: string[] = [];
   if (videosEn.length > 0) availableStepIds.push('videoEn');
   if (videosGu.length > 0) availableStepIds.push('videoGu');
   if (sopPdfUrl) availableStepIds.push('sopPdf');
+  if (sopPdfUrlGu) availableStepIds.push('sopPdfGu');
   if (slidesEn.length > 0) availableStepIds.push('slidesEn');
   if (slidesGu.length > 0) availableStepIds.push('slidesGu');
   if (mcqCount > 0) availableStepIds.push('quiz');
+  if (mcqCountGu > 0) availableStepIds.push('quizGu');
 
   return {
     sop: sop
@@ -91,7 +107,10 @@ function buildJourneyContent(sop: SopLean | null, mcqCount: number): JourneyCont
     slidesGu,
     sopPdfUrl,
     sopFileType: sop?.fileType === 'docx' ? 'docx' : 'pdf',
+    sopPdfUrlGu,
+    sopFileTypeGu: gujSop?.fileType === 'docx' ? 'docx' : 'pdf',
     mcqCount,
+    mcqCountGu,
   };
 }
 
@@ -110,11 +129,13 @@ function sopMatchesCode(sop: SopLean, code: string): boolean {
 
 function mcqCountForCode(
   code: string,
-  bankDocs: Array<{ sopIdentifier?: string; totalQuestions?: number }>,
+  bankDocs: Array<{ sopIdentifier?: string; totalQuestions?: number; language?: string }>,
+  language: 'English' | 'Gujarati',
 ): number {
   const re = new RegExp(`^${escapeRegex(code)}`, 'i');
   let total = 0;
   for (const bank of bankDocs) {
+    if ((bank.language || 'English') !== language) continue;
     if (re.test(String(bank.sopIdentifier || ''))) total += bank.totalQuestions || 0;
   }
   return total;
@@ -146,22 +167,24 @@ export async function getJourneyContentBatch(
 
   const [sopRows, bankDocs] = await Promise.all([
     SOP.find({ isObsolete: { $ne: true }, $or: sopOr })
-      .select('name identifier sopBaseId department fileUrl fileType mediaLinks versionNum uploadedAt')
+      .select('name identifier sopBaseId department fileUrl fileType language mediaLinks versionNum uploadedAt')
       .lean<SopLean[]>(),
     MCQBank.find({
       isObsolete: { $ne: true },
-      language: 'English',
+      language: { $in: ['English', 'Gujarati'] },
       $or: missing.map((code) => ({
         sopIdentifier: { $regex: new RegExp(`^${escapeRegex(code)}`, 'i') },
       })),
     })
-      .select('sopIdentifier totalQuestions')
-      .lean<Array<{ sopIdentifier?: string; totalQuestions?: number }>>(),
+      .select('sopIdentifier totalQuestions language')
+      .lean<Array<{ sopIdentifier?: string; totalQuestions?: number; language?: string }>>(),
   ]);
 
   for (const code of missing) {
     let best: SopLean | null = null;
     let bestRank = -1;
+    let bestGu: SopLean | null = null;
+    let bestGuRank = -1;
     for (const sop of sopRows) {
       if (!sopMatchesCode(sop, code)) continue;
       const rank = sopRank(sop);
@@ -169,9 +192,18 @@ export async function getJourneyContentBatch(
         best = sop;
         bestRank = rank;
       }
+      if (sop.language === 'Gujarati' && rank > bestGuRank) {
+        bestGu = sop;
+        bestGuRank = rank;
+      }
     }
 
-    const content = buildJourneyContent(best, mcqCountForCode(code, bankDocs));
+    const content = buildJourneyContent(
+      best,
+      bestGu,
+      mcqCountForCode(code, bankDocs, 'English'),
+      mcqCountForCode(code, bankDocs, 'Gujarati'),
+    );
     result.set(code, content);
     primeLmsServerCache(
       lmsServerKeys.journeyContent(code),
@@ -190,7 +222,7 @@ export async function getJourneyContent(sopCode: string): Promise<JourneyContent
     lmsServerTtl.journeyContent,
     async () => {
       const batch = await getJourneyContentBatch([sopCode]);
-      return batch.get(sopCode) ?? buildJourneyContent(null, 0);
+      return batch.get(sopCode) ?? buildJourneyContent(null, null, 0, 0);
     },
   );
 }

@@ -49,6 +49,7 @@ import {
   applyAuditorStandards,
   classifyAll,
   computeWeightedScoreBreakdown,
+  isScoringFinding,
   sortByRisk,
 } from "@/lib/complianceClassification";
 import {
@@ -218,7 +219,7 @@ REQUIREMENT IMPORTANCE & REASONING (for weighted scoring + auditor panel):
 
 OUTPUT COMPACTNESS (critical — large audits must finish in minutes, not hours):
 - "compliant" and "not-applicable": REQUIRED fields only — guidelineName, clauseNumber, clauseTitle, guidelineReference, applicability, scopeOwner, complianceLevel, matchConfidence, requirementCriticality, issueSeverity, sopSectionAffected, sopTextSnippet (≤1 line), evidenceFound, evidenceMissing ("None" when compliant). OMIT impactAnalysis, suggestedAction, suggestedText, whyApplies, whyEvidenceInsufficient, mismatchExplanation (unless not-applicable — then ≤15 words).
-- "partial" and "non-compliant": include ALL fields below with concise but complete gap analysis (impactAnalysis ≤2 sentences, suggestedText ≤4 sentences).
+- "partial" and "non-compliant": include ALL fields below with concise but complete gap analysis (suggestedText ≤4 sentences). OMIT impactAnalysis — it is derived automatically from structured fields.
 
 Generate one complete, evidence-backed finding for EVERY clause — never skip, never merge, never summarise remaining clauses. Return EXACTLY one finding per clause, same order, as valid complete JSON only:
 {
@@ -244,7 +245,6 @@ Generate one complete, evidence-backed finding for EVERY clause — never skip, 
       "whyApplies": "string",
       "whyEvidenceInsufficient": "string",
       "mismatchExplanation": "string (factual reason for the gap — NO speculation)",
-      "impactAnalysis": "string (audit/CAPA/regulatory risk)",
       "suggestedAction": "string (one-line fix)",
       "suggestedText": "string (insertion-ready SOP wording in the SOP's own style, with section number — required for partial/non-compliant)",
       "rootCause": "string",
@@ -321,14 +321,20 @@ function finalizeFinding(raw: RawFinding | undefined, clause: GuidelineClauseInp
       : "");
 
   const impact =
-    raw?.impactAnalysis?.trim() ||
     (isActionable
       ? buildImpactAnalysis(
           {
             mismatchExplanation: gap,
             issueSeverity: raw?.issueSeverity,
             clauseNumber: clause.clauseNumber,
+            clauseTitle: clause.clauseTitle,
             guidelineName: clause.guidelineName,
+            folderName: clause.folderName,
+            pdfName: clause.pdfName,
+            guidelineReference: cleanFindingText(raw?.guidelineReference),
+            pageNumber: (raw?.pageNumber ?? "").toString().trim() || undefined,
+            paragraphNumber: (raw?.paragraphNumber ?? "").toString().trim() || undefined,
+            sopSectionAffected: cleanFindingText(raw?.sopSectionAffected),
           },
           requirement,
         )
@@ -700,7 +706,7 @@ function buildGmpFindings(
         findingType: "gmp-expectation" as const,
         guidelineReference: `GMP Expectation — ${exp.title}`,
         evidenceFound: "",
-        evidenceMissing: exp.title,
+        evidenceMissing: `${exp.title}: ${exp.rationale}`,
         rootCauseKey: exp.id,
       };
     });
@@ -989,16 +995,21 @@ export async function analyzeSOPComplianceV5(request: {
   // 3. Traceability matrix is built from the full clause set (every clause reviewed).
   const traceabilityMatrix = buildTraceabilityMatrix(allClausesForMatrix, validatedClauseFindings);
 
-  // 4. GMP Intelligence Layer — expectations beyond literal clause wording.
-  const topics = detectSopTopics(request.sopName, request.sopContent);
-  const gmpResults = evaluateGmpExpectations(request.sopContent, topics);
-  const gmpFindings = buildGmpFindings(gmpResults, request.sopName);
-
-  // 5. Cross-SOP dependency validation.
+  // 4. Cross-SOP dependency validation (before GMP so available refs satisfy expectations).
   const { dependencies, findings: crossSopFindings } = validateCrossSopDependencies(
     request.sopContent,
     request.sopLibrary ?? [],
   );
+  const availableCrossSopTypes = new Set(
+    dependencies.filter((d) => d.status === "available").map((d) => d.referencedType),
+  );
+
+  // 5. GMP Intelligence Layer — expectations beyond literal clause wording.
+  const topics = detectSopTopics(request.sopName, request.sopContent);
+  const gmpResults = evaluateGmpExpectations(request.sopContent, topics, {
+    availableCrossSopTypes,
+  });
+  const gmpFindings = buildGmpFindings(gmpResults, request.sopName);
 
   // 6. Classify (applicability + category + risk + evidence strength + reasoning).
   const classified = classifyAll([...validatedClauseFindings, ...gmpFindings, ...crossSopFindings]);
@@ -1012,9 +1023,20 @@ export async function analyzeSOPComplianceV5(request: {
   //    clause keeps its own finding for full clause-by-clause traceability.
   const sorted = sortByRisk(defensible);
 
-  // 10. Weighted, recalibrated scoring (one minor gap can't collapse the score).
+  // 10. Weighted score — guideline clauses only; GMP / cross-SOP are advisory.
   const scoreBreakdown = computeWeightedScoreBreakdown(sorted);
   const score = scoreBreakdown.score;
+
+  const scorableClauseCount = sorted.filter(
+    (f) => (!f.findingType || f.findingType === "guideline-clause") && isScoringFinding(f),
+  ).length;
+  const failedClauseCount = validatedClauseFindings.filter(
+    (f) => f.complianceLevel === "analysis-failed",
+  ).length;
+  const complianceStatus =
+    scorableClauseCount === 0 && failedClauseCount > 0
+      ? ("Analysis Incomplete" as const)
+      : getScoreLabel(score);
 
   const compliantCount = sorted.filter((f) => f.complianceLevel === "compliant").length;
   const partialCount = sorted.filter((f) => f.complianceLevel === "partial").length;
@@ -1052,7 +1074,7 @@ export async function analyzeSOPComplianceV5(request: {
   return {
     findings: sorted,
     overallScore: score,
-    complianceStatus: getScoreLabel(score),
+    complianceStatus,
     compliantCount,
     partialCount,
     nonCompliantCount,

@@ -1,6 +1,7 @@
 import { execSync, spawn } from "node:child_process";
 import { rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import http from "node:http";
 import path from "node:path";
 
 const PORT = Number(process.env.PORT || 3000);
@@ -49,10 +50,129 @@ try {
   console.warn("Warning: seed-admin failed (MongoDB may be slow or unreachable). Continuing…");
 }
 
-const child = spawn("npx", ["next", "dev", "--webpack", "-p", String(PORT)], {
+// Top-level routes to pre-compile once the server is up. In webpack dev mode,
+// compiling a route for the first time regenerates the shared app-router runtime
+// chunk, which forces every other open browser tab to full-reload (Fast Refresh
+// can't hot-patch a shared runtime chunk). Warming all routes right after startup
+// means the user's first real navigation to each page doesn't trigger that anymore.
+const WARMUP_ROUTES = [
+  "/",
+  "/login",
+  "/dashboard",
+  "/compliance",
+  "/training-matrix",
+  "/induction-training-matrix",
+  "/mcq-bank",
+  "/mcq-review",
+  "/lms",
+  "/employees",
+  "/bunny-files",
+  "/test",
+];
+
+function httpRequest(options, body) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(options, (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () =>
+        resolve({
+          statusCode: res.statusCode,
+          headers: res.headers,
+          body: Buffer.concat(chunks).toString("utf8"),
+        }),
+      );
+    });
+    req.on("error", reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+function cookieHeaderFrom(setCookieHeaders = []) {
+  return setCookieHeaders.map((c) => c.split(";")[0]).join("; ");
+}
+
+// Most protected routes (dashboard, employees, compliance, etc.) sit behind
+// next-auth middleware. Warming them up with an unauthenticated request just
+// hits the /login redirect — the protected page itself never gets compiled,
+// so the cross-tab reload still happens on the user's first real visit.
+// Sign in as the seeded admin first so warmup requests carry a real session.
+async function getWarmupSessionCookie(port) {
+  try {
+    const csrfRes = await httpRequest({ host: "localhost", port, path: "/api/auth/csrf", method: "GET" });
+    const csrfCookie = cookieHeaderFrom(
+      Array.isArray(csrfRes.headers["set-cookie"]) ? csrfRes.headers["set-cookie"] : [],
+    );
+    const { csrfToken } = JSON.parse(csrfRes.body);
+
+    const form = new URLSearchParams({
+      csrfToken,
+      username: "admin",
+      password: "admin123",
+      json: "true",
+    }).toString();
+
+    const loginRes = await httpRequest(
+      {
+        host: "localhost",
+        port,
+        path: "/api/auth/callback/credentials",
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "Content-Length": Buffer.byteLength(form),
+          Cookie: csrfCookie,
+        },
+      },
+      form,
+    );
+    const sessionCookie = cookieHeaderFrom(
+      Array.isArray(loginRes.headers["set-cookie"]) ? loginRes.headers["set-cookie"] : [],
+    );
+    return [csrfCookie, sessionCookie].filter(Boolean).join("; ");
+  } catch {
+    // Seeded admin missing or auth route unavailable — fall back to unauthenticated warmup.
+    return "";
+  }
+}
+
+async function warmupRoutes(port) {
+  const cookie = await getWarmupSessionCookie(port);
+  for (const route of WARMUP_ROUTES) {
+    try {
+      await fetch(`http://localhost:${port}${route}`, cookie ? { headers: { Cookie: cookie } } : undefined);
+    } catch {
+      // ignore — route may require auth/redirect, compilation still happens
+    }
+  }
+  console.log(
+    cookie
+      ? `Warmed up ${WARMUP_ROUTES.length} routes as admin (prevents cross-tab dev reloads)`
+      : `Warmed up ${WARMUP_ROUTES.length} routes (unauthenticated — protected pages may still trigger a one-time cross-tab reload)`,
+  );
+}
+
+// Use the Next 16 default bundler (Turbopack). Webpack's dev server recompiles
+// on-demand entries by regenerating a shared runtime chunk; Fast Refresh can't
+// hot-patch that, so opening a not-yet-compiled route forces a full reload in
+// every other open tab. Turbopack compiles routes independently and does not
+// invalidate a shared runtime chunk, so visiting a fresh route no longer reloads
+// the other tabs. (Pass DEV_BUNDLER=webpack to opt back into the old behavior.)
+const bundlerArgs = process.env.DEV_BUNDLER === "webpack" ? ["--webpack"] : [];
+const child = spawn("npx", ["next", "dev", ...bundlerArgs, "-p", String(PORT)], {
   cwd: root,
-  stdio: "inherit",
+  stdio: ["inherit", "pipe", "inherit"],
   shell: true,
+});
+
+let warmedUp = false;
+child.stdout.on("data", (chunk) => {
+  process.stdout.write(chunk);
+  if (!warmedUp && /Ready in/.test(chunk.toString())) {
+    warmedUp = true;
+    void warmupRoutes(PORT);
+  }
 });
 
 child.on("exit", (code) => process.exit(code ?? 0));

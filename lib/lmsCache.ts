@@ -80,6 +80,7 @@ export function invalidateLmsLearnerCache(employeeId: string, sopCode?: string) 
     `lms:progress:${employeeId}`,
     `lms:certificates:${employeeId}`,
     `lms:dashboard:${employeeId}`,
+    `lms:assets:${employeeId}`,
   );
   if (sopCode) {
     invalidateLmsServerKeys(
@@ -140,6 +141,7 @@ export async function getOrBuildLmsCache<T>(
 
 export const lmsServerKeys = {
   me: (employeeId: string) => `lms:me:${employeeId}`,
+  assets: (employeeId: string) => `lms:assets:${employeeId}`,
   progress: (employeeId: string) => `lms:progress:${employeeId}`,
   progressSop: (employeeId: string, sopCode: string) => `lms:progress:${employeeId}:${sopCode}`,
   certificates: (employeeId: string) => `lms:certificates:${employeeId}`,

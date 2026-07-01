@@ -1,9 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
+import mongoose from "mongoose";
 import { connectDB } from "@/lib/mongodb";
 import SOP from "@/models/SOP";
 import SOPGuideline from "@/models/SOPGuideline";
 import { type SopLibraryEntry } from "@/lib/complianceEngineV5";
 import { runComplianceReview } from "@/lib/compliance-review-orchestrator";
+import { resolveComplianceSopContent } from "@/lib/compliance-sop-content";
 import { extractClauses } from "@/lib/ocrProcessor";
 import { requireAuth } from "@/lib/withAuth";
 import { getComplianceProvider, checkClaudeCliHealth, checkCodexCliHealth, type LlmProvider } from "@/lib/llm";
@@ -68,7 +70,7 @@ export async function POST(request: NextRequest) {
   try {
     await connectDB();
     const body = await request.json();
-    const { sopId, forceRefresh = false, mode } = body;
+    const { sopId, guidelineId, guidelineIds: bodyGuidelineIds, forceRefresh = false, mode } = body;
     const p = body.provider as string | undefined;
     const providerOverride: LlmProvider | undefined =
       p === "claude" ? "claude" : p === "codex" ? "codex" : p === "ollama" ? "ollama" : p === "gemini" ? "gemini" : undefined;
@@ -79,22 +81,65 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ success: false, error: "sopId is required" }, { status: 400 });
     }
 
-    const sop = await SOP.findById(sopId).lean();
-    if (!sop) return NextResponse.json({ success: false, error: "SOP not found" }, { status: 404 });
+    const sopRow = await SOP.findById(sopId).lean();
+    if (!sopRow) return NextResponse.json({ success: false, error: "SOP not found" }, { status: 404 });
 
-    if (!sop.content || sop.content.trim().length < 50) {
+    const resolved = await resolveComplianceSopContent(sopId);
+    if (!resolved) {
       return NextResponse.json(
-        { success: false, error: `SOP "${sop.identifier}" has no parseable content. Re-upload the PDF.` },
+        {
+          success: false,
+          error: `SOP "${sopRow.identifier}" has no parseable content. Upload a DOCX version or re-link from storage so text can be extracted.`,
+        },
         { status: 422 },
       );
     }
 
-    const guidelines = await SOPGuideline.find({ ocrStatus: "completed" })
+    const sop = { ...resolved.record, content: resolved.content };
+    if (resolved.referencedSupplementChars > 0) {
+      console.log(
+        `[analyze-v5] ${sop.identifier}: merged ${resolved.referencedSupplementChars} chars from referenced SOPs`,
+      );
+    }
+
+    const resolvedGuidelineIds: string[] = [];
+    if (Array.isArray(bodyGuidelineIds)) {
+      for (const id of bodyGuidelineIds) {
+        const trimmed = String(id).trim();
+        if (trimmed && mongoose.Types.ObjectId.isValid(trimmed) && !resolvedGuidelineIds.includes(trimmed)) {
+          resolvedGuidelineIds.push(trimmed);
+        }
+      }
+    }
+    const trimmedGuidelineId = typeof guidelineId === "string" ? guidelineId.trim() : "";
+    if (
+      trimmedGuidelineId &&
+      mongoose.Types.ObjectId.isValid(trimmedGuidelineId) &&
+      !resolvedGuidelineIds.includes(trimmedGuidelineId)
+    ) {
+      resolvedGuidelineIds.push(trimmedGuidelineId);
+    }
+
+    const guidelineQuery: { ocrStatus: "completed"; _id?: { $in: mongoose.Types.ObjectId[] } } = {
+      ocrStatus: "completed",
+    };
+    if (resolvedGuidelineIds.length) {
+      guidelineQuery._id = {
+        $in: resolvedGuidelineIds.map((id) => new mongoose.Types.ObjectId(id)),
+      };
+    }
+
+    const guidelines = await SOPGuideline.find(guidelineQuery)
       .select("name folderName pdfName rawText clauses.clauseNumber clauses.clauseTitle clauses.clauseText")
       .lean();
     if (!guidelines.length) {
       return NextResponse.json(
-        { success: false, error: "No guidelines found. Upload guideline PDFs in Step 2 first." },
+        {
+          success: false,
+          error: resolvedGuidelineIds.length
+            ? "One or more selected guidelines were not found or are not ready. Upload and OCR the PDFs in Step 2 first."
+            : "No guidelines found. Upload guideline PDFs in Step 2 first.",
+        },
         { status: 404 },
       );
     }
@@ -114,8 +159,10 @@ export async function POST(request: NextRequest) {
       })),
     );
 
+    const scopedGuidelineIds = resolvedGuidelineIds.length ? resolvedGuidelineIds : undefined;
+
     console.log(
-      `[analyze-v5] ${sop.identifier}: full audit of ${guidelineClauses.length} clauses across ${guidelines.length} guidelines`,
+      `[analyze-v5] ${sop.identifier}: audit of ${guidelineClauses.length} clauses across ${guidelines.length} guideline(s)${scopedGuidelineIds ? ` (scoped: ${scopedGuidelineIds.length})` : " (all)"}`,
     );
 
     // SOP library for cross-SOP dependency validation.
@@ -176,6 +223,7 @@ export async function POST(request: NextRequest) {
         mode: reviewMode,
         forceRefresh: Boolean(forceRefresh),
         runEpoch,
+        scopedGuidelineIds,
       });
 
       await SOP.updateMany(

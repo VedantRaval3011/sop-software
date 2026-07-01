@@ -46,19 +46,26 @@ function isMeaningfulEvidence(text?: string): boolean {
  * non-compliant findings against a genuine requirement count as gaps.
  */
 export function classifyFinding(finding: ComplianceFinding): {
-  findingCategory: FindingCategory;
+  findingCategory?: FindingCategory;
   riskLevel: RiskLevel;
 } {
   const level = finding.complianceLevel;
   const severity = finding.issueSeverity;
 
-  // A compliant clause with only an enhancement suggestion is a Best Practice rec.
-  if (level === "compliant" || level === "not-applicable" || level === "analysis-failed") {
-    const hasSuggestion = Boolean(finding.suggestedAction?.trim() || finding.suggestedText?.trim());
+  if (level === "not-applicable" || level === "analysis-failed") {
     return {
-      findingCategory: hasSuggestion ? "Best Practice Recommendation" : "Best Practice Recommendation",
+      findingCategory: "Best Practice Recommendation",
       riskLevel: "Improvement",
     };
+  }
+
+  // Compliant clause — scored via complianceLevel. Only tag Best Practice when there is an enhancement note.
+  if (level === "compliant") {
+    const hasSuggestion = Boolean(finding.suggestedAction?.trim() || finding.suggestedText?.trim());
+    if (hasSuggestion) {
+      return { findingCategory: "Best Practice Recommendation", riskLevel: "Improvement" };
+    }
+    return { riskLevel: "Minor" };
   }
 
   if (level === "non-compliant") {
@@ -75,17 +82,35 @@ export function classifyFinding(finding: ComplianceFinding): {
 
 /** True for findings that represent a genuine, score-affecting compliance requirement. */
 export function isScoringFinding(finding: ComplianceFinding): boolean {
+  // GMP Intelligence and cross-SOP checks are advisory — they never drive the 0–10 score.
+  if (finding.findingType === "gmp-expectation" || finding.findingType === "cross-sop-dependency") {
+    return false;
+  }
   if (finding.complianceLevel === "not-applicable" || finding.complianceLevel === "analysis-failed") {
     return false;
   }
-  // Advisory recommendations never affect the score.
-  if (
-    finding.findingCategory === "Improvement Opportunity" ||
-    finding.findingCategory === "Best Practice Recommendation"
-  ) {
+  // Auditor-demoted speculative gaps are advisory only.
+  if (finding.findingCategory === "Improvement Opportunity") {
     return false;
   }
-  return true;
+  // Best Practice on a compliant clause is an enhancement note — still counts positively.
+  if (finding.findingCategory === "Best Practice Recommendation") {
+    return finding.complianceLevel === "compliant";
+  }
+  return (
+    finding.complianceLevel === "compliant" ||
+    finding.complianceLevel === "partial" ||
+    finding.complianceLevel === "non-compliant"
+  );
+}
+
+function countImprovementFindings(findings: ComplianceFinding[]): number {
+  return findings.filter(
+    (f) =>
+      f.complianceLevel !== "compliant" &&
+      (f.findingCategory === "Improvement Opportunity" ||
+        f.findingCategory === "Best Practice Recommendation"),
+  ).length;
 }
 
 /**
@@ -104,11 +129,7 @@ export function computeScoreBreakdown(findings: ComplianceFinding[]): Compliance
   const partialCount = scoring.filter((f) => f.complianceLevel === "partial").length;
   const nonCompliantCount = scoring.filter((f) => f.complianceLevel === "non-compliant").length;
 
-  const improvementCount = findings.filter(
-    (f) =>
-      f.findingCategory === "Improvement Opportunity" ||
-      f.findingCategory === "Best Practice Recommendation",
-  ).length;
+  const improvementCount = countImprovementFindings(findings);
   const notApplicableCount = findings.filter((f) => f.complianceLevel === "not-applicable").length;
 
   const totalApplicableRequirements = scoring.length;
@@ -168,11 +189,7 @@ export function computeWeightedScoreBreakdown(findings: ComplianceFinding[]): Co
   const partialCount = scoring.filter((f) => f.complianceLevel === "partial").length;
   const nonCompliantCount = scoring.filter((f) => f.complianceLevel === "non-compliant").length;
 
-  const improvementCount = findings.filter(
-    (f) =>
-      f.findingCategory === "Improvement Opportunity" ||
-      f.findingCategory === "Best Practice Recommendation",
-  ).length;
+  const improvementCount = countImprovementFindings(findings);
   const notApplicableCount = findings.filter((f) => f.complianceLevel === "not-applicable").length;
 
   let weightedTotal = 0;
@@ -199,11 +216,14 @@ export function computeWeightedScoreBreakdown(findings: ComplianceFinding[]): Co
   const score = Math.round(rawScore * 10) / 10;
 
   const formula =
-    `Weighted Score = (Σ achieved weight) ÷ (Σ total weight) × 10` +
-    `\nWeights: Critical=5, Major=3, Minor=1, Improvement=0` +
-    `\nRequirements: ${criticalRequirementCount} critical, ${majorRequirementCount} major, ${minorRequirementCount} minor` +
-    `\n= (${weightedAchieved.toFixed(1)}) ÷ (${weightedTotal.toFixed(1)}) × 10` +
-    `\n= ${score.toFixed(1)} / 10`;
+    totalApplicableRequirements === 0
+      ? "No guideline clauses were successfully evaluated for scoring. " +
+        "Re-run analysis with a working AI provider. GMP Intelligence findings are advisory and do not affect this score."
+      : `Weighted Score = (Σ achieved weight) ÷ (Σ total weight) × 10` +
+        `\nWeights: Critical=5, Major=3, Minor=1, GMP/Cross-SOP=0 (advisory only)` +
+        `\nGuideline requirements: ${criticalRequirementCount} critical, ${majorRequirementCount} major, ${minorRequirementCount} minor` +
+        `\n= (${weightedAchieved.toFixed(1)}) ÷ (${weightedTotal.toFixed(1)}) × 10` +
+        `\n= ${score.toFixed(1)} / 10`;
 
   return {
     totalApplicableRequirements,
@@ -388,7 +408,7 @@ export function classifyAll(findings: ComplianceFinding[]): ComplianceFinding[] 
 
     return {
       ...f,
-      findingCategory,
+      ...(findingCategory ? { findingCategory } : {}),
       riskLevel,
       evidenceStrength,
       requiresManualReview,

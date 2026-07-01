@@ -55,6 +55,7 @@ export interface FindingCardProps {
     findingCategory?: string;
     riskLevel?: string;
     guidelineReference?: string;
+    guidelineId?: string;
     evidenceFound?: string;
     evidenceMissing?: string;
     evidenceStrength?: string;
@@ -153,6 +154,44 @@ function evidenceStrengthBadge(strength?: string): { label: string; className: s
 function isMeaningful(text?: string): boolean {
   if (!text?.trim()) return false;
   return !/^(none|n\/a|na|not\s+found|not\s+applicable|-)$/i.test(text.trim());
+}
+
+/**
+ * Split prose text into bullet-ready strings.
+ * Priority: explicit \n separators → sentence boundaries → single item.
+ */
+function toBullets(text: string): string[] {
+  if (!text.trim()) return [];
+
+  // Already newline-separated (from buildImpactAnalysis)
+  if (text.includes('\n')) {
+    return text.split('\n').map(s => s.trim()).filter(Boolean);
+  }
+
+  // Split on sentence boundaries: ". " followed by a capital letter or known label
+  const sentences = text
+    .split(/(?<=[\.\!\?])\s+(?=[A-Z"'(])/)
+    .map(s => s.trim())
+    .filter(Boolean);
+
+  return sentences.length > 1 ? sentences : [text.trim()];
+}
+
+function BulletList({ text, className }: { text: string; className?: string }) {
+  const items = toBullets(text);
+  if (items.length <= 1) {
+    return <p className={`text-sm text-gray-800 leading-relaxed ${className ?? ''}`}>{text}</p>;
+  }
+  return (
+    <ul className={`space-y-1.5 ${className ?? ''}`}>
+      {items.map((item, i) => (
+        <li key={i} className="flex items-start gap-2 text-sm text-gray-800 leading-relaxed">
+          <span className="mt-1.5 h-1.5 w-1.5 rounded-full bg-current shrink-0 opacity-50" />
+          <span>{item}</span>
+        </li>
+      ))}
+    </ul>
+  );
 }
 
 function applicabilityBadge(applicability?: string): { label: string; className: string } | null {
@@ -431,25 +470,29 @@ export default function FindingCard({
 
             {/* Evidence-based assessment */}
             {(isMeaningful(evidenceFound) || isMeaningful(evidenceMissing)) && (
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <div className={`grid gap-4 ${isMeaningful(evidenceFound) && isMeaningful(evidenceMissing) ? 'grid-cols-1 lg:grid-cols-2' : 'grid-cols-1'}`}>
+                {isMeaningful(evidenceFound) && (
                 <section className="rounded-xl border border-emerald-200 bg-emerald-50/70 p-4">
                   <h4 className="text-[10px] font-black text-emerald-700 uppercase tracking-widest mb-2 flex items-center gap-1.5">
                     <CheckCircle2 className="h-3.5 w-3.5" />
                     Evidence Found
                   </h4>
                   <p className="text-sm text-gray-800 leading-relaxed">
-                    {isMeaningful(evidenceFound) ? evidenceFound : 'No supporting evidence located in the SOP.'}
+                    {evidenceFound}
                   </p>
                 </section>
+                )}
+                {isMeaningful(evidenceMissing) && (
                 <section className="rounded-xl border border-rose-200 bg-rose-50/70 p-4">
                   <h4 className="text-[10px] font-black text-rose-700 uppercase tracking-widest mb-2 flex items-center gap-1.5">
                     <XCircle className="h-3.5 w-3.5" />
                     Evidence Missing
                   </h4>
                   <p className="text-sm text-gray-800 leading-relaxed">
-                    {isMeaningful(evidenceMissing) ? evidenceMissing : 'None — requirement fully evidenced.'}
+                    {evidenceMissing}
                   </p>
                 </section>
+                )}
               </div>
             )}
 
@@ -559,14 +602,37 @@ export default function FindingCard({
                     <AlertTriangle className="h-3.5 w-3.5" />
                     Gap Identified
                   </h4>
-                  <p className="text-sm text-gray-800 leading-relaxed">{gapText}</p>
+                  <BulletList text={gapText} />
                 </section>
                 <section className="rounded-xl border border-orange-200 bg-orange-50/80 p-4">
                   <h4 className="text-[10px] font-black text-orange-700 uppercase tracking-widest mb-2 flex items-center gap-1.5">
                     <Target className="h-3.5 w-3.5" />
                     Impact Analysis
                   </h4>
-                  <p className="text-sm text-gray-800 leading-relaxed">{impactText}</p>
+                  <BulletList text={impactText} />
+                  {finding.guidelineId && (() => {
+                    const pageFragment = finding.pageNumber?.trim()
+                      ? `#page=${finding.pageNumber.trim()}`
+                      : '';
+                    const href = `/api/guidelines/upload?serve=${finding.guidelineId}${pageFragment}`;
+                    const label = [
+                      finding.pdfName || finding.folderName || finding.guidelineName,
+                      finding.clauseNumber ? `§ ${finding.clauseNumber}` : '',
+                      finding.pageNumber?.trim() ? `p. ${finding.pageNumber.trim()}` : '',
+                    ].filter(Boolean).join(' · ');
+                    return (
+                      <a
+                        href={href}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="mt-3 inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-orange-300 bg-white text-[11px] font-bold text-orange-700 hover:bg-orange-50 hover:border-orange-400 transition-colors"
+                        title="Open source guideline document"
+                      >
+                        <ExternalLink className="h-3 w-3 shrink-0" />
+                        {label || 'View source in guideline'}
+                      </a>
+                    );
+                  })()}
                 </section>
               </div>
             )}

@@ -17,9 +17,9 @@ export function getMcqCodexModel(): string {
   return process.env.MCQ_CODEX_MODEL ?? DEFAULT_MCQ_CODEX_MODEL;
 }
 
-/** Compliance uses a separate model — defaults to gpt-4.1 (not the MCQ mini model). */
+/** Compliance Codex model — must be supported on ChatGPT subscription (gpt-4.1 is API-only). */
 export function getComplianceCodexModel(): string {
-  return process.env.COMPLIANCE_CODEX_MODEL ?? "gpt-4.1";
+  return process.env.COMPLIANCE_CODEX_MODEL ?? DEFAULT_MCQ_CODEX_MODEL;
 }
 
 export interface CodexCliHealth {
@@ -267,7 +267,19 @@ async function runCodexExecPrompt(
     proc.on("close", (code: number | null) => {
       if (options?.signal) options.signal.removeEventListener("abort", onAbort);
       if (code !== 0) {
-        finish(() => reject(new Error(`Codex CLI exited with code ${code}: ${stderr.slice(0, 400)}`)));
+        const apiErr = stderr.match(/ERROR:\s*(\{[\s\S]*?\})(?=\nERROR:|\n*$)/)?.[1];
+        let detail = stderr.trim();
+        if (apiErr) {
+          try {
+            const parsed = JSON.parse(apiErr) as { error?: { message?: string } };
+            if (parsed.error?.message) detail = parsed.error.message;
+          } catch {
+            detail = apiErr.slice(0, 400);
+          }
+        } else {
+          detail = stderr.slice(-800) || stdout.slice(-400) || `exit code ${code}`;
+        }
+        finish(() => reject(new Error(`Codex CLI exited with code ${code}: ${detail}`)));
       } else {
         finish(() => resolve(stdout.trim()));
       }

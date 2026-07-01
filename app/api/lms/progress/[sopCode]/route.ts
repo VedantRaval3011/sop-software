@@ -18,15 +18,20 @@ type Params = { params: Promise<{ sopCode: string }> };
 function recalcOverall(steps: Record<string, unknown>, availableSteps: string[]): number {
   if (availableSteps.length === 0) return 0;
 
-  const hasQuiz = availableSteps.includes('quiz');
+  const quizKeys = availableSteps.filter((k) => k === 'quiz' || k === 'quizGu');
+  const hasQuiz = quizKeys.length > 0;
 
   if (hasQuiz) {
-    // Quiz is the only mandatory step. Passing it = 100%.
-    const quiz = steps['quiz'] as { completed?: boolean } | undefined;
-    if (quiz?.completed === true) return 100;
+    // The assessment is the only mandatory step. Passing it in either language
+    // (English or Gujarati) = 100%.
+    const quizPassed = quizKeys.some((k) => {
+      const s = steps[k] as { completed?: boolean } | undefined;
+      return s?.completed === true;
+    });
+    if (quizPassed) return 100;
 
     // Before passing, show partial progress from optional steps capped at 90%.
-    const optionalSteps = availableSteps.filter((k) => k !== 'quiz');
+    const optionalSteps = availableSteps.filter((k) => k !== 'quiz' && k !== 'quizGu');
     if (optionalSteps.length === 0) return 0;
     const doneOptional = optionalSteps.filter((k) => {
       const s = steps[k] as { completed?: boolean } | undefined;
@@ -107,7 +112,7 @@ export async function PATCH(req: NextRequest, { params }: Params) {
     }
 
     if (typeof step === 'string' && step) {
-      const validSteps = ['videoEn', 'videoGu', 'slidesEn', 'slidesGu', 'sopPdf', 'quiz'];
+      const validSteps = ['videoEn', 'videoGu', 'slidesEn', 'slidesGu', 'sopPdf', 'sopPdfGu', 'quiz', 'quizGu'];
       if (!validSteps.includes(step)) {
         return NextResponse.json({ error: 'Invalid step' }, { status: 400 });
       }
@@ -117,7 +122,7 @@ export async function PATCH(req: NextRequest, { params }: Params) {
       const merged = { ...current, ...stepData };
 
       // Quiz: once a user has passed, never allow a failed retake to un-complete their training
-      if (step === 'quiz' && (current.passed === true || current.completed === true)) {
+      if ((step === 'quiz' || step === 'quizGu') && (current.passed === true || current.completed === true)) {
         merged.completed = true;
         merged.passed = true;
       }
