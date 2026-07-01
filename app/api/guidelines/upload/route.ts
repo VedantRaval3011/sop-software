@@ -157,11 +157,24 @@ export async function GET(request: NextRequest) {
   // Serve PDF file from disk
   if (serve) {
     try {
-      const doc = await SOPGuideline.findById(serve).select("filePath pdfName").lean();
+      const doc = await SOPGuideline.findById(serve).select("filePath pdfName folderName").lean();
       if (!doc) return NextResponse.json({ error: "Guideline not found" }, { status: 404 });
-      if (!fs.existsSync(doc.filePath))
-        return NextResponse.json({ error: "Guideline file not found on disk" }, { status: 404 });
-      const fileBuffer = fs.readFileSync(doc.filePath);
+
+      // Resolve file path: use stored path if it exists, otherwise reconstruct from folderName + pdfName
+      let resolvedPath = doc.filePath;
+      if (!fs.existsSync(resolvedPath)) {
+        const reconstructed = path.join(process.cwd(), "temp", "guidelines", doc.folderName, doc.pdfName);
+        if (fs.existsSync(reconstructed)) {
+          resolvedPath = reconstructed;
+        } else {
+          return NextResponse.json(
+            { error: "Guideline file not found. Please re-upload the PDF." },
+            { status: 404 },
+          );
+        }
+      }
+
+      const fileBuffer = fs.readFileSync(resolvedPath);
       return new NextResponse(fileBuffer, {
         headers: {
           "Content-Type": "application/pdf",

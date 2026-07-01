@@ -6,7 +6,7 @@ import {
   ArrowLeft, Check, ChevronLeft, ChevronRight, PlayCircle,
   FileText, BookOpen, ClipboardList, Lock, Loader2, AlertCircle,
   Volume2, Trophy, X, Award, RefreshCw, Clock,
-  Maximize2, ExternalLink, Download,
+  Maximize2, ExternalLink, Download, Flag, XCircle,
 } from 'lucide-react';
 import type { JourneyStep } from '@/app/api/lms/journey/[sopCode]/route';
 import { buildOfficeOnlineEmbedUrl } from '@/lib/file-urls';
@@ -545,16 +545,15 @@ function QuizStep({
   sopCode,
   step,
   onComplete,
-  onExamActive,
+  onExit,
 }: {
   sopCode: string;
   step: JourneyStep;
-  onComplete: (score: number, passed: boolean, isTrial: boolean, newAttempts: number) => void;
-  onExamActive: (active: boolean) => void;
+  onComplete: (score: number, passed: boolean, newAttempts: number) => void;
+  onExit: () => void;
 }) {
   const [localAttempts, setLocalAttempts] = useState(step.attempts ?? 0);
-  const [mode, setMode] = useState<'trial' | 'exam'>(step.attempts === 0 ? 'trial' : 'exam');
-  const [phase, setPhase] = useState<'loading' | 'answering' | 'review'>('loading');
+  const [phase, setPhase] = useState<'loading' | 'intro' | 'answering' | 'review'>('loading');
   const [questions, setQuestions] = useState<PreparedQuestion[]>([]);
   const [settings, setSettings] = useState<QuizSettings | null>(null);
   const [answers, setAnswers] = useState<Record<string, string>>({});
@@ -577,7 +576,22 @@ function QuizStep({
   const [showViolationWarning, setShowViolationWarning] = useState(false);
   const lastViolationTs = useRef(0);
 
-  const fetchQuestions = useCallback(async (m: 'trial' | 'exam') => {
+  // Paginated navigator state (one-question-at-a-time test UI)
+  const [currentIdx, setCurrentIdx] = useState(0);
+  const [marked, setMarked] = useState<Set<number>>(new Set());
+  const [visited, setVisited] = useState<Set<number>>(new Set([0]));
+
+  // Reset the navigator whenever a fresh set of questions loads (trial/exam/retest).
+  useEffect(() => {
+    setCurrentIdx(0);
+    setMarked(new Set());
+    setVisited(new Set([0]));
+  }, [questions]);
+
+  // Gujarati assessment pulls from the Gujarati MCQ bank via the lang param.
+  const lang = step.id === 'quizGu' ? 'gu' : 'en';
+
+  const fetchQuestions = useCallback(async () => {
     setPhase('loading');
     setAnswers({});
     setScore(0);
@@ -586,7 +600,7 @@ function QuizStep({
     setRetestQueue([]);
     setExamAttempts(0);
     try {
-      const res = await fetch(`/api/lms/quiz/${sopCode}?mode=${m}`);
+      const res = await fetch(`/api/lms/quiz/${sopCode}?mode=exam&lang=${lang}`);
       const data = await res.json() as {
         questions?: MCQQuestion[];
         settings?: QuizSettings;
@@ -595,18 +609,19 @@ function QuizStep({
       if (!data.questions?.length) { setError(data.error || 'No questions available.'); setPhase('review'); return; }
       setSettings(data.settings ?? null);
       setQuestions(prepareQuestions(data.questions, data.settings?.shuffleOptions ?? false));
-      setPhase('answering');
+      setPhase('intro');
     } catch {
       setError('Failed to load quiz. Please try again.');
       setPhase('review');
     }
-  }, [sopCode]);
+  }, [sopCode, lang]);
 
-  useEffect(() => { fetchQuestions(mode); }, [fetchQuestions, mode]);
+  // Start straight on the exam (no demo). Skip auto-start when already passed.
+  useEffect(() => { if (!step.completed) fetchQuestions(); }, [fetchQuestions, step.completed]);
 
-  // Countdown timer — always enabled for exams and retests (paced per question).
+  // Countdown timer — paced per question.
   useEffect(() => {
-    if (mode !== 'exam' || phase !== 'answering' || questions.length === 0) {
+    if (phase !== 'answering' || questions.length === 0) {
       setTimeLeft(null);
       return;
     }
@@ -624,18 +639,11 @@ function QuizStep({
       });
     }, 1000);
     return () => clearInterval(interval);
-  }, [mode, phase, settings, questions.length]);
-
-  // Notify parent when exam is active (to lock sidebar navigation)
-  useEffect(() => {
-    const examIsRunning = mode === 'exam' && phase === 'answering';
-    onExamActive(examIsRunning);
-    return () => { if (examIsRunning) onExamActive(false); };
-  }, [mode, phase, onExamActive]);
+  }, [phase, settings, questions.length]);
 
   // Tab-switch / focus-loss detection during exam
   useEffect(() => {
-    if (mode !== 'exam' || phase !== 'answering') return;
+    if (phase !== 'answering') return;
 
     const fireViolation = () => {
       const now = Date.now();
@@ -663,7 +671,7 @@ function QuizStep({
       document.removeEventListener('visibilitychange', onVisibilityChange);
       window.removeEventListener('blur', onBlur);
     };
-  }, [mode, phase]);
+  }, [phase]);
 
   const handleSubmit = useCallback(() => {
     let correct = 0;
@@ -679,26 +687,15 @@ function QuizStep({
     setRetestQueue(wrong);
     setPhase('review');
 
-    if (mode === 'trial') {
-      onComplete(pct, false, true, newAttempts);
-    } else {
-      // A retest must be answered perfectly; the main exam uses the configured score.
-      const required = isRetest ? 100 : (settings?.passingScore ?? 80);
-      const passed = pct >= required;
-      setExamAttempts((n) => n + 1);
-      onComplete(pct, passed, false, newAttempts);
-    }
-  }, [questions, answers, localAttempts, mode, isRetest, settings, onComplete]);
+    // A retest must be answered perfectly; the main exam uses the configured score.
+    const required = isRetest ? 100 : (settings?.passingScore ?? 80);
+    const passed = pct >= required;
+    setExamAttempts((n) => n + 1);
+    onComplete(pct, passed, newAttempts);
+  }, [questions, answers, localAttempts, isRetest, settings, onComplete]);
 
   // Keep ref in sync so timer can auto-submit
   useEffect(() => { submitRef.current = handleSubmit; }, [handleSubmit]);
-
-  const [showExamConfirm, setShowExamConfirm] = useState(false);
-
-  const startExam = () => {
-    setMode('exam');
-    fetchQuestions('exam');
-  };
 
   // Re-attempt only the questions missed in the previous attempt. Each retest
   // narrows to whatever is still wrong, and requires every answer to be correct.
@@ -725,7 +722,7 @@ function QuizStep({
           </p>
         </div>
         <button
-          onClick={() => { setMode('exam'); fetchQuestions('exam'); }}
+          onClick={() => fetchQuestions()}
           className="flex items-center gap-1.5 rounded-lg border border-gray-200 px-4 py-2 text-sm text-gray-600 hover:bg-gray-50"
         >
           <RefreshCw className="h-3.5 w-3.5" /> Retake Assessment
@@ -754,127 +751,83 @@ function QuizStep({
     );
   }
 
-  // ── Review after trial ─────────────────────────────────────────────────────
-  if (phase === 'review' && mode === 'trial') {
-    const showAnswers = settings?.showAnswersAfterTrial ?? true;
+  // ── Pre-exam intro / confirmation ──────────────────────────────────────────
+  if (phase === 'intro') {
+    const introPassing = isRetest ? 100 : (settings?.passingScore ?? 80);
+    const totalSecs = timerSecondsFor(settings, questions.length);
+    const minutes = totalSecs > 0 ? Math.max(1, Math.round(totalSecs / 60)) : null;
+    const maxAttempts = settings?.maxAttempts ?? 0;
+    const details = [
+      { Icon: ClipboardList, label: 'Questions', value: `${questions.length}` },
+      { Icon: Clock, label: 'Time limit', value: minutes ? `${minutes} min` : 'Untimed' },
+      { Icon: Award, label: 'Passing score', value: `${introPassing}%` },
+      { Icon: RefreshCw, label: 'Attempts', value: maxAttempts > 0 ? `${maxAttempts}` : 'Unlimited' },
+    ];
     return (
-      <div className="flex flex-1 flex-col gap-5 py-4">
-        {/* Trial result banner */}
-        <div className="flex items-center gap-3 rounded-xl border border-blue-200 bg-blue-50 px-4 py-3">
-          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-blue-100">
-            <ClipboardList className="h-5 w-5 text-blue-600" />
+      <div className="fixed inset-0 z-40 flex items-center justify-center bg-gray-50 p-4">
+        <div className="w-full max-w-lg rounded-2xl border border-gray-200 bg-white p-7 shadow-xl">
+          <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-purple-100">
+            <ClipboardList className="h-7 w-7 text-purple-600" />
           </div>
-          <div>
-            <p className="text-sm font-bold text-blue-800">Demo Assessment Complete — {score}%</p>
-            <p className="text-xs text-blue-600">
-              {questions.filter((q) => answers[q._id] === q.correctAnswer).length} of {questions.length} correct ·
-              This was a demo — no pass/fail pressure
-            </p>
-          </div>
-        </div>
-
-        {/* Answer review */}
-        {showAnswers && (
-          <div className="space-y-3">
-            <p className="text-xs font-semibold uppercase tracking-wider text-gray-400">Demo Answer Review</p>
-            {questions.map((q, i) => {
-              const given = answers[q._id];
-              const isRight = given === q.correctAnswer;
-              const correctText = q.displayOptions.find((o) => o.label === q.correctAnswer)?.text ?? q.correctAnswer;
-              const givenText = q.displayOptions.find((o) => o.label === given)?.text;
-              return (
-                <div
-                  key={q._id}
-                  className={`rounded-xl border p-3 text-sm ${isRight ? 'border-green-200 bg-green-50' : 'border-red-200 bg-red-50'}`}
-                >
-                  <p className="font-medium text-gray-800">{i + 1}. {q.question}</p>
-                  <p className={`mt-1 text-xs ${isRight ? 'text-green-700' : 'text-red-700'}`}>
-                    {isRight
-                      ? `Correct: ${correctText}`
-                      : <>Your answer: {givenText || '—'} · Correct: {correctText}</>
-                    }
-                  </p>
-                  {!isRight && q.explanation && (
-                    <p className="mt-1 text-xs text-gray-500">{q.explanation}</p>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        )}
-
-        {/* Start exam CTA */}
-        <div className="rounded-xl border border-purple-200 bg-purple-50 p-4">
-          <p className="text-sm font-bold text-purple-800">Ready to take the exam?</p>
-          <p className="mt-0.5 text-xs text-purple-600">
-            The exam has {settings ? `${settings.passingScore}% passing score` : 'a passing score'}
-            {settings?.timeLimitMinutes ? ` and a ${settings.timeLimitMinutes}-minute time limit` : ''}.
-            Your demo score does not count.
+          <h2 className="text-xl font-bold text-gray-800">{isRetest ? 'Start Retest' : 'Start Assessment'}</h2>
+          <p className="mt-1 text-sm text-gray-500">
+            Review the details below, then begin when you&apos;re ready.
           </p>
-          <button
-            onClick={() => setShowExamConfirm(true)}
-            className="mt-3 flex items-center gap-2 rounded-lg bg-purple-600 px-5 py-2.5 text-sm font-medium text-white shadow hover:bg-purple-700"
-          >
-            <ClipboardList className="h-4 w-4" /> Start Main Exam
-          </button>
 
-          {/* Exam start confirmation modal */}
-          {showExamConfirm && (
-            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
-              <div className="mx-4 w-full max-w-md rounded-2xl border border-gray-200 bg-white p-6 shadow-2xl">
-                <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-purple-100">
-                  <ClipboardList className="h-7 w-7 text-purple-600" />
+          {/* Exam details */}
+          <div className="mt-5 grid grid-cols-2 gap-3">
+            {details.map(({ Icon, label, value }) => (
+              <div key={label} className="flex items-center gap-3 rounded-xl border border-gray-200 bg-gray-50 px-3 py-2.5">
+                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-white ring-1 ring-inset ring-gray-200">
+                  <Icon className="h-4 w-4 text-purple-600" />
                 </div>
-                <h3 className="text-lg font-bold text-gray-800">Starting Main Exam</h3>
-                <p className="mt-2 text-sm text-gray-600">
-                  You are about to begin the <strong>official exam</strong>. Please note:
-                </p>
-                <ul className="mt-3 space-y-1.5 text-sm text-gray-600">
-                  <li className="flex items-start gap-2">
-                    <span className="mt-0.5 h-4 w-4 shrink-0 rounded-full bg-purple-100 text-center text-[10px] font-bold leading-4 text-purple-700">1</span>
-                    Do <strong>not</strong> switch tabs or windows during the exam.
-                  </li>
-                  <li className="flex items-start gap-2">
-                    <span className="mt-0.5 h-4 w-4 shrink-0 rounded-full bg-purple-100 text-center text-[10px] font-bold leading-4 text-purple-700">2</span>
-                    You have <strong>{MAX_TAB_VIOLATIONS} warnings</strong> before your exam is auto-submitted.
-                  </li>
-                  <li className="flex items-start gap-2">
-                    <span className="mt-0.5 h-4 w-4 shrink-0 rounded-full bg-purple-100 text-center text-[10px] font-bold leading-4 text-purple-700">3</span>
-                    The exam is <strong>timed</strong> — you have about{' '}
-                    <strong>
-                      {Math.max(1, Math.round(timerSecondsFor(settings, settings?.examQuestionCount ?? 20) / 60))} minutes
-                    </strong>{' '}
-                    to complete it.
-                  </li>
-                  <li className="flex items-start gap-2">
-                    <span className="mt-0.5 h-4 w-4 shrink-0 rounded-full bg-purple-100 text-center text-[10px] font-bold leading-4 text-purple-700">4</span>
-                    You must score the required passing marks to complete this training.
-                  </li>
-                </ul>
-                <div className="mt-5 flex gap-3">
-                  <button
-                    onClick={() => setShowExamConfirm(false)}
-                    className="flex-1 rounded-lg border border-gray-200 py-2.5 text-sm font-medium text-gray-600 hover:bg-gray-50"
-                  >
-                    Not Yet
-                  </button>
-                  <button
-                    onClick={() => { setShowExamConfirm(false); startExam(); }}
-                    className="flex-1 rounded-lg bg-purple-600 py-2.5 text-sm font-semibold text-white hover:bg-purple-700"
-                  >
-                    Yes, Start Exam
-                  </button>
+                <div className="min-w-0">
+                  <p className="text-[11px] text-gray-400">{label}</p>
+                  <p className="truncate text-sm font-bold text-gray-800">{value}</p>
                 </div>
               </div>
-            </div>
-          )}
+            ))}
+          </div>
+
+          {/* Rules */}
+          <ul className="mt-5 space-y-2 text-sm text-gray-600">
+            <li className="flex items-start gap-2">
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
+              Do not switch tabs or windows — you have {MAX_TAB_VIOLATIONS} warnings before the exam auto-submits.
+            </li>
+            <li className="flex items-start gap-2">
+              <Clock className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
+              {minutes
+                ? `The exam is timed (${minutes} min) and submits automatically when time runs out.`
+                : 'Answer all questions, then submit.'}
+            </li>
+            <li className="flex items-start gap-2">
+              <Award className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
+              You must score at least {introPassing}% to complete this training.
+            </li>
+          </ul>
+
+          <div className="mt-6 flex gap-3">
+            <button
+              onClick={onExit}
+              className="flex-1 rounded-lg border border-gray-200 py-2.5 text-sm font-medium text-gray-600 hover:bg-gray-50"
+            >
+              Not now
+            </button>
+            <button
+              onClick={() => setPhase('answering')}
+              className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-purple-600 py-2.5 text-sm font-semibold text-white shadow hover:bg-purple-700"
+            >
+              <ClipboardList className="h-4 w-4" /> {isRetest ? 'Start Retest' : 'Start Exam'}
+            </button>
+          </div>
         </div>
       </div>
     );
   }
 
   // ── Review after exam ──────────────────────────────────────────────────────
-  if (phase === 'review' && mode === 'exam') {
+  if (phase === 'review') {
     const passingScore = isRetest ? 100 : (settings?.passingScore ?? 80);
     const passed = score >= passingScore;
     const missedCount = retestQueue.length;
@@ -996,23 +949,65 @@ function QuizStep({
     );
   }
 
-  // ── Answering phase ────────────────────────────────────────────────────────
-  const allAnswered = questions.length > 0 && questions.every((q) => answers[q._id]);
+  // ── Answering phase (paginated, one question at a time — full-screen) ────────
   const passingScore = isRetest ? 100 : (settings?.passingScore ?? 80);
+  const q = questions[currentIdx];
+  const answeredCount = Object.keys(answers).length;
+  const isLast = currentIdx === questions.length - 1;
+  const submitLabel = isRetest ? 'Submit Retest' : 'Submit Exam';
+
+  const goToQuestion = (idx: number) => {
+    if (idx < 0 || idx >= questions.length) return;
+    setCurrentIdx(idx);
+    setVisited((prev) => new Set(prev).add(idx));
+  };
+  const clearResponse = () =>
+    setAnswers((prev) => {
+      const next = { ...prev };
+      if (q) delete next[q._id];
+      return next;
+    });
+  const toggleMark = () =>
+    setMarked((prev) => {
+      const next = new Set(prev);
+      if (next.has(currentIdx)) next.delete(currentIdx);
+      else next.add(currentIdx);
+      return next;
+    });
+
+  const navState = (i: number): 'current' | 'answered' | 'marked' | 'visited' | 'pending' => {
+    if (i === currentIdx) return 'current';
+    if (marked.has(i)) return 'marked';
+    if (answers[questions[i]._id] !== undefined) return 'answered';
+    if (visited.has(i)) return 'visited';
+    return 'pending';
+  };
+  const navColor = (s: string) =>
+    s === 'current'  ? 'bg-purple-600 border-purple-600 text-white shadow-md scale-105'
+    : s === 'answered' ? 'bg-emerald-500 border-emerald-500 text-white'
+    : s === 'marked'   ? 'bg-amber-400 border-amber-400 text-white'
+    : s === 'visited'  ? 'bg-gray-100 border-gray-300 text-gray-600'
+    : 'bg-white border-gray-200 text-gray-400';
+
+  if (!q) {
+    return (
+      <div className="fixed inset-0 z-40 flex items-center justify-center bg-gray-50">
+        <Loader2 className="h-6 w-6 animate-spin text-purple-400" />
+      </div>
+    );
+  }
 
   return (
-    <div className="flex flex-1 flex-col gap-4">
+    <div className="fixed inset-0 z-40 flex flex-col bg-gray-50">
       {/* Violation warning overlay */}
       {showViolationWarning && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
           <div className="mx-4 w-full max-w-sm rounded-2xl border border-red-200 bg-white p-6 shadow-2xl">
             <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-full bg-red-100">
               <AlertCircle className="h-6 w-6 text-red-600" />
             </div>
             <h3 className="text-base font-bold text-gray-800">Tab Switch Detected</h3>
-            <p className="mt-1 text-sm text-gray-600">
-              You left the exam window. This has been recorded.
-            </p>
+            <p className="mt-1 text-sm text-gray-600">You left the exam window. This has been recorded.</p>
             <div className="mt-3 flex items-center gap-2 rounded-lg bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
               Warning {violations} of {MAX_TAB_VIOLATIONS} — {MAX_TAB_VIOLATIONS - violations} remaining before auto-submit
             </div>
@@ -1026,70 +1021,170 @@ function QuizStep({
         </div>
       )}
 
-      {/* Mode banner */}
-      <div className={`flex items-center justify-between rounded-lg px-3 py-2 text-xs font-medium ${
-        mode === 'trial'
-          ? 'border border-blue-200 bg-blue-50 text-blue-700'
-          : isRetest
-          ? 'border border-amber-200 bg-amber-50 text-amber-700'
-          : 'border border-purple-200 bg-purple-50 text-purple-700'
-      }`}>
-        <span>
-          {mode === 'trial'
-            ? `Demo Assessment — ${questions.length} sample questions · No pass/fail`
-            : isRetest
-            ? `Retest — ${questions.length} missed question${questions.length !== 1 ? 's' : ''} · Must answer all correctly (100%)`
-            : `Exam — ${questions.length} questions · Pass: ${passingScore}%`}
-        </span>
-        <div className="flex items-center gap-3">
-          {violations > 0 && (
-            <span className="flex items-center gap-1 rounded-full bg-red-100 px-2 py-0.5 text-[10px] font-bold text-red-700">
-              ⚠ {violations}/{MAX_TAB_VIOLATIONS} warnings
-            </span>
-          )}
-          {mode === 'exam' && timeLeft !== null && (
-            <span className={`flex items-center gap-1 font-bold tabular-nums ${timeLeft < 60 ? 'text-red-600' : ''}`}>
-              <Clock className="h-3.5 w-3.5" /> {formatTime(timeLeft)}
-            </span>
-          )}
+      {/* Top bar */}
+      <div className="sticky top-0 z-10 flex items-center gap-4 border-b border-gray-200 bg-white px-4 py-3 shadow-sm">
+        <div className="min-w-0 flex-1">
+          <h1 className="truncate text-sm font-bold text-gray-800 md:text-base">
+            {isRetest ? 'Retest' : 'Assessment'}
+          </h1>
+          <p className="text-xs text-gray-400">
+            {isRetest
+              ? `${questions.length} missed · Answer all correctly (100%)`
+              : `${questions.length} questions · Pass: ${passingScore}%`}
+          </p>
         </div>
+        {violations > 0 && (
+          <span className="flex items-center gap-1 rounded-full bg-red-100 px-2 py-1 text-[10px] font-bold text-red-700">
+            ⚠ {violations}/{MAX_TAB_VIOLATIONS}
+          </span>
+        )}
+        {timeLeft !== null && (
+          <div className={`flex items-center gap-1.5 rounded-xl border px-3 py-1.5 font-mono text-sm font-bold tabular-nums ${
+            timeLeft <= 30 ? 'animate-pulse border-red-200 bg-red-50 text-red-600' : 'border-gray-200 bg-gray-50 text-gray-700'
+          }`}>
+            <Clock className="h-4 w-4" /> {formatTime(timeLeft)}
+          </div>
+        )}
+        <button
+          onClick={handleSubmit}
+          className="rounded-xl bg-purple-600 px-4 py-2 text-sm font-semibold text-white shadow transition hover:bg-purple-700"
+        >
+          {submitLabel}
+        </button>
       </div>
 
-      {/* Questions */}
-      <div className="space-y-5">
-        {questions.map((q, i) => (
-          <div key={q._id} className="rounded-xl border border-gray-100 bg-gray-50 p-4">
-            <p className="mb-3 text-sm font-semibold text-gray-800">{i + 1}. {q.question}</p>
-            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-              {q.displayOptions.map((opt) => {
-                const selected = answers[q._id] === opt.label;
-                return (
-                  <button
-                    key={opt.label}
-                    onClick={() => setAnswers((prev) => ({ ...prev, [q._id]: opt.label }))}
-                    className={`rounded-lg border px-3 py-2.5 text-left text-sm transition ${
-                      selected
-                        ? 'border-purple-400 bg-purple-50 font-medium text-purple-800'
-                        : 'border-gray-200 bg-white text-gray-700 hover:border-purple-200 hover:bg-purple-50/50'
-                    }`}
-                  >
-                    <span className="mr-2 font-semibold">{opt.label}.</span>{opt.text}
-                  </button>
-                );
-              })}
+      <div className="flex flex-1 gap-0 overflow-hidden">
+        {/* Main question area */}
+        <div className="flex-1 overflow-y-auto p-4 md:p-6">
+          <div className="mb-3 flex flex-wrap items-center gap-2">
+            <span className="text-sm font-semibold text-gray-500">
+              Question {currentIdx + 1} / {questions.length}
+            </span>
+            {marked.has(currentIdx) && (
+              <span className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-xs font-semibold text-amber-700">
+                Marked for review
+              </span>
+            )}
+          </div>
+
+          {/* Question card */}
+          <div className="mb-5 rounded-3xl border border-gray-200 bg-white p-6 shadow-sm">
+            <p className="text-lg font-medium leading-relaxed text-gray-800">{q.question}</p>
+          </div>
+
+          {/* Options */}
+          <div className="mb-6 space-y-3">
+            {q.displayOptions.map((opt) => {
+              const selected = answers[q._id] === opt.label;
+              return (
+                <button
+                  key={opt.label}
+                  onClick={() => setAnswers((prev) => ({ ...prev, [q._id]: opt.label }))}
+                  className={`flex w-full items-center gap-3 rounded-2xl border px-5 py-4 text-left text-sm font-medium transition ${
+                    selected
+                      ? 'border-purple-400 bg-purple-50 text-purple-800 shadow-sm'
+                      : 'border-gray-200 bg-white text-gray-700 hover:border-purple-200 hover:bg-purple-50/40'
+                  }`}
+                >
+                  <span className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-xs font-bold ${
+                    selected ? 'bg-purple-600 text-white' : 'bg-gray-100 text-gray-500'
+                  }`}>
+                    {opt.label}
+                  </span>
+                  {opt.text}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Action bar */}
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              onClick={clearResponse}
+              disabled={answers[q._id] === undefined}
+              className="flex items-center gap-1.5 rounded-xl border border-gray-200 px-4 py-2 text-sm text-gray-600 transition hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <XCircle className="h-4 w-4" /> Clear Response
+            </button>
+            <button
+              onClick={toggleMark}
+              className={`flex items-center gap-1.5 rounded-xl border px-4 py-2 text-sm transition ${
+                marked.has(currentIdx) ? 'border-amber-300 bg-amber-50 text-amber-700' : 'border-gray-200 text-gray-600 hover:bg-gray-50'
+              }`}
+            >
+              <Flag className="h-4 w-4" /> {marked.has(currentIdx) ? 'Marked for Review' : 'Mark for Review'}
+            </button>
+            <div className="ml-auto flex gap-2">
+              <button
+                onClick={() => goToQuestion(currentIdx - 1)}
+                disabled={currentIdx === 0}
+                className="flex items-center gap-1 rounded-xl border border-gray-200 px-4 py-2 text-sm text-gray-700 transition hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <ChevronLeft className="h-4 w-4" /> Previous
+              </button>
+              <button
+                onClick={() => (isLast ? handleSubmit() : goToQuestion(currentIdx + 1))}
+                className="flex items-center gap-1 rounded-xl bg-purple-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-purple-700"
+              >
+                {isLast ? 'Finish' : 'Save & Next'} <ChevronRight className="h-4 w-4" />
+              </button>
             </div>
           </div>
-        ))}
-      </div>
+        </div>
 
-      <button
-        onClick={handleSubmit}
-        disabled={!allAnswered}
-        className="flex items-center justify-center gap-2 rounded-lg bg-purple-600 py-3 text-sm font-medium text-white shadow hover:bg-purple-700 disabled:cursor-not-allowed disabled:opacity-50"
-      >
-        <ClipboardList className="h-4 w-4" />
-        {mode === 'trial' ? 'Submit Demo' : isRetest ? 'Submit Retest' : 'Submit Exam'}
-      </button>
+        {/* Right panel — Question Navigator */}
+        <div className="hidden w-64 shrink-0 flex-col overflow-y-auto border-l border-gray-200 bg-white p-4 lg:flex">
+          <h3 className="text-sm font-semibold text-gray-800">Question Navigator</h3>
+          <p className="mb-3 text-xs text-gray-400">{answeredCount} answered · {marked.size} marked</p>
+
+          {/* Legend */}
+          <div className="mb-4 grid grid-cols-2 gap-1 text-xs">
+            {[
+              { color: 'bg-purple-600', label: 'Current' },
+              { color: 'bg-emerald-500', label: 'Answered' },
+              { color: 'bg-amber-400', label: 'Marked' },
+              { color: 'bg-gray-200', label: 'Visited' },
+            ].map(({ color, label }) => (
+              <div key={label} className="flex items-center gap-1 text-gray-500">
+                <span className={`h-2.5 w-2.5 rounded-sm ${color}`} /> {label}
+              </div>
+            ))}
+          </div>
+
+          <div className="grid grid-cols-5 gap-1.5">
+            {questions.map((_, i) => (
+              <button
+                key={i}
+                onClick={() => goToQuestion(i)}
+                title={`Question ${i + 1}`}
+                className={`h-10 w-10 rounded-xl border text-xs font-semibold transition ${navColor(navState(i))}`}
+              >
+                {i + 1}
+              </button>
+            ))}
+          </div>
+
+          <div className="mt-6 space-y-2">
+            <div className="flex justify-between text-xs text-gray-400">
+              <span>Progress</span>
+              <span>{Math.round((answeredCount / questions.length) * 100)}%</span>
+            </div>
+            <div className="h-2 overflow-hidden rounded-full bg-gray-200">
+              <div
+                className="h-full rounded-full bg-purple-500 transition-all"
+                style={{ width: `${(answeredCount / questions.length) * 100}%` }}
+              />
+            </div>
+          </div>
+
+          <button
+            onClick={handleSubmit}
+            className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl bg-purple-600 py-2.5 text-sm font-semibold text-white transition hover:bg-purple-700"
+          >
+            <Award className="h-4 w-4" /> {submitLabel}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1109,16 +1204,22 @@ export default function JourneyPage() {
   const [overallPct, setOverallPct] = useState(0);
   const [showCelebration, setShowCelebration] = useState(false);
   const [hasCert, setHasCert] = useState(false);
-  const [examActive, setExamActive] = useState(false);
-  const [showLockedAlert, setShowLockedAlert] = useState(false);
-  const [showAssessmentIntro, setShowAssessmentIntro] = useState(false);
-  const [pendingQuizIdx, setPendingQuizIdx] = useState<number | null>(null);
 
   const applyJourneyData = useCallback((json: JourneyData) => {
     setData(json);
     setLocalSteps(json.steps);
     const pct = json.progress?.overallPercentage ?? 0;
     setOverallPct(pct);
+    // Deep link: `?step=<id>` opens that resource directly (used by the dashboard
+    // "Show Video / PPT / SOP / Start Test" buttons). Falls back to first incomplete.
+    const desired = typeof window !== 'undefined'
+      ? new URLSearchParams(window.location.search).get('step')
+      : null;
+    const desiredIdx = desired ? json.steps.findIndex((s) => s.id === desired) : -1;
+    if (desiredIdx >= 0) {
+      setCurrentStep(desiredIdx);
+      return;
+    }
     const firstIncomplete = json.steps.findIndex((s) => !s.completed);
     setCurrentStep(firstIncomplete >= 0 ? firstIncomplete : 0);
   }, []);
@@ -1204,33 +1305,24 @@ export default function JourneyPage() {
     stepId: string,
     score: number,
     passed: boolean,
-    isTrial: boolean,
     newAttempts: number,
   ) => {
-    if (isTrial) {
-      // Trial done — update attempts count only, step not yet complete
-      setLocalSteps((prev) =>
-        prev.map((s) => (s.id === stepId ? { ...s, attempts: newAttempts } : s)),
-      );
-      updateProgress(stepId, { completed: false, score, attempts: newAttempts });
-    } else {
-      // Never un-complete: if they already passed and retake fails, keep completed=true
-      setLocalSteps((prev) =>
-        prev.map((s) => {
-          if (s.id !== stepId) return s;
-          return { ...s, completed: passed || s.completed, attempts: newAttempts };
-        }),
-      );
-      updateProgress(stepId, { completed: passed, passed, score, attempts: newAttempts });
+    // Never un-complete: if they already passed and a retake fails, keep completed=true
+    setLocalSteps((prev) =>
+      prev.map((s) => {
+        if (s.id !== stepId) return s;
+        return { ...s, completed: passed || s.completed, attempts: newAttempts };
+      }),
+    );
+    updateProgress(stepId, { completed: passed, passed, score, attempts: newAttempts });
 
-      // Trigger celebration and certificate ONLY when the exam is passed in this session
-      if (passed) {
-        setShowCelebration(true);
-        fetch(`/api/lms/certificate/${sopCode}`, { method: 'POST' })
-          .then((r) => r.json())
-          .then((d) => { if (d.certificate) setHasCert(true); })
-          .catch(() => {});
-      }
+    // Trigger celebration and certificate ONLY when the exam is passed in this session
+    if (passed) {
+      setShowCelebration(true);
+      fetch(`/api/lms/certificate/${sopCode}`, { method: 'POST' })
+        .then((r) => r.json())
+        .then((d) => { if (d.certificate) setHasCert(true); })
+        .catch(() => {});
     }
   }, [updateProgress, sopCode]);
 
@@ -1257,75 +1349,8 @@ export default function JourneyPage() {
   const sopName = data?.sop?.name || sopCode;
   const activeStep = localSteps[currentStep];
 
-  const quizStep = localSteps.find((s) => s.type === 'quiz');
-
   return (
     <div className="flex min-h-screen flex-col bg-gray-50">
-
-      {/* ── Locked-navigation alert (exam in progress) ─────────────── */}
-      {showLockedAlert && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
-          <div className="mx-4 w-full max-w-sm rounded-2xl border border-red-200 bg-white p-6 shadow-2xl">
-            <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-full bg-red-100">
-              <Lock className="h-6 w-6 text-red-600" />
-            </div>
-            <h3 className="text-base font-bold text-gray-800">Exam in Progress</h3>
-            <p className="mt-2 text-sm text-gray-600">
-              You cannot navigate to other sections while the exam is running.
-              Complete or submit the exam first.
-            </p>
-            <button
-              onClick={() => setShowLockedAlert(false)}
-              className="mt-5 w-full rounded-lg bg-purple-600 py-2.5 text-sm font-semibold text-white hover:bg-purple-700"
-            >
-              Return to Exam
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* ── Assessment intro popup ──────────────────────────────────── */}
-      {showAssessmentIntro && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
-          <div className="mx-4 w-full max-w-md rounded-2xl border border-gray-200 bg-white p-6 shadow-2xl">
-            <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-purple-100">
-              <ClipboardList className="h-7 w-7 text-purple-600" />
-            </div>
-            <h3 className="text-lg font-bold text-gray-800">Assessment</h3>
-            <p className="mt-1 text-sm text-gray-500">{sopName}</p>
-            <div className="mt-4 space-y-2 text-sm text-gray-600">
-              <div className="flex items-start gap-2 rounded-lg bg-blue-50 px-3 py-2">
-                <span className="mt-0.5 shrink-0 text-blue-500">①</span>
-                <span><strong>Demo Assessment first</strong> — {quizStep?.attempts === 0
-                  ? 'You have not taken the demo yet. It has a few sample questions to help you prepare.'
-                  : 'You have already completed the demo assessment.'}</span>
-              </div>
-              <div className="flex items-start gap-2 rounded-lg bg-purple-50 px-3 py-2">
-                <span className="mt-0.5 shrink-0 text-purple-500">②</span>
-                <span><strong>Main Exam follows</strong> — the actual graded exam. Do not switch browser tabs once it starts.</span>
-              </div>
-            </div>
-            <div className="mt-5 flex gap-3">
-              <button
-                onClick={() => { setShowAssessmentIntro(false); setPendingQuizIdx(null); }}
-                className="flex-1 rounded-lg border border-gray-200 py-2.5 text-sm font-medium text-gray-600 hover:bg-gray-50"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={() => {
-                  setShowAssessmentIntro(false);
-                  if (pendingQuizIdx !== null) setCurrentStep(pendingQuizIdx);
-                  setPendingQuizIdx(null);
-                }}
-                className="flex-1 rounded-lg bg-purple-600 py-2.5 text-sm font-semibold text-white hover:bg-purple-700"
-              >
-                Go to Assessment
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* ── Training complete / certificate celebration ─────────── */}
       {showCelebration && (
@@ -1386,83 +1411,6 @@ export default function JourneyPage() {
       </header>
 
       <div className="mx-auto flex w-full max-w-screen-2xl flex-1 gap-0 px-4 py-6 sm:px-6 lg:px-8">
-        {/* Sidebar */}
-        <aside className="mr-6 w-64 shrink-0 xl:w-72">
-          <div className="sticky top-20 rounded-xl border border-gray-200 bg-white shadow-sm overflow-hidden">
-            <div className="border-b border-gray-100 px-4 py-3">
-              <p className="text-xs font-semibold uppercase tracking-wider text-gray-400">Learning Steps</p>
-              {examActive && (
-                <p className="mt-1 flex items-center gap-1 text-[10px] font-semibold text-red-600">
-                  <Lock className="h-3 w-3" /> Locked — exam in progress
-                </p>
-              )}
-            </div>
-            <nav className="divide-y divide-gray-100">
-              {localSteps.map((step, idx) => {
-                const isActive = idx === currentStep;
-                const isCompleted = step.completed;
-                return (
-                  <button
-                    key={step.id}
-                    onClick={() => {
-                      if (examActive && !isActive) {
-                        setShowLockedAlert(true);
-                        return;
-                      }
-                      if (!examActive && step.type === 'quiz' && !isActive) {
-                        setShowAssessmentIntro(true);
-                        // store the idx so we can navigate after confirm
-                        setPendingQuizIdx(idx);
-                        return;
-                      }
-                      setCurrentStep(idx);
-                    }}
-                    className={`flex w-full items-center gap-3 px-4 py-3 text-left text-xs transition ${
-                      examActive && !isActive ? 'cursor-not-allowed opacity-40' :
-                      isActive
-                        ? 'bg-purple-50 text-purple-800'
-                        : isCompleted
-                        ? 'text-gray-500 hover:bg-gray-50'
-                        : 'text-gray-500 hover:bg-gray-50'
-                    }`}
-                  >
-                    <span
-                      className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[10px] font-bold ${
-                        isCompleted
-                          ? 'bg-green-500 text-white'
-                          : isActive
-                          ? 'bg-purple-600 text-white'
-                          : 'bg-gray-100 text-gray-500'
-                      }`}
-                    >
-                      {isCompleted ? <Check className="h-3 w-3" /> : idx + 1}
-                    </span>
-                    <div className="flex flex-col gap-0.5 overflow-hidden">
-                      <span className={`truncate font-medium leading-tight ${isActive ? 'text-purple-800' : 'text-gray-700'}`}>
-                        {step.label}
-                      </span>
-                      <span className="flex items-center gap-1 text-[10px] text-gray-400">
-                        <StepIcon type={step.type} size={3} />
-                        {step.type === 'quiz'
-                          ? (isCompleted ? 'Passed ✓' : 'Required')
-                          : (step.type === 'video' && (step.percentage ?? 0) > 0
-                            ? `${step.percentage}% watched · Optional`
-                            : `Optional${isCompleted ? ' · Done' : ''}`)}
-                      </span>
-                    </div>
-                  </button>
-                );
-              })}
-              {localSteps.length === 0 && (
-                <div className="px-4 py-6 text-center">
-                  <Lock className="mx-auto mb-2 h-5 w-5 text-gray-300" />
-                  <p className="text-xs text-gray-400">No content available yet.</p>
-                </div>
-              )}
-            </nav>
-          </div>
-        </aside>
-
         {/* Main content */}
         <main className="flex flex-1 flex-col overflow-hidden rounded-xl border border-gray-200 bg-white shadow-sm">
           {/* Step header */}
@@ -1526,10 +1474,10 @@ export default function JourneyPage() {
                 key={activeStep.id}
                 sopCode={sopCode}
                 step={activeStep}
-                onComplete={(score, passed, isTrial, newAttempts) =>
-                  handleQuizComplete(activeStep.id, score, passed, isTrial, newAttempts)
+                onComplete={(score, passed, newAttempts) =>
+                  handleQuizComplete(activeStep.id, score, passed, newAttempts)
                 }
-                onExamActive={setExamActive}
+                onExit={() => router.push('/lms')}
               />
             )}
           </div>
@@ -1539,8 +1487,7 @@ export default function JourneyPage() {
             <div className="flex items-center justify-between border-t border-gray-100 px-5 py-3">
               <button
                 onClick={() => setCurrentStep((i) => Math.max(0, i - 1))}
-                disabled={currentStep === 0 || examActive}
-                title={examActive ? 'Navigation locked during exam' : undefined}
+                disabled={currentStep === 0}
                 className="flex items-center gap-1.5 rounded-lg border border-gray-200 px-3 py-2 text-xs font-medium text-gray-600 hover:bg-gray-50 disabled:opacity-40"
               >
                 <ChevronLeft className="h-3.5 w-3.5" /> Previous
@@ -1553,8 +1500,6 @@ export default function JourneyPage() {
               {currentStep < localSteps.length - 1 ? (
                 <button
                   onClick={() => setCurrentStep((i) => Math.min(localSteps.length - 1, i + 1))}
-                  disabled={examActive}
-                  title={examActive ? 'Navigation locked during exam' : undefined}
                   className="flex items-center gap-1.5 rounded-lg bg-purple-600 px-3 py-2 text-xs font-medium text-white hover:bg-purple-700 disabled:opacity-40"
                 >
                   Next <ChevronRight className="h-3.5 w-3.5" />

@@ -87,8 +87,8 @@ export type SopStatus = 'completed' | 'partial' | 'not_completed';
 const COMPONENT_GROUPS = {
   videos: ['videoEn', 'videoGu'],
   slides: ['slidesEn', 'slidesGu'],
-  sopDoc: ['sopPdf'],
-  mcq:    ['quiz'],
+  sopDoc: ['sopPdf', 'sopPdfGu'],
+  mcq:    ['quiz', 'quizGu'],
 } as const;
 
 type ComponentKey = keyof typeof COMPONENT_GROUPS;
@@ -344,7 +344,7 @@ export async function GET(req: NextRequest) {
               sopNameGujarati: gujarati,
               status,
               months: sched?.get(stripVersion(a.sopCode)) ?? [],
-              hasExam: availableSet.has('quiz'),
+              hasExam: availableSet.has('quiz') || availableSet.has('quizGu'),
               components,
             }];
           });

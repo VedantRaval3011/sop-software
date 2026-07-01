@@ -3,8 +3,10 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import FindingCard from './components/FindingCard';
+import { GuidelineSelector } from './components/GuidelineSelector';
 import { getScoreColorClass } from '@/lib/complianceFormatter';
-import { BookOpen, FileText, Layers, CheckCircle, Copy, X, Upload, Sparkles, Cpu, Bot } from 'lucide-react';
+import { useComplianceRunStore, complianceRunProgressPct } from '@/lib/store/compliance-run-store';
+import { BookOpen, FileText, Layers, CheckCircle, Copy, X, Upload, Sparkles, Cpu, Bot, CheckSquare, Square } from 'lucide-react';
 
 interface Guideline {
   _id: string;
@@ -354,7 +356,7 @@ function ReportMetrics({ report }: { report: ComplianceReport }) {
     (report.compliantCount + report.partialCount + report.nonCompliantCount);
   const pct = (n: number) => (applicable > 0 ? Math.round((n / applicable) * 100) : 0);
   const metrics = [
-    { label: 'Requirements Evaluated', value: report.totalGuidelinesChecked, tone: 'text-gray-800' },
+    { label: 'Requirements Evaluated', value: sb?.totalApplicableRequirements ?? applicable, tone: 'text-gray-800' },
     { label: 'Clause Coverage', value: `${report.clauseCoveragePct ?? 0}%`, tone: 'text-purple-700' },
     { label: 'Compliance', value: `${pct(report.compliantCount)}%`, tone: 'text-emerald-600' },
     { label: 'Partial', value: `${pct(report.partialCount)}%`, tone: 'text-amber-600' },
@@ -555,20 +557,19 @@ export default function ComplianceEnginePage() {
   const [loadingGuidelines, setLoadingGuidelines] = useState(false);
   const [loadingReports, setLoadingReports] = useState(false);
 
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [isPaused, setIsPaused] = useState(false);
-  const pauseRef = useRef(false);
-  const stopRequestedRef = useRef(false);
-  const currentAnalyzingSopIdRef = useRef<string | null>(null);
-  const analyzeAbortRef = useRef<AbortController | null>(null);
-  const [analysisStats, setAnalysisStats] = useState({ total: 0, completed: 0, cached: 0, failed: 0, currentSopName: '', currentSopIdentifier: '' });
-  const [sopLists, setSopLists] = useState<{
-    completed: { identifier: string; name: string; score: number | null; status: string }[];
-    cached: { identifier: string; name: string; score: number | null; status: string }[];
-    failed: { identifier: string; name: string; error?: string }[];
-  }>({ completed: [], cached: [], failed: [] });
+  const {
+    isAnalyzing,
+    isPaused,
+    analysisComplete,
+    analysisStats,
+    sopLists,
+    startRun,
+    stopRun,
+    togglePause,
+    runGeneration,
+  } = useComplianceRunStore();
+
   const [activeChip, setActiveChip] = useState<'completed' | 'cached' | 'failed' | null>(null);
-  const [analysisComplete, setAnalysisComplete] = useState(false);
 
   const [preflightData, setPreflightData] = useState({ checked: false, existingCount: 0, newCount: 0 });
   const [selectedReport, setSelectedReport] = useState<ComplianceReport | null>(null);
@@ -580,22 +581,24 @@ export default function ComplianceEnginePage() {
   const [hideNotApplicable, setHideNotApplicable] = useState(true);
   const [hideFailedFindings, setHideFailedFindings] = useState(true);
   const [filterGuideline, setFilterGuideline] = useState('all');
-  const [selectedSopId, setSelectedSopId] = useState<string>('all');
+  const [selectedSopIds, setSelectedSopIds] = useState<Set<string>>(new Set());
+  const [selectedGuidelineIds, setSelectedGuidelineIds] = useState<Set<string>>(new Set());
 
   const [selectedFindingIds, setSelectedFindingIds] = useState<Set<number>>(new Set());
   const [showConsolidatedSummary, setShowConsolidatedSummary] = useState(false);
+  const [isSummaryFullScreen, setIsSummaryFullScreen] = useState(false);
+  const [isFullScreen, setIsFullScreen] = useState(false);
   const [applicableFindings, setApplicableFindings] = useState<Set<string>>(new Set());
   const [submittingApplicable, setSubmittingApplicable] = useState(false);
   const [applyingFixGapId, setApplyingFixGapId] = useState<string | null>(null);
   const [forceFullReanalysis, setForceFullReanalysis] = useState(false);
-  const [expandedGuideline, setExpandedGuideline] = useState<string | null>(null);
   const [llmInfo, setLlmInfo] = useState<{
     provider: 'gemini' | 'ollama' | 'claude' | 'codex';
     model: string;
     complianceModel: string;
     label: string;
   } | null>(null);
-  const [selectedProvider, setSelectedProvider] = useState<'claude' | 'codex' | 'gemini' | 'ollama' | null>('claude');
+  const [selectedProvider, setSelectedProvider] = useState<'claude' | 'codex' | 'gemini' | 'ollama' | null>('codex');
   const [selectedModel, setSelectedModel] = useState('claude-sonnet-4-6');
   const [claudeStatus, setClaudeStatus] = useState<{
     ok: boolean;
@@ -632,9 +635,16 @@ export default function ComplianceEnginePage() {
       const res = await fetch('/api/compliance/sops');
       const data = await res.json();
       if (data.success) {
-        setSops(data.sops ?? []);
-        setSopTotal(data.total ?? data.sops?.length ?? 0);
+        const loaded: SOP[] = data.sops ?? [];
+        setSops(loaded);
+        setSopTotal(data.total ?? loaded.length ?? 0);
         setDepartments(data.departments ?? []);
+        // Keep existing selection on refresh; do not auto-select the entire library.
+        setSelectedSopIds((prev) => {
+          if (prev.size === 0) return prev;
+          const valid = new Set(loaded.map((s) => s._id));
+          return new Set([...prev].filter((id) => valid.has(id)));
+        });
       }
     } catch { /* silent */ } finally { setLoadingSops(false); }
   };
@@ -645,14 +655,24 @@ export default function ComplianceEnginePage() {
       const res = await fetch('/api/guidelines');
       const data = await res.json();
       if (data.guidelines) {
-        setGuidelines(data.guidelines);
+        const normalized = (data.guidelines as Guideline[]).map((g) => ({
+          ...g,
+          _id: String(g._id),
+        }));
+        setGuidelines(normalized);
         const folderMap: Record<string, GuidelineFolder> = {};
-        for (const g of data.guidelines as Guideline[]) {
+        for (const g of normalized) {
           if (!folderMap[g.folder]) folderMap[g.folder] = { folderName: g.folder, guidelineCount: 0, totalClauses: 0 };
           folderMap[g.folder].guidelineCount++;
           folderMap[g.folder].totalClauses += g.clauses?.length ?? 0;
         }
         setFolders(Object.values(folderMap));
+        setSelectedGuidelineIds((prev) => {
+          if (prev.size === 0 && normalized.length) {
+            return new Set(normalized.map((g) => g._id));
+          }
+          return prev;
+        });
       }
     } catch { /* silent */ } finally { setLoadingGuidelines(false); }
   };
@@ -665,7 +685,11 @@ export default function ComplianceEnginePage() {
       const data = await res.json();
       if (data.success) {
         setGuidelines(prev => prev.filter(g => g._id !== id));
-        setExpandedGuideline(v => v === id ? null : v);
+        setSelectedGuidelineIds((prev) => {
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
       } else {
         alert(data.error ?? 'Delete failed');
       }
@@ -682,7 +706,7 @@ export default function ComplianceEnginePage() {
   };
 
   const runPreflightCheck = useCallback(async () => {
-    const target = selectedSopId === 'all' ? sops : sops.filter(s => s._id === selectedSopId);
+    const target = sops.filter((s) => selectedSopIds.has(s._id));
     if (!target.length) return;
     try {
       const res = await fetch('/api/compliance/check-existing', {
@@ -697,119 +721,73 @@ export default function ComplianceEnginePage() {
     } catch {
       setPreflightData({ checked: false, existingCount: 0, newCount: 0 });
     }
-  }, [sops, selectedSopId]);
+  }, [sops, selectedSopIds]);
 
-  useEffect(() => { if (currentStep === 'review') runPreflightCheck(); }, [currentStep, selectedSopId]);
-
-  const handleStopAnalysis = async () => {
-    stopRequestedRef.current = true;
-    pauseRef.current = false;
-    setIsPaused(false);
-    try {
-      await fetch('/api/compliance/cancel', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ stopAll: true }),
-      });
-    } catch { /* ignore */ }
-    analyzeAbortRef.current?.abort();
-  };
+  useEffect(() => { if (currentStep === 'review') runPreflightCheck(); }, [currentStep, selectedSopIds, runPreflightCheck]);
 
   const runAnalysis = async () => {
-    const candidates = selectedSopId === 'all' ? sops : sops.filter(s => s._id === selectedSopId);
-    if (!candidates.length || !guidelines.length) return;
-    pauseRef.current = false;
-    stopRequestedRef.current = false;
-    setIsPaused(false);
-    setIsAnalyzing(true);
-    setAnalysisComplete(false);
+    const candidates = sops.filter((s) => selectedSopIds.has(s._id));
+    if (!candidates.length || selectedGuidelineIds.size === 0) return;
     setCurrentStep('analyze');
-
-    const waitIfPaused = () => new Promise<void>(resolve => {
-      const check = () => pauseRef.current ? setTimeout(check, 500) : resolve();
-      check();
-    });
-
-    setAnalysisStats({ total: candidates.length, completed: 0, cached: 0, failed: 0, currentSopName: candidates[0]?.name ?? '', currentSopIdentifier: candidates[0]?.identifier ?? '' });
-    setSopLists({ completed: [], cached: [], failed: [] });
     setActiveChip(null);
-
-    let lastAnalyzedSopId: string | null = null;
-
-    for (const sop of candidates) {
-      if (stopRequestedRef.current) break;
-      await waitIfPaused();
-      if (stopRequestedRef.current) break;
-      setAnalysisStats(prev => ({ ...prev, currentSopName: sop.name, currentSopIdentifier: sop.identifier }));
-      currentAnalyzingSopIdRef.current = sop._id;
-      const abortController = new AbortController();
-      analyzeAbortRef.current = abortController;
-      try {
-        const res = await fetch('/api/compliance/analyze-v5', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            sopId: sop._id,
-            forceRefresh: forceFullReanalysis,
-            mode: forceFullReanalysis ? 'initial' : 'auto',
-            ...(selectedProvider ? { provider: selectedProvider } : {}),
-            ...(selectedProvider === 'claude' ? { model: selectedModel } : {}),
-            ...(selectedProvider === 'codex' ? { model: codexStatus?.complianceModel ?? 'gpt-4.1' } : {}),
-          }),
-          signal: abortController.signal,
-        });
-        const data = await res.json().catch(() => ({ success: false, error: 'Parse error' }));
-        if (data.cancelled || stopRequestedRef.current) break;
-        if (data.success) {
-          const entry = { identifier: sop.identifier, name: sop.name, score: data.overallScore ?? null, status: data.complianceStatus ?? '' };
-          if (data.cached) {
-            setAnalysisStats(prev => ({ ...prev, cached: prev.cached + 1 }));
-            setSopLists(prev => ({ ...prev, cached: [...prev.cached, entry] }));
-          } else {
-            setAnalysisStats(prev => ({ ...prev, completed: prev.completed + 1 }));
-            setSopLists(prev => ({ ...prev, completed: [...prev.completed, entry] }));
-          }
-          lastAnalyzedSopId = sop._id;
-        } else {
-          setAnalysisStats(prev => ({ ...prev, failed: prev.failed + 1 }));
-          setSopLists(prev => ({ ...prev, failed: [...prev.failed, { identifier: sop.identifier, name: sop.name, error: data.error }] }));
-        }
-      } catch (err) {
-        if (stopRequestedRef.current || (err instanceof DOMException && err.name === 'AbortError')) break;
-        setAnalysisStats(prev => ({ ...prev, failed: prev.failed + 1 }));
-        setSopLists(prev => ({ ...prev, failed: [...prev.failed, { identifier: sop.identifier, name: sop.name, error: err instanceof Error ? err.message : 'Network error' }] }));
-      } finally {
-        currentAnalyzingSopIdRef.current = null;
-        analyzeAbortRef.current = null;
-      }
-      if (stopRequestedRef.current) break;
-      await new Promise(r => setTimeout(r, 2000));
-    }
-
-    const wasStopped = stopRequestedRef.current;
-    setIsAnalyzing(false);
-    setIsPaused(false);
-    pauseRef.current = false;
-    stopRequestedRef.current = false;
-    setAnalysisComplete(!wasStopped);
-    await fetchReports();
-    fetch('/api/compliance/guideline-stats').then(r => r.json()).then(d => { if (d.success) setGuidelineStats(d.stats ?? {}); }).catch(() => {});
-
-    // Auto-open the freshly analyzed report when a single SOP was run
-    if (lastAnalyzedSopId && candidates.length === 1) {
-      try {
-        const listRes = await fetch('/api/compliance/analyze');
-        const listData = await listRes.json();
-        const report = (listData.reports ?? []).find(
-          (r: ComplianceReport) => r.sopIdentifier === candidates[0].identifier,
-        );
-        if (report) {
-          setCurrentStep('results');
-          await handleSelectReport(report);
-        }
-      } catch { /* silent */ }
-    }
+    const selectedList = guidelines.filter((g) => selectedGuidelineIds.has(g._id));
+    const guidelineLabel =
+      selectedList.length === 1
+        ? selectedList[0].name
+        : `${selectedList.length} guidelines`;
+    await startRun({
+      candidates,
+      guidelineIds: [...selectedGuidelineIds],
+      guidelineLabel,
+      forceRefresh: forceFullReanalysis,
+      provider: selectedProvider,
+      model:
+        selectedProvider === 'claude'
+          ? selectedModel
+          : selectedProvider === 'codex'
+            ? codexStatus?.complianceModel ?? 'gpt-5.4-mini'
+            : undefined,
+    });
   };
+
+  const lastRunGenerationRef = useRef(0);
+  useEffect(() => {
+    if (runGeneration === 0 || runGeneration === lastRunGenerationRef.current) return;
+    lastRunGenerationRef.current = runGeneration;
+
+    void (async () => {
+      const state = useComplianceRunStore.getState();
+      await fetchReports();
+      fetch('/api/compliance/guideline-stats')
+        .then((r) => r.json())
+        .then((d) => {
+          if (d.success) setGuidelineStats(d.stats ?? {});
+        })
+        .catch(() => {});
+
+      if (
+        !state.wasStopped &&
+        state.lastAnalyzedSopId &&
+        state.analysisStats.total === 1
+      ) {
+        try {
+          const listRes = await fetch('/api/compliance/analyze');
+          const listData = await listRes.json();
+          const candidate = sops.find((s) => s._id === state.lastAnalyzedSopId);
+          const report = (listData.reports ?? []).find(
+            (r: ComplianceReport) => r.sopIdentifier === candidate?.identifier,
+          );
+          if (report) {
+            setCurrentStep('results');
+            await handleSelectReport(report);
+          }
+        } catch {
+          /* silent */
+        }
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- react to runGeneration only
+  }, [runGeneration, sops]);
 
   const handleGuidelineUpload = async () => {
     // Bulk folder mode: one request per subfolder group
@@ -942,6 +920,24 @@ export default function ComplianceEnginePage() {
   }, [selectedProvider]);
 
   const totalClauses = guidelines.reduce((s, g) => s + (g.clauses?.length ?? 0), 0);
+  const selectedGuidelineCount = selectedGuidelineIds.size;
+  const selectedGuidelines = useMemo(
+    () => guidelines.filter((g) => selectedGuidelineIds.has(g._id)),
+    [guidelines, selectedGuidelineIds],
+  );
+  const selectedGuidelineClauseCount = useMemo(
+    () => selectedGuidelines.reduce((sum, g) => sum + (g.clauses?.length ?? 0), 0),
+    [selectedGuidelines],
+  );
+  const selectedSopCount = selectedSopIds.size;
+  const selectedSops = useMemo(
+    () => sops.filter((s) => selectedSopIds.has(s._id)),
+    [sops, selectedSopIds],
+  );
+  const selectedDepartmentCount = useMemo(() => {
+    const depts = new Set(selectedSops.map((s) => s.department).filter(Boolean));
+    return depts.size;
+  }, [selectedSops]);
 
   const filteredSops = useMemo(
     () => sops.filter((s) => filterDepartment === 'all' || s.department === filterDepartment),
@@ -982,11 +978,41 @@ export default function ComplianceEnginePage() {
     }
   };
 
-  const handleSopRowSelect = (sop: SOP) => {
-    setSelectedSopId(sop._id);
+  const toggleSopSelection = (id: string) => {
+    setSelectedSopIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
     setPreflightData({ checked: false, existingCount: 0, newCount: 0 });
-    setCurrentStep('fetch-guidelines');
   };
+
+  const selectOnlySop = (id: string) => {
+    setSelectedSopIds(new Set([id]));
+    setPreflightData({ checked: false, existingCount: 0, newCount: 0 });
+  };
+
+  const setAllVisibleSopsSelected = (selected: boolean) => {
+    setSelectedSopIds((prev) => {
+      const next = new Set(prev);
+      for (const sop of filteredSops) {
+        if (selected) next.add(sop._id);
+        else next.delete(sop._id);
+      }
+      return next;
+    });
+    setPreflightData({ checked: false, existingCount: 0, newCount: 0 });
+  };
+
+  const handleGuidelineSelectionChange = (ids: Set<string>) => {
+    setSelectedGuidelineIds(ids);
+    setPreflightData({ checked: false, existingCount: 0, newCount: 0 });
+  };
+  const allVisibleSopsSelected =
+    filteredSops.length > 0 && filteredSops.every((s) => selectedSopIds.has(s._id));
+  const someVisibleSopsSelected =
+    filteredSops.some((s) => selectedSopIds.has(s._id)) && !allVisibleSopsSelected;
 
   const SopSortHeader = ({
     label,
@@ -1026,8 +1052,24 @@ export default function ComplianceEnginePage() {
       case 'Fully Compliant': return 'bg-emerald-100 text-emerald-700 border-emerald-200';
       case 'Partially Compliant': return 'bg-amber-100 text-amber-700 border-amber-200';
       case 'Non-Compliant': return 'bg-rose-100 text-rose-700 border-rose-200';
+      case 'Analysis Incomplete': return 'bg-sky-100 text-sky-800 border-sky-200';
       default: return 'bg-gray-100 text-gray-600 border-gray-200';
     }
+  };
+
+  const getScoreColor = (score: number) => {
+    if (score >= 9) return 'text-emerald-600';
+    if (score >= 6) return 'text-amber-600';
+    return 'text-rose-600';
+  };
+
+  const handleToggleApplicable = (findingId: string, isChecked: boolean) => {
+    setApplicableFindings((prev) => {
+      const next = new Set(prev);
+      if (isChecked) next.add(findingId);
+      else next.delete(findingId);
+      return next;
+    });
   };
 
   const handleSelectReport = async (report: ComplianceReport) => {
@@ -1147,6 +1189,22 @@ export default function ComplianceEnginePage() {
       });
   }, [selectedReport, filterStatus, filterGuideline, hideNotApplicable, hideFailedFindings]);
 
+  const allFindingsSelected =
+    visibleFindings.length > 0 && visibleFindings.every(({ i }) => selectedFindingIds.has(i));
+  const someFindingsSelected = visibleFindings.some(({ i }) => selectedFindingIds.has(i));
+
+  const toggleSelectAllFindings = () => {
+    if (allFindingsSelected) {
+      const next = new Set(selectedFindingIds);
+      visibleFindings.forEach(({ i }) => next.delete(i));
+      setSelectedFindingIds(next);
+    } else {
+      const next = new Set(selectedFindingIds);
+      visibleFindings.forEach(({ i }) => next.add(i));
+      setSelectedFindingIds(next);
+    }
+  };
+
   const normaliseSectionKey = (f: ComplianceFinding) => {
     const raw = f.sopSectionAffected || 'General';
     const m = String(raw).match(/(\d[\d.]*)/);
@@ -1187,7 +1245,7 @@ export default function ComplianceEnginePage() {
     } catch { /* silent */ } finally { setSubmittingApplicable(false); }
   };
 
-  const progressPct = analysisStats.total > 0 ? Math.round(((analysisStats.completed + analysisStats.cached + analysisStats.failed) / analysisStats.total) * 100) : 0;
+  const progressPct = complianceRunProgressPct(analysisStats);
 
   return (
     <div className="min-h-screen bg-[#f8f9fa] font-sans">
@@ -1200,6 +1258,13 @@ export default function ComplianceEnginePage() {
             </h1>
             <div className="flex flex-wrap items-center gap-2 mt-1">
               <p className="text-sm text-gray-500 font-medium">Automated Regulatory Compliance Validation</p>
+              <span
+                className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-bold uppercase tracking-wide bg-indigo-50 text-indigo-800 border border-indigo-200"
+                title="V3 precision engine: gatekeeping, per-clause analysis, intelligent scoring"
+              >
+                <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-pulse" />
+                V3 Engine · Active
+              </span>
               {llmInfo && (
                 <span
                   className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-bold uppercase tracking-wide ${
@@ -1215,7 +1280,7 @@ export default function ComplianceEnginePage() {
                     selectedProvider === 'claude'
                       ? `Claude model: ${selectedModel}`
                       : selectedProvider === 'codex'
-                      ? `Codex model: ${codexStatus?.complianceModel ?? 'gpt-4.1'}`
+                      ? `Codex model: ${codexStatus?.complianceModel ?? 'gpt-5.4-mini'}`
                       : `Compliance model: ${llmInfo.complianceModel}`
                   }
                 >
@@ -1228,7 +1293,7 @@ export default function ComplianceEnginePage() {
                   {selectedProvider === 'claude'
                     ? `Claude · ${selectedModel.includes('haiku') ? 'Haiku' : 'Sonnet'}`
                     : selectedProvider === 'codex'
-                    ? `Codex · ${codexStatus?.complianceModel ?? 'gpt-4.1'}`
+                    ? `Codex · ${codexStatus?.complianceModel ?? 'gpt-5.4-mini'}`
                     : selectedProvider === 'ollama'
                     ? 'Ollama (local)'
                     : selectedProvider === 'gemini'
@@ -1271,7 +1336,7 @@ export default function ComplianceEnginePage() {
               onClick={() => setSelectedProvider('codex')}
               title={
                 selectedProvider === 'codex' && codexStatus?.ok
-                  ? `Codex via your ChatGPT subscription (${codexStatus.complianceModel ?? 'gpt-4.1'}) — local CLI, no API key`
+                  ? `Codex via your ChatGPT subscription (${codexStatus.complianceModel ?? 'gpt-5.4-mini'}) — local CLI, no API key`
                   : selectedProvider === 'codex' && codexStatus?.error
                     ? `Codex not connected: ${codexStatus.error}`
                     : 'Codex — local CLI via ChatGPT subscription (no API key)'
@@ -1373,7 +1438,7 @@ export default function ComplianceEnginePage() {
               <>
                 Compliance will use your ChatGPT subscription via Codex CLI
                 {codexStatus.authMode ? ` (${codexStatus.authMode})` : ''}
-                {' · '}model: <strong>{codexStatus.complianceModel ?? 'gpt-4.1'}</strong>
+                {' · '}model: <strong>{codexStatus.complianceModel ?? 'gpt-5.4-mini'}</strong>
                 {codexStatus.codexVersion ? ` · CLI v${codexStatus.codexVersion}` : ''}
                 {' · '}No OpenAI API key required — uses local <code className="rounded bg-sky-100 px-1">codex exec</code>
               </>
@@ -1634,42 +1699,63 @@ export default function ComplianceEnginePage() {
                 <table className="w-full min-w-[720px] text-sm">
                   <thead className="sticky top-0 z-10 bg-gray-50 border-b border-gray-200">
                     <tr>
+                      <th className="w-10 px-3 py-3">
+                        <input
+                          type="checkbox"
+                          checked={allVisibleSopsSelected}
+                          ref={(el) => {
+                            if (el) el.indeterminate = someVisibleSopsSelected;
+                          }}
+                          onChange={(e) => setAllVisibleSopsSelected(e.target.checked)}
+                          className="rounded border-gray-300 text-purple-600 focus:ring-purple-500"
+                          title="Select all visible SOPs"
+                        />
+                      </th>
                       <SopSortHeader label="SOP ID" sortKey="identifier" className="w-[140px]" />
                       <SopSortHeader label="Version" sortKey="version" className="w-[90px]" />
                       <SopSortHeader label="Title" sortKey="name" />
                       <SopSortHeader label="Location / Area" sortKey="location" className="w-[220px]" />
                       <SopSortHeader label="Department" sortKey="department" className="w-[140px]" />
+                      <th className="w-[72px] px-3 py-3 text-[11px] font-bold uppercase tracking-wider text-gray-500">Only</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-gray-100 bg-white">
                     {sortedSops.length === 0 ? (
                       <tr>
-                        <td colSpan={5} className="px-4 py-16 text-center text-gray-500">
+                        <td colSpan={7} className="px-4 py-16 text-center text-gray-500">
                           No SOPs match the selected department filter.
                         </td>
                       </tr>
                     ) : (
                       sortedSops.map((sop) => {
-                        const isSelected = selectedSopId === sop._id;
+                        const isSelected = selectedSopIds.has(sop._id);
                         return (
                         <tr
                           key={sop._id}
                           role="button"
                           tabIndex={0}
-                          onClick={() => handleSopRowSelect(sop)}
+                          onClick={() => selectOnlySop(sop._id)}
                           onKeyDown={(e) => {
                             if (e.key === 'Enter' || e.key === ' ') {
                               e.preventDefault();
-                              handleSopRowSelect(sop);
+                              selectOnlySop(sop._id);
                             }
                           }}
-                          title={`Select ${sop.identifier} and continue to Guidelines`}
+                          title={`Select only ${sop.identifier} (use checkbox to add more)`}
                           className={`cursor-pointer transition-colors group ${
                             isSelected
                               ? 'bg-purple-50 ring-1 ring-inset ring-purple-300'
                               : 'hover:bg-purple-50/40'
                           }`}
                         >
+                          <td className="px-3 py-3 align-top" onClick={(e) => e.stopPropagation()}>
+                            <input
+                              type="checkbox"
+                              checked={isSelected}
+                              onChange={() => toggleSopSelection(sop._id)}
+                              className="rounded border-gray-300 text-purple-600 focus:ring-purple-500"
+                            />
+                          </td>
                           <td className="px-4 py-3 align-top">
                             <span className="inline-block text-purple-700 font-bold text-xs bg-purple-50 px-2 py-0.5 rounded border border-purple-100 font-mono">
                               {sop.identifier}
@@ -1703,6 +1789,23 @@ export default function ComplianceEnginePage() {
                               🏢 {sop.department}
                             </span>
                           </td>
+                          <td className="px-3 py-3 align-top">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                selectOnlySop(sop._id);
+                              }}
+                              className={`px-2 py-1 rounded-lg text-[10px] font-bold uppercase tracking-wide border transition-colors ${
+                                selectedSopIds.size === 1 && isSelected
+                                  ? 'bg-purple-600 text-white border-purple-600'
+                                  : 'bg-white text-gray-500 border-gray-200 hover:border-purple-300 hover:text-purple-700'
+                              }`}
+                              title={`Run compliance for ${sop.identifier} only`}
+                            >
+                              Only
+                            </button>
+                          </td>
                         </tr>
                         );
                       })
@@ -1713,8 +1816,10 @@ export default function ComplianceEnginePage() {
                   <span>
                     Showing {sortedSops.length} of {sopTotal || sops.length} SOPs
                     {filterDepartment !== 'all' ? ` in ${filterDepartment}` : ''}
+                    {' · '}
+                    <span className="text-purple-600 font-medium">{selectedSopCount} selected for analysis</span>
                   </span>
-                  <span className="text-purple-600 font-medium">Click a row to select an SOP and continue →</span>
+                  <span className="text-gray-400">Click a row for that SOP only · checkboxes to add more</span>
                 </div>
               </div>
             )}
@@ -1745,105 +1850,77 @@ export default function ComplianceEnginePage() {
               </div>
             </div>
 
-            {/* Folder summary cards */}
+            {/* Guideline multi-select */}
+            {loadingGuidelines ? (
+              <div className="text-center py-20 bg-gray-50 rounded-xl border border-dashed border-gray-200 mb-8">
+                <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-purple-600 mx-auto mb-4" />
+                <p className="text-gray-500">Loading guidelines...</p>
+              </div>
+            ) : (
+              <div className="mb-8">
+                <GuidelineSelector
+                  guidelines={guidelines}
+                  folders={folders}
+                  selectedIds={selectedGuidelineIds}
+                  onSelectionChange={handleGuidelineSelectionChange}
+                  guidelineStats={guidelineStats}
+                  onDelete={handleDeleteGuideline}
+                />
+              </div>
+            )}
+
+            {/* Folder summary — click to toggle all guidelines in category */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
-              {folders.map(folder => (
-                <div key={folder.folderName} className="p-5 bg-purple-50 rounded-xl border border-purple-100 hover:border-purple-300 hover:shadow-md transition-all">
+              {folders.map(folder => {
+                const inFolder = guidelines.filter((g) => g.folder === folder.folderName);
+                const selectedInFolder = inFolder.filter((g) => selectedGuidelineIds.has(g._id)).length;
+                const allInFolder = inFolder.length > 0 && selectedInFolder === inFolder.length;
+                return (
+                <button
+                  key={folder.folderName}
+                  type="button"
+                  onClick={() => {
+                    const next = new Set(selectedGuidelineIds);
+                    for (const g of inFolder) {
+                      if (allInFolder) next.delete(g._id);
+                      else next.add(g._id);
+                    }
+                    handleGuidelineSelectionChange(next);
+                  }}
+                  className={`p-5 rounded-xl border text-left transition-all hover:shadow-md ${
+                    allInFolder
+                      ? 'bg-purple-100 border-purple-400 ring-2 ring-purple-300'
+                      : selectedInFolder > 0
+                        ? 'bg-purple-50 border-purple-200'
+                        : 'bg-purple-50 border-purple-100 hover:border-purple-300'
+                  }`}
+                >
                   <div className="flex items-center gap-2 mb-2">
                     <span className="text-purple-500 opacity-80">📁</span>
                     <p className="text-gray-800 font-semibold truncate" title={folder.folderName}>{folder.folderName}</p>
                   </div>
                   <div className="flex items-end justify-between">
                     <div>
-                      <p className="text-2xl font-bold text-purple-700 leading-none">{folder.guidelineCount}</p>
-                      <p className="text-xs text-gray-500 mt-1">Guidelines</p>
+                      <p className="text-2xl font-bold text-purple-700 leading-none">{selectedInFolder}/{folder.guidelineCount}</p>
+                      <p className="text-xs text-gray-500 mt-1">Selected</p>
                     </div>
                     <div className="text-right">
                       <p className="text-sm font-medium text-gray-700">{folder.totalClauses}</p>
                       <p className="text-xs text-gray-400">Clauses</p>
                     </div>
                   </div>
-                </div>
-              ))}
+                </button>
+                );
+              })}
             </div>
-
-            {/* Guidelines list */}
-            {loadingGuidelines ? (
-              <div className="text-center py-20 bg-gray-50 rounded-xl border border-dashed border-gray-200">
-                <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-purple-600 mx-auto mb-4" />
-                <p className="text-gray-500">Loading guidelines...</p>
-              </div>
-            ) : (
-              <div className="max-h-[600px] overflow-y-auto space-y-3 pr-2">
-                {guidelines.map(g => {
-                  const stat = guidelineStats[g.name];
-                  return (
-                    <div key={g._id} className="bg-gray-50 border border-gray-100 rounded-xl overflow-hidden hover:bg-purple-50 hover:border-purple-200 transition-all group/row">
-                      {/* Row header — div not button so we can nest the delete button safely */}
-                      <div className="w-full p-5 flex items-center justify-between">
-                        {/* Clickable expand area */}
-                        <div
-                          role="button"
-                          tabIndex={0}
-                          onClick={() => setExpandedGuideline(expandedGuideline === g._id ? null : g._id)}
-                          onKeyDown={e => (e.key === 'Enter' || e.key === ' ') && setExpandedGuideline(expandedGuideline === g._id ? null : g._id)}
-                          className="flex-1 pr-4 min-w-0 cursor-pointer"
-                        >
-                          <div className="flex flex-wrap items-center gap-2 mb-1.5">
-                            <span className="px-2 py-0.5 bg-purple-100 text-purple-700 rounded text-[10px] font-bold uppercase tracking-wider border border-purple-200">{g.folder}</span>
-                          </div>
-                          <h3 className="text-gray-800 font-semibold text-base leading-tight">{g.name}</h3>
-                        </div>
-                        <div className="flex items-center gap-2 flex-shrink-0">
-                          <span className="px-2.5 py-1 bg-white text-gray-500 rounded-lg text-xs font-medium border border-gray-200">{g.clauses?.length ?? 0} clauses</span>
-                          {stat && stat.totalFindings > 0 && (
-                            <span className={`px-2.5 py-1 rounded-lg text-xs font-bold border ${stat.nonCompliantCount > 0 ? 'bg-rose-50 text-rose-700 border-rose-200' : stat.compliantCount === stat.totalFindings ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-amber-50 text-amber-700 border-amber-200'}`}>
-                              {stat.totalFindings} points
-                            </span>
-                          )}
-                          {stat && stat.sopCount > 0 && (
-                            <span className="px-2 py-1 bg-purple-50 text-purple-600 rounded-lg text-[10px] font-bold border border-purple-200">{stat.sopCount} SOPs</span>
-                          )}
-                          <button
-                            onClick={(e) => handleDeleteGuideline(g._id, g.name, e)}
-                            className="p-1.5 text-gray-300 hover:text-rose-500 transition-colors rounded opacity-0 group-hover/row:opacity-100"
-                            title="Delete guideline"
-                          >
-                            <X className="h-4 w-4" />
-                          </button>
-                          <span
-                            role="button"
-                            tabIndex={-1}
-                            aria-hidden
-                            onClick={() => setExpandedGuideline(expandedGuideline === g._id ? null : g._id)}
-                            className={`text-gray-400 transition-transform duration-300 cursor-pointer ${expandedGuideline === g._id ? 'rotate-180' : ''}`}
-                          >▼</span>
-                        </div>
-                      </div>
-                      {expandedGuideline === g._id && (
-                        <div className="px-5 pb-5 pt-2 bg-white border-t border-gray-100">
-                          <div className="space-y-2 max-h-64 overflow-y-auto">
-                            {(g.clauses ?? []).map((c, idx) => (
-                              <div key={idx} className="p-3 bg-gray-50 rounded-lg border border-gray-100 flex gap-3">
-                                <span className="px-2 py-1 bg-purple-100 text-purple-700 rounded text-xs font-bold border border-purple-200 flex-shrink-0">{c.number}</span>
-                                <div>
-                                  <p className="text-xs font-semibold text-gray-700">{c.title}</p>
-                                  <p className="text-xs text-gray-500 mt-0.5 line-clamp-2">{c.text}</p>
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
 
             <div className="flex justify-between mt-8 pt-6 border-t border-gray-100">
               <button onClick={() => setCurrentStep('fetch-sops')} className="px-6 py-2.5 bg-gray-100 text-gray-600 rounded-xl font-semibold hover:bg-gray-200 transition-all">← Back</button>
-              <button onClick={() => setCurrentStep('review')} className="px-8 py-3 bg-purple-600 text-white rounded-xl font-semibold hover:bg-purple-700 transition-all shadow-lg shadow-purple-200">
+              <button
+                onClick={() => setCurrentStep('review')}
+                disabled={selectedGuidelineIds.size === 0 || guidelines.length === 0}
+                className="px-8 py-3 bg-purple-600 text-white rounded-xl font-semibold hover:bg-purple-700 transition-all shadow-lg shadow-purple-200 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
                 Next: Review →
               </button>
             </div>
@@ -1856,22 +1933,88 @@ export default function ComplianceEnginePage() {
             <div className="bg-white rounded-2xl border border-gray-200 shadow-sm p-8">
               <h2 className="text-2xl font-bold text-gray-800 mb-6">Review Configuration</h2>
 
-              <div className="mb-6">
-                <label className="block text-sm font-semibold text-gray-700 mb-2">Select Analysis Scope</label>
-                <div className="relative">
-                  <select
-                    value={selectedSopId}
-                    onChange={e => { setSelectedSopId(e.target.value); setPreflightData({ checked: false, existingCount: 0, newCount: 0 }); }}
-                    className="w-full pl-4 pr-10 py-3 bg-white border border-gray-300 rounded-xl text-gray-700 focus:outline-none focus:ring-2 focus:ring-purple-500/20 text-sm appearance-none"
-                  >
-                    <option value="all">Analyze All Available SOPs ({sopTotal || sops.length})</option>
-                    {sops.map(s => <option key={s._id} value={s._id}>{s.identifier} - {s.name}</option>)}
-                  </select>
-                  <div className="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-gray-500">▼</div>
-                </div>
+              <div className="mb-8">
+                <GuidelineSelector
+                  guidelines={guidelines}
+                  folders={folders}
+                  selectedIds={selectedGuidelineIds}
+                  onSelectionChange={handleGuidelineSelectionChange}
+                  maxHeight="max-h-80"
+                />
               </div>
 
-              {preflightData.checked && (
+              <div className="mb-6">
+                <div className="flex items-center justify-between gap-4 mb-3">
+                  <label className="block text-sm font-semibold text-gray-700">SOPs to analyze</label>
+                  <div className="flex items-center gap-2 text-xs">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSelectedSopIds(new Set(sops.map((s) => s._id)));
+                        setPreflightData({ checked: false, existingCount: 0, newCount: 0 });
+                      }}
+                      className="px-2.5 py-1 rounded-lg border border-gray-200 text-gray-600 hover:border-purple-300 hover:text-purple-700"
+                    >
+                      Select all ({sopTotal || sops.length})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSelectedSopIds(new Set());
+                        setPreflightData({ checked: false, existingCount: 0, newCount: 0 });
+                      }}
+                      className="px-2.5 py-1 rounded-lg border border-gray-200 text-gray-600 hover:border-purple-300 hover:text-purple-700"
+                    >
+                      Clear
+                    </button>
+                  </div>
+                </div>
+                <div className="max-h-72 overflow-y-auto rounded-xl border border-gray-200 divide-y divide-gray-100">
+                  {sops.length === 0 ? (
+                    <p className="px-4 py-8 text-center text-sm text-gray-500">No SOPs loaded.</p>
+                  ) : (
+                    sops.map((s) => (
+                      <div
+                        key={s._id}
+                        className={`flex items-start gap-3 px-4 py-3 hover:bg-purple-50/50 ${
+                          selectedSopIds.has(s._id) ? 'bg-purple-50/80' : ''
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={selectedSopIds.has(s._id)}
+                          onChange={() => toggleSopSelection(s._id)}
+                          className="mt-1 rounded border-gray-300 text-purple-600 focus:ring-purple-500"
+                        />
+                        <span className="min-w-0 flex-1">
+                          <span className="block text-sm font-semibold text-gray-800">
+                            <span className="font-mono text-purple-700">{s.identifier}</span>
+                            {' — '}
+                            {s.name}
+                          </span>
+                          <span className="block text-xs text-gray-500 mt-0.5">{s.department}</span>
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => selectOnlySop(s._id)}
+                          className={`px-2 py-1 rounded-lg text-[10px] font-bold uppercase border flex-shrink-0 ${
+                            selectedSopIds.size === 1 && selectedSopIds.has(s._id)
+                              ? 'bg-purple-600 text-white border-purple-600'
+                              : 'bg-white text-gray-500 border-gray-200 hover:border-purple-300'
+                          }`}
+                        >
+                          Only
+                        </button>
+                      </div>
+                    ))
+                  )}
+                </div>
+                <p className="text-xs text-gray-500 mt-2">
+                  {selectedSopCount} of {sopTotal || sops.length} SOPs selected
+                </p>
+              </div>
+
+              {preflightData.checked && selectedSopCount > 0 && (
                 <div className="p-4 bg-purple-50 border border-purple-200 rounded-xl mb-6">
                   <p className="text-sm font-semibold text-purple-700 mb-2">Analysis Scope</p>
                   <div className="flex flex-wrap gap-3">
@@ -1894,9 +2037,9 @@ export default function ComplianceEnginePage() {
 
               <div className="grid grid-cols-3 gap-4 mb-8">
                 {[
-                  { label: 'TARGET SOPS', value: selectedSopId === 'all' ? (sopTotal || sops.length) : 1, sub: `across ${departments.length} departments`, color: 'border-purple-200 bg-purple-50' },
-                  { label: 'REFERENCE GUIDELINES', value: guidelines.length, sub: `from ${folders.length} categories`, color: 'border-pink-200 bg-pink-50' },
-                  { label: 'TOTAL VALIDATION POINTS', value: totalClauses, sub: 'clauses to verify', color: 'border-amber-200 bg-amber-50' },
+                  { label: 'TARGET SOPS', value: selectedSopCount, sub: selectedSopCount === 0 ? 'none selected' : selectedSopCount === 1 ? selectedSops[0]?.department ?? '1 department' : `across ${selectedDepartmentCount} department${selectedDepartmentCount === 1 ? '' : 's'}`, color: 'border-purple-200 bg-purple-50' },
+                  { label: 'GUIDELINES', value: selectedGuidelineCount, sub: `${selectedGuidelineClauseCount} clauses to verify`, color: 'border-pink-200 bg-pink-50' },
+                  { label: 'VALIDATION POINTS', value: selectedGuidelineClauseCount, sub: 'across selected guidelines', color: 'border-amber-200 bg-amber-50' },
                 ].map(card => (
                   <div key={card.label} className={`p-6 rounded-xl border ${card.color}`}>
                     <p className="text-[10px] font-black text-gray-500 uppercase tracking-widest mb-2">{card.label}</p>
@@ -1909,7 +2052,7 @@ export default function ComplianceEnginePage() {
               <div className="bg-gray-50 rounded-xl border border-gray-200 p-6">
                 <h3 className="font-bold text-gray-800 mb-4">Process Overview</h3>
                 <div className="space-y-3">
-                  {['Line-by-line scan of every SOP section against all guideline clauses', 'Evidence-based scoring (Compliant, Partial, Non-Compliant) with exact line references', 'Gap detection with verbatim SOP excerpts and suggested fixes', 'Validated coverage audit before final compliance score'].map((step, i) => (
+                  {['Gatekeeping validates SOP + guidelines before any AI calls', 'Per-clause V3 precision analysis with finding validation', 'Evidence-based scoring (Compliant, Partial, Non-Compliant) with section mapping', 'Intelligent score calculation and transparent report breakdown'].map((step, i) => (
                     <div key={i} className="flex items-start gap-3">
                       <span className="w-6 h-6 rounded-full bg-purple-100 text-purple-700 flex items-center justify-center text-xs font-black flex-shrink-0">{i + 1}</span>
                       <p className="text-sm text-gray-600">{step}</p>
@@ -1921,20 +2064,23 @@ export default function ComplianceEnginePage() {
 
             {/* Provider summary — toggles are in the header */}
             <div className="bg-violet-50 border border-violet-200 rounded-xl p-4">
-              <p className="text-xs font-semibold text-violet-700 uppercase tracking-wide mb-2">AI Provider for this run</p>
+              <p className="text-xs font-semibold text-violet-700 uppercase tracking-wide mb-2">V3 Engine · AI Provider for this run</p>
               <p className="text-sm text-gray-700">
+                Analysis uses the <strong>V3 precision engine</strong> (per-clause gatekeeping, validation, intelligent scoring).
+                {' '}
                 {selectedProvider === 'claude' && (
-                  <>Using <strong>Claude {selectedModel.includes('haiku') ? 'Haiku' : 'Sonnet'}</strong> via your Claude Code subscription. Switch provider in the header.</>
+                  <>LLM: <strong>Claude {selectedModel.includes('haiku') ? 'Haiku' : 'Sonnet'}</strong> via Claude Code.</>
                 )}
                 {selectedProvider === 'codex' && (
-                  <>Using <strong>Codex</strong> ({codexStatus?.complianceModel ?? 'gpt-4.1'}) via your ChatGPT subscription. Switch provider in the header.</>
+                  <>LLM: <strong>Codex</strong> ({codexStatus?.complianceModel ?? 'gpt-5.4-mini'}) via your ChatGPT subscription.</>
                 )}
                 {selectedProvider === 'gemini' && (
-                  <>Using <strong>Gemini</strong> ({llmInfo?.complianceModel ?? 'cloud'}). Switch provider in the header.</>
+                  <>LLM: <strong>Gemini</strong> ({llmInfo?.complianceModel ?? 'cloud'}).</>
                 )}
                 {selectedProvider === 'ollama' && (
-                  <>Using <strong>local Ollama</strong>. Switch provider in the header.</>
+                  <>LLM: <strong>local Ollama</strong>.</>
                 )}
+                {' '}Switch provider in the header.
               </p>
             </div>
 
@@ -1953,7 +2099,8 @@ export default function ComplianceEnginePage() {
               <button
                 onClick={runAnalysis}
                 disabled={
-                  sops.length === 0
+                  selectedSopCount === 0
+                  || selectedGuidelineIds.size === 0
                   || guidelines.length === 0
                   || (selectedProvider === 'claude' && claudeStatus !== null && !claudeStatus.loading && !claudeStatus.ok)
                   || (selectedProvider === 'codex' && codexStatus !== null && !codexStatus.loading && !codexStatus.ok)
@@ -1968,7 +2115,7 @@ export default function ComplianceEnginePage() {
                     : 'bg-purple-600 hover:bg-purple-700 shadow-purple-200'
                 }`}
               >
-                🚀 Start Analysis
+                🚀 Start V3 Analysis
                 {selectedProvider === 'claude'
                   ? ` · ${selectedModel.includes('haiku') ? 'Haiku' : 'Sonnet'}`
                   : selectedProvider === 'codex'
@@ -1990,23 +2137,28 @@ export default function ComplianceEnginePage() {
               <div className="flex items-center justify-between mb-6">
                 <div>
                   <h2 className="text-xl font-bold text-gray-800">
-                    {isAnalyzing ? 'Processing Compliance Checks...' : analysisComplete ? '✅ Analysis Complete' : 'Analysis'}
+                    {isAnalyzing ? 'V3 Precision Analysis Running...' : analysisComplete ? '✅ V3 Analysis Complete' : 'Analysis'}
                   </h2>
+                  <p className="text-xs font-semibold text-indigo-600 mt-1 uppercase tracking-wide">
+                    V3 Engine · {selectedProvider === 'codex' ? `Codex (${codexStatus?.complianceModel ?? 'gpt-5.4-mini'})` : selectedProvider === 'claude' ? `Claude (${selectedModel})` : selectedProvider === 'ollama' ? 'Ollama' : selectedProvider === 'gemini' ? `Gemini (${llmInfo?.complianceModel ?? 'cloud'})` : 'Provider'}
+                  </p>
                   {isAnalyzing && analysisStats.currentSopName && (
-                    <p className="text-sm text-gray-500 mt-1">Finishing up...</p>
+                    <p className="text-sm text-gray-500 mt-1">
+                      {analysisStats.currentSopIdentifier} — {analysisStats.currentSopName}
+                    </p>
                   )}
                 </div>
                 <div className="flex items-center gap-3">
                   {isAnalyzing && (
                     <>
                       <button
-                        onClick={() => { pauseRef.current = !isPaused; setIsPaused(v => !v); }}
+                        onClick={togglePause}
                         className={`flex items-center gap-2 px-4 py-2 rounded-xl border font-semibold text-sm transition-all ${isPaused ? 'bg-purple-600 text-white border-purple-500' : 'bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-100'}`}
                       >
                         {isPaused ? '▶ Resume' : '⏸ Pause'}
                       </button>
                       <button
-                        onClick={handleStopAnalysis}
+                        onClick={() => void stopRun()}
                         className="flex items-center gap-2 px-4 py-2 rounded-xl border font-semibold text-sm transition-all bg-rose-50 text-rose-700 border-rose-200 hover:bg-rose-100"
                       >
                         ⏹ Stop
@@ -2116,259 +2268,512 @@ export default function ComplianceEnginePage() {
           </div>
         )}
 
-        {/* ── STEP 5: RESULTS ── */}
+        {/* Step 5: Results — matches reference dev folder grid layout */}
         {currentStep === 'results' && (
-          <div className="space-y-6">
-            {!selectedReport ? (
-              <div className="bg-white rounded-2xl border border-gray-200 shadow-sm p-8">
-                <div className="flex items-center justify-between mb-6">
-                  <div>
-                    <h2 className="text-2xl font-bold text-gray-800">Compliance Reports</h2>
-                    <p className="text-gray-500 mt-1">{reports.length} reports available</p>
+          <div className={`${isFullScreen ? 'fixed inset-0 z-50 bg-[#f8f9fa] p-6 overflow-hidden' : 'grid grid-cols-1 xl:grid-cols-12 gap-8 h-[calc(100vh-180px)]'}`}>
+
+            {!isFullScreen && (
+            <div className={`${selectedReport ? 'xl:col-span-4' : 'xl:col-span-12'} bg-white rounded-2xl border border-gray-200 shadow-sm flex flex-col overflow-hidden transition-all duration-500`}>
+              <div className="p-5 border-b border-gray-100 flex items-center justify-between sticky top-0 bg-white z-10">
+                <h2 className="text-lg font-bold text-gray-800 flex items-center gap-2">
+                  Generated Reports
+                  <span className="px-2 py-0.5 bg-purple-100 text-purple-700 text-xs rounded-full font-bold">
+                    {reports?.length || 0}
+                  </span>
+                </h2>
+                <button
+                  onClick={fetchReports}
+                  className="p-2 hover:bg-gray-100 text-gray-400 hover:text-purple-600 rounded-lg transition-all"
+                  title="Refresh"
+                >
+                  <span className={loadingReports ? 'animate-spin block' : ''}>🔄</span>
+                </button>
+              </div>
+
+              {loadingReports ? (
+                <div className="flex-1 flex flex-col items-center justify-center p-12">
+                  <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-purple-600 mx-auto mb-3" />
+                  <p className="text-gray-400 text-sm">Loading...</p>
+                </div>
+              ) : (reports?.length || 0) === 0 ? (
+                <div className="flex-1 flex flex-col items-center justify-center p-12 text-gray-400">
+                  <div className="w-16 h-16 bg-gray-100 rounded-full flex items-center justify-center mb-4">
+                    <span className="text-2xl grayscale opacity-50">📊</span>
                   </div>
-                  <button onClick={fetchReports} disabled={loadingReports} className="px-4 py-2 bg-purple-50 text-purple-700 rounded-xl border border-purple-200 font-medium text-sm hover:bg-purple-100 transition-all">
-                    {loadingReports ? 'Loading...' : '🔄 Refresh'}
+                  <p className="font-medium text-gray-500">No reports generated</p>
+                  <button
+                    onClick={() => setCurrentStep('review')}
+                    className="mt-4 text-purple-600 text-sm font-medium hover:underline"
+                  >
+                    Start New Analysis
                   </button>
                 </div>
-
-                {reports.length === 0 ? (
-                  <div className="text-center py-20 bg-gray-50 rounded-xl border border-dashed border-gray-200">
-                    <p className="text-4xl mb-4 opacity-50">📊</p>
-                    <p className="text-lg font-medium text-gray-700 mb-2">No reports yet</p>
-                    <p className="text-sm text-gray-500 mb-6">Run an analysis to generate compliance reports.</p>
-                    <button onClick={() => setCurrentStep('review')} className="px-6 py-2.5 bg-purple-600 text-white rounded-lg font-medium hover:bg-purple-700 transition-all">
-                      Start Analysis
-                    </button>
-                  </div>
-                ) : (
-                  <div className="space-y-3">
-                    {reports.map(r => (
-                      <div
-                        key={r._id}
-                        role="button"
-                        tabIndex={0}
-                        onClick={() => handleSelectReport(r)}
-                        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handleSelectReport(r); } }}
-                        className="w-full text-left p-5 bg-gray-50 border border-gray-100 rounded-xl hover:border-purple-200 hover:bg-purple-50/30 transition-all group cursor-pointer"
+              ) : (
+                <div className={`overflow-y-auto p-3 space-y-2 ${selectedReport ? 'flex-1' : 'grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 space-y-0 w-full'}`}>
+                  {(reports || []).map((report) => (
+                    <div
+                      key={report._id}
+                      onClick={() => {
+                        handleSelectReport(report);
+                        setFilterStatus('all');
+                      }}
+                      className={`relative group p-5 rounded-2xl text-left transition-all duration-300 cursor-pointer border-2 ${
+                        selectedReport?._id === report._id
+                          ? 'bg-purple-50 border-purple-400 shadow-md shadow-purple-100'
+                          : 'bg-gray-50 border-gray-100 hover:border-purple-300 hover:bg-purple-50/50'
+                      }`}
+                    >
+                      <button
+                        onClick={(e) => handleDeleteReport(report._id, e)}
+                        className="absolute top-2 right-2 p-1.5 hover:bg-rose-50 text-gray-300 hover:text-rose-500 rounded-md opacity-0 group-hover:opacity-100 transition-all z-10"
+                        title="Delete Report"
                       >
-                        <div className="flex items-center justify-between">
-                          <div className="flex-1 min-w-0 pr-4">
-                            <div className="flex items-center gap-2 mb-1">
-                              <span className="text-purple-700 font-bold text-sm bg-purple-50 px-2 py-0.5 rounded border border-purple-100">{r.sopIdentifier}</span>
-                              <span className={`px-2 py-0.5 rounded border text-[10px] font-bold ${getStatusColor(r.complianceStatus)}`}>{r.complianceStatus}</span>
-                            </div>
-                            <h3 className="text-gray-800 font-medium truncate group-hover:text-purple-700 transition-colors">{r.sopName}</h3>
-                            <p className="text-xs text-gray-400 mt-0.5">{r.department} · {new Date(r.analyzedAt).toLocaleDateString()}</p>
-                          </div>
-                          <div className="flex items-center gap-4 flex-shrink-0">
-                            <div className="text-center">
-                              <p className={`text-xl font-black ${r.overallScore >= 8 ? 'text-emerald-600' : r.overallScore >= 5 ? 'text-amber-600' : 'text-rose-600'}`}>{r.overallScore?.toFixed(1)}</p>
-                              <p className="text-[10px] text-gray-400">/10</p>
-                            </div>
-                            <div className="flex items-center gap-2 text-xs">
-                              <span className="text-emerald-600 font-bold">{r.compliantCount}✓</span>
-                              <span className="text-amber-600 font-bold">{r.partialCount}~</span>
-                              <span className="text-rose-600 font-bold">{r.nonCompliantCount}✗</span>
-                            </div>
-                            <button type="button" onClick={(e) => handleDeleteReport(r._id, e)} className="p-1.5 text-gray-300 hover:text-rose-500 transition-colors rounded opacity-0 group-hover:opacity-100">
-                              <X className="h-4 w-4" />
-                            </button>
+                        🗑️
+                      </button>
+
+                      <div className="flex justify-between items-start mb-3">
+                        <span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">
+                          {report.sopIdentifier}
+                        </span>
+                        <div className="flex items-center gap-2">
+                          <div className={`w-3 h-3 rounded-full ${
+                            report.overallScore >= 7 ? 'bg-emerald-500' :
+                            report.overallScore >= 4 ? 'bg-amber-500' :
+                            'bg-rose-500'
+                          }`} />
+                          <div className="text-lg font-black text-gray-800">
+                            <span className={getScoreColor(report.overallScore)}>{report.overallScore}</span>
+                            <span className="text-gray-400 text-xs">/10</span>
                           </div>
                         </div>
                       </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            ) : (
-              /* Report detail */
-              <div className="space-y-6">
-                <div className="bg-white rounded-2xl border border-gray-200 shadow-sm p-6">
-                  <div className="flex items-center justify-between mb-4">
-                    <button onClick={() => setSelectedReport(null)} className="flex items-center gap-2 text-purple-600 hover:text-purple-800 font-semibold text-sm">
-                      ← Back to Reports
-                    </button>
-                    {!showConsolidatedSummary && selectedFindingIds.size > 0 && (
-                      <button onClick={() => setShowConsolidatedSummary(true)} className="flex items-center gap-2 px-4 py-2 bg-purple-600 text-white rounded-xl font-semibold text-sm hover:bg-purple-700 transition-all">
-                        <Layers className="h-4 w-4" />Consolidated Summary ({selectedFindingIds.size})
-                      </button>
-                    )}
-                  </div>
 
-                  <div className="flex items-start justify-between mb-6">
-                    <div>
-                      <div className="flex items-center gap-2 mb-1">
-                        <span className="text-purple-700 font-bold bg-purple-50 px-3 py-1 rounded-lg border border-purple-100">{selectedReport.sopIdentifier}</span>
-                        <span className={`px-3 py-1 rounded-lg border text-sm font-bold ${getStatusColor(selectedReport.complianceStatus)}`}>{selectedReport.complianceStatus}</span>
+                      <h3
+                        className={`font-bold text-xs leading-tight mb-4 line-clamp-2 uppercase tracking-tight ${selectedReport?._id === report._id ? 'text-purple-700' : 'text-gray-700'}`}
+                        title={report.sopName}
+                      >
+                        {report.sopName}
+                      </h3>
+
+                      <div className="flex items-center justify-between mt-auto">
+                        <span className={`px-2 py-0.5 rounded text-[9px] font-bold uppercase tracking-widest border ${getStatusColor(report.complianceStatus)}`}>
+                          {report.complianceStatus}
+                        </span>
+                        <span className="text-[9px] text-gray-400 font-medium font-mono">
+                          {new Date(report.analyzedAt).toLocaleDateString()}
+                        </span>
                       </div>
-                      <h2 className="text-xl font-bold text-gray-800">{selectedReport.sopName}</h2>
-                      <p className="text-sm text-gray-500">{selectedReport.department}</p>
                     </div>
-                    <div className="text-center">
-                      <div className={`inline-flex flex-col items-center justify-center w-20 h-20 rounded-full border-4 ${
-                        selectedReport.overallScore >= 8
-                          ? 'border-emerald-200 bg-emerald-50'
-                          : selectedReport.overallScore >= 5
-                            ? 'border-amber-200 bg-amber-50'
-                            : 'border-rose-200 bg-rose-50'
-                      }`}>
-                        <p className={`text-2xl font-black leading-none ${getScoreColorClass(selectedReport.overallScore)}`}>
-                          {selectedReport.overallScore?.toFixed(1)}
+                  ))}
+                </div>
+              )}
+            </div>
+            )}
+
+            {selectedReport && (
+              <div className={`${isFullScreen ? 'h-full' : 'xl:col-span-8'} flex flex-col gap-6 overflow-hidden animate-in fade-in slide-in-from-right-4 duration-300`}>
+
+                <div className="bg-white rounded-2xl border border-gray-200 shadow-sm p-5 relative overflow-hidden flex-shrink-0">
+                  <div className="flex flex-row justify-between items-center gap-6">
+                    <div className="flex items-center gap-6">
+                      <div className="flex items-baseline gap-1.5">
+                        <span className={`text-5xl font-black tracking-tighter ${getScoreColor(selectedReport.overallScore)}`}>
+                          {selectedReport.overallScore}
+                        </span>
+                        <span className="text-xl font-bold text-gray-400">/10</span>
+                      </div>
+                      <div className="h-10 w-px bg-gray-200" />
+                      <div className="space-y-0.5">
+                        <p className="text-purple-600 text-[10px] font-black uppercase tracking-[0.2em] leading-none">{selectedReport.department}</p>
+                        <p className={`text-lg font-black tracking-tight ${getScoreColor(selectedReport.overallScore)} leading-tight`}>
+                          {selectedReport.complianceStatus}
                         </p>
-                        <p className="text-[10px] text-gray-400 font-semibold mt-0.5">/ 10</p>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-4">
+                      <div className={`w-12 h-12 rounded-full ${
+                        selectedReport.overallScore >= 7 ? 'bg-emerald-500' :
+                        selectedReport.overallScore >= 4 ? 'bg-amber-500' :
+                        'bg-rose-500'
+                      }`} />
+                      <button
+                        onClick={() => setIsFullScreen(!isFullScreen)}
+                        className="p-2.5 bg-gray-50 hover:bg-gray-100 text-gray-500 rounded-xl transition-all border border-gray-200 hover:scale-110 active:scale-95"
+                      >
+                        {isFullScreen ? '↙️' : '↗️'}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex-1 overflow-y-auto pr-2 space-y-6 pb-10">
+
+                  <div className="mb-6">
+                    <label className="block text-sm font-medium text-gray-600 mb-2">Filter by Guideline Folder</label>
+                    <select
+                      value={filterGuideline}
+                      onChange={(e) => setFilterGuideline(e.target.value)}
+                      className="w-full px-4 py-2.5 bg-white border border-gray-200 rounded-lg text-gray-700 focus:outline-none focus:ring-2 focus:ring-purple-500/30 text-sm font-medium"
+                    >
+                      <option value="all">All Guidelines ({selectedReport.findings?.length || 0})</option>
+                      {folders.filter((f) => f.guidelineCount > 0).map((folder) => {
+                        const folderFindings = (selectedReport.findings || []).filter((f) => f.folderName === folder.folderName);
+                        return (
+                          <option key={folder.folderName} value={folder.folderName}>
+                            {folder.folderName} ({folderFindings.length})
+                          </option>
+                        );
+                      })}
+                    </select>
+                  </div>
+
+                  <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                    <div className="p-6 bg-blue-50 rounded-2xl border border-blue-200 flex flex-col justify-between">
+                      <div className="flex justify-between items-center mb-4">
+                        <p className="text-xs font-bold text-blue-600 uppercase tracking-widest">Total Checked</p>
+                        <span className="text-2xl">📋</span>
+                      </div>
+                      <p className="text-4xl font-black text-gray-800">{selectedReport.findings?.length || 0}</p>
+                    </div>
+
+                    <button
+                      onClick={() => setFilterStatus(filterStatus === 'compliant' ? 'all' : 'compliant')}
+                      className={`p-6 rounded-2xl border transition-all text-left flex flex-col justify-between ${
+                        filterStatus === 'compliant' ? 'bg-emerald-100 border-emerald-400 ring-2 ring-emerald-300 shadow-md' : 'bg-emerald-50 border-emerald-200 hover:border-emerald-400'
+                      }`}
+                    >
+                      <div className="flex justify-between items-center mb-4">
+                        <p className="text-xs font-bold text-emerald-700 uppercase tracking-widest">Compliant</p>
+                        <span className="text-2xl">✅</span>
+                      </div>
+                      <p className="text-4xl font-black text-emerald-700">{selectedReport.compliantCount}</p>
+                    </button>
+
+                    <button
+                      onClick={() => setFilterStatus(filterStatus === 'partial' ? 'all' : 'partial')}
+                      className={`p-6 rounded-2xl border transition-all text-left flex flex-col justify-between ${
+                        filterStatus === 'partial' ? 'bg-amber-100 border-amber-400 ring-2 ring-amber-300 shadow-md' : 'bg-amber-50 border-amber-200 hover:border-amber-400'
+                      }`}
+                    >
+                      <div className="flex justify-between items-center mb-4">
+                        <p className="text-xs font-bold text-amber-700 uppercase tracking-widest">Partial</p>
+                        <span className="text-2xl">⚠️</span>
+                      </div>
+                      <div className="flex items-baseline gap-2">
+                        <p className="text-4xl font-black text-amber-700">{selectedReport.partialCount}</p>
+                        <p className="text-xs font-bold text-amber-500 font-mono">
+                          ({Math.round((selectedReport.partialCount / (selectedReport.findings?.length || 1)) * 100)}%)
+                        </p>
+                      </div>
+                    </button>
+
+                    <button
+                      onClick={() => setFilterStatus(filterStatus === 'non-compliant' ? 'all' : 'non-compliant')}
+                      className={`p-6 rounded-2xl border transition-all text-left flex flex-col justify-between ${
+                        filterStatus === 'non-compliant' ? 'bg-rose-100 border-rose-400 ring-2 ring-rose-300 shadow-md' : 'bg-rose-50 border-rose-200 hover:border-rose-400'
+                      }`}
+                    >
+                      <div className="flex justify-between items-center mb-4">
+                        <p className="text-xs font-bold text-rose-700 uppercase tracking-widest">Non-Compliant</p>
+                        <span className="text-2xl">❌</span>
+                      </div>
+                      <div className="flex items-baseline gap-2">
+                        <p className="text-4xl font-black text-rose-700">{selectedReport.nonCompliantCount}</p>
+                        <p className="text-xs font-bold text-rose-400 font-mono">
+                          ({Math.round((selectedReport.nonCompliantCount / (selectedReport.findings?.length || 1)) * 100)}%)
+                        </p>
+                      </div>
+                    </button>
+                  </div>
+
+                  <div className="bg-white rounded-2xl border border-gray-200 p-5">
+                    <div className="flex justify-between items-center mb-3">
+                      <p className="text-xs font-bold text-gray-500 uppercase tracking-widest">Compliance Distribution</p>
+                      <p className="text-[10px] text-gray-400 font-bold uppercase tracking-widest">{selectedReport.findings?.length || 0} applicable clauses</p>
+                    </div>
+                    <div className="h-4 w-full bg-gray-100 rounded-full overflow-hidden flex shadow-inner border border-gray-200">
+                      <div
+                        className="bg-emerald-500 h-full transition-all duration-1000 flex items-center justify-center text-[10px] font-bold text-white"
+                        style={{ width: `${(selectedReport.compliantCount / (selectedReport.findings?.length || 1)) * 100}%` }}
+                      >
+                        {selectedReport.compliantCount > 0 && Math.round((selectedReport.compliantCount / (selectedReport.findings?.length || 1)) * 100) > 5 && `${Math.round((selectedReport.compliantCount / (selectedReport.findings?.length || 1)) * 100)}%`}
+                      </div>
+                      <div
+                        className="bg-amber-500 h-full transition-all duration-1000 flex items-center justify-center text-[10px] font-bold text-white"
+                        style={{ width: `${(selectedReport.partialCount / (selectedReport.findings?.length || 1)) * 100}%` }}
+                      >
+                        {selectedReport.partialCount > 0 && Math.round((selectedReport.partialCount / (selectedReport.findings?.length || 1)) * 100) > 5 && `${Math.round((selectedReport.partialCount / (selectedReport.findings?.length || 1)) * 100)}%`}
+                      </div>
+                      <div
+                        className="bg-rose-500 h-full transition-all duration-1000 flex items-center justify-center text-[10px] font-bold text-white shadow-[inset_0_0_10px_rgba(0,0,0,0.1)]"
+                        style={{ width: `${(selectedReport.nonCompliantCount / (selectedReport.findings?.length || 1)) * 100}%` }}
+                      >
+                        {selectedReport.nonCompliantCount > 0 && Math.round((selectedReport.nonCompliantCount / (selectedReport.findings?.length || 1)) * 100) > 5 && `${Math.round((selectedReport.nonCompliantCount / (selectedReport.findings?.length || 1)) * 100)}%`}
                       </div>
                     </div>
                   </div>
 
-                  {/* Score breakdown */}
-                  <div className="grid grid-cols-3 gap-4 mb-6">
-                    {[
-                      { label: 'Compliant', count: selectedReport.compliantCount, color: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
-                      { label: 'Partial', count: selectedReport.partialCount, color: 'bg-amber-50 text-amber-700 border-amber-200' },
-                      { label: 'Non-Compliant', count: selectedReport.nonCompliantCount, color: 'bg-rose-50 text-rose-700 border-rose-200' },
-                    ].map(b => (
-                      <div key={b.label} className={`p-4 rounded-xl border ${b.color} text-center`}>
-                        <p className="text-2xl font-black">{b.count}</p>
-                        <p className="text-xs font-semibold mt-1">{b.label}</p>
+                  {applicableFindings.size > 0 && (
+                    <div className="bg-purple-50 border-2 border-purple-300 rounded-2xl p-5 flex justify-between items-center shadow-md">
+                      <div className="flex items-center gap-4">
+                        <div className="w-12 h-12 rounded-full bg-purple-600 flex items-center justify-center text-white font-black text-lg shadow-md">
+                          {applicableFindings.size}
+                        </div>
+                        <div>
+                          <p className="text-purple-700 font-bold text-sm">
+                            {applicableFindings.size} finding{applicableFindings.size !== 1 ? 's' : ''} selected
+                          </p>
+                          <p className="text-purple-600 text-xs">Ready to generate compiled SOP text</p>
+                        </div>
                       </div>
-                    ))}
-                  </div>
-
-                  {/* Audit completeness report — proves the full guideline library was reviewed */}
-                  <AuditCompletenessReport report={selectedReport} />
-
-                  {/* Regulatory dashboard metrics */}
-                  <ReportMetrics report={selectedReport} />
-
-                  {/* Score transparency */}
-                  <ScoreTransparency report={selectedReport} />
-
-                  {/* Cross-SOP dependency validation */}
-                  {selectedReport.crossSopDependencies && (
-                    <CrossSopPanel deps={selectedReport.crossSopDependencies} />
+                      <div className="flex gap-3">
+                        <button
+                          onClick={() => setApplicableFindings(new Set())}
+                          className="px-4 py-2 bg-white hover:bg-gray-50 text-gray-700 rounded-lg text-sm font-medium transition-all border border-gray-200"
+                        >
+                          Clear Selection
+                        </button>
+                        <button
+                          onClick={submitApplicableFindings}
+                          disabled={submittingApplicable}
+                          className="px-6 py-2 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white rounded-lg text-sm font-bold uppercase tracking-wider shadow-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+                        >
+                          {submittingApplicable ? (
+                            <>
+                              <span className="animate-spin">⏳</span>
+                              <span>Processing...</span>
+                            </>
+                          ) : (
+                            <>
+                              <span>📝</span>
+                              <span>Generate Compiled SOP Text</span>
+                            </>
+                          )}
+                        </button>
+                      </div>
+                    </div>
                   )}
 
-                  {/* Clause-by-clause traceability matrix */}
-                  {selectedReport.traceabilityMatrix && (
-                    <TraceabilityMatrix matrix={selectedReport.traceabilityMatrix} />
-                  )}
-
-                  {/* Filters */}
-                  <div className="flex flex-wrap gap-3 mb-6">
-                    <select value={filterStatus} onChange={e => setFilterStatus(e.target.value as never)} className="px-3 py-2 border border-gray-200 rounded-lg text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-purple-500/20">
-                      <option value="all">All Status</option>
-                      <option value="non-compliant">Non-Compliant</option>
-                      <option value="partial">Partial</option>
-                      <option value="compliant">Compliant</option>
-                      <option value="not-applicable">N/A</option>
-                    </select>
-                    <select value={filterGuideline} onChange={e => setFilterGuideline(e.target.value)} className="px-3 py-2 border border-gray-200 rounded-lg text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-purple-500/20">
-                      <option value="all">All Guidelines</option>
-                      {guidelineFolders.map(f => <option key={f} value={f}>{f}</option>)}
-                    </select>
-                    <label className="flex items-center gap-2 cursor-pointer select-none">
-                      <input type="checkbox" checked={hideNotApplicable} onChange={e => setHideNotApplicable(e.target.checked)} className="rounded" />
-                      <span className="text-sm text-gray-600">Hide N/A</span>
-                    </label>
-                    <label className="flex items-center gap-2 cursor-pointer select-none">
-                      <input type="checkbox" checked={hideFailedFindings} onChange={e => setHideFailedFindings(e.target.checked)} className="rounded" />
-                      <span className="text-sm text-gray-600">Hide Failed</span>
-                    </label>
-                    {visibleFindings.length > 0 && (
-                      <button
-                        onClick={() => {
-                          const allSel = visibleFindings.every(({ i }) => selectedFindingIds.has(i));
-                          const next = new Set(selectedFindingIds);
-                          if (allSel) visibleFindings.forEach(({ i }) => next.delete(i));
-                          else visibleFindings.forEach(({ i }) => next.add(i));
-                          setSelectedFindingIds(next);
-                        }}
-                        className="px-3 py-2 bg-purple-50 text-purple-700 border border-purple-200 rounded-lg text-sm font-medium hover:bg-purple-100 transition-all"
-                      >
-                        {visibleFindings.every(({ i }) => selectedFindingIds.has(i)) ? 'Deselect All' : 'Select All'}
-                      </button>
-                    )}
-                    {applicableFindings.size > 0 && (
-                      <button
-                        onClick={submitApplicableFindings}
-                        disabled={submittingApplicable}
-                        className="px-4 py-2 bg-emerald-600 text-white rounded-lg text-sm font-semibold hover:bg-emerald-700 disabled:opacity-50 transition-all"
-                      >
-                        {submittingApplicable ? 'Submitting...' : `Submit ${applicableFindings.size} Applicable`}
-                      </button>
-                    )}
-                  </div>
-
-                  {/* Consolidated Summary Modal */}
-                  {showConsolidatedSummary && (
-                    <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/40 p-8 overflow-y-auto">
-                      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl">
-                        <div className="flex items-center justify-between p-6 border-b">
-                          <h3 className="text-xl font-bold text-gray-800 flex items-center gap-2">
-                            <Layers className="h-5 w-5 text-purple-600" />Consolidated Action Plan
-                          </h3>
-                          <button onClick={() => setShowConsolidatedSummary(false)} className="p-2 hover:bg-gray-100 rounded-lg transition-colors">
-                            <X className="h-5 w-5 text-gray-500" />
+                  <div className="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden">
+                    <div className="p-5 border-b border-gray-100 bg-white flex flex-col gap-3 sticky top-0 z-10">
+                      <div className="flex items-center justify-between">
+                        <h3 className="text-lg font-bold text-gray-800 flex items-center gap-3">
+                          <span className="text-xl">📔</span>
+                          Findings with Guideline References
+                          {filterStatus !== 'all' && (
+                            <span className="text-[10px] font-black text-white px-2.5 py-1 bg-purple-600 rounded-md uppercase tracking-[0.2em]">
+                              {filterStatus}
+                            </span>
+                          )}
+                        </h3>
+                        {filterStatus !== 'all' && (
+                          <button
+                            onClick={() => setFilterStatus('all')}
+                            className="text-xs font-medium text-purple-600 hover:text-purple-700 hover:underline"
+                          >
+                            Clear Filters
                           </button>
-                        </div>
-                        <div className="p-6 space-y-4 max-h-[70vh] overflow-y-auto">
-                          {consolidatedSections.map(sec => (
-                            <ConsolidatedSectionCard key={sec.sectionKey} sec={sec} />
-                          ))}
-                        </div>
+                        )}
+                      </div>
+
+                      <div className="flex items-center justify-between gap-3 pt-1 border-t border-gray-100">
+                        <button
+                          onClick={toggleSelectAllFindings}
+                          className="flex items-center gap-2 text-sm font-semibold text-gray-600 hover:text-gray-900 transition-colors"
+                        >
+                          {allFindingsSelected ? (
+                            <CheckSquare className="h-5 w-5 text-purple-600" />
+                          ) : someFindingsSelected ? (
+                            <div className="h-5 w-5 rounded border-2 border-purple-500 bg-purple-100 flex items-center justify-center">
+                              <div className="h-2 w-2 bg-purple-600 rounded-sm" />
+                            </div>
+                          ) : (
+                            <Square className="h-5 w-5 text-gray-400" />
+                          )}
+                          {allFindingsSelected ? 'Deselect All' : 'Select All Results'}
+                          {someFindingsSelected && (
+                            <span className="ml-1 px-2 py-0.5 bg-purple-100 text-purple-700 text-xs font-bold rounded-full border border-purple-200">
+                              {selectedFindingIds.size} selected
+                            </span>
+                          )}
+                        </button>
+
+                        <button
+                          onClick={() => setShowConsolidatedSummary(true)}
+                          disabled={selectedFindingIds.size === 0}
+                          className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold transition-all ${
+                            selectedFindingIds.size > 0
+                              ? 'bg-purple-600 text-white hover:bg-purple-700 shadow-md shadow-purple-200'
+                              : 'bg-gray-100 text-gray-400 cursor-not-allowed border border-gray-200'
+                          }`}
+                        >
+                          <Sparkles className="h-3.5 w-3.5" />
+                          Generate Consolidated Summary
+                          {selectedFindingIds.size > 0 && (
+                            <span className="ml-1 px-1.5 py-0.5 bg-white/30 rounded text-[10px]">{selectedFindingIds.size}</span>
+                          )}
+                        </button>
                       </div>
                     </div>
-                  )}
 
-                  {loadingFullReport ? (
-                    <div className="text-center py-12">
-                      <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-purple-600 mx-auto mb-3" />
-                      <p className="text-gray-500 text-sm">Loading full report...</p>
+                    <div className="p-6 space-y-6 bg-gray-50 min-h-[400px]">
+                      {loadingFullReport ? (
+                        <div className="text-center py-20">
+                          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-purple-600 mx-auto mb-3" />
+                          <p className="text-gray-500 text-sm">Loading full report...</p>
+                        </div>
+                      ) : selectedReport.findings && selectedReport.findings.length > 0 ? (
+                        visibleFindings.map(({ f, i }) => (
+                          <div
+                            key={f.gapId ?? i}
+                            className={`transition-all duration-200 rounded-2xl ${
+                              selectedFindingIds.has(i) ? 'ring-2 ring-purple-400 ring-offset-2 ring-offset-gray-50' : ''
+                            }`}
+                          >
+                            <FindingCard
+                              finding={f}
+                              reportContext={{
+                                sopIdentifier: selectedReport.sopIdentifier,
+                                sopName: selectedReport.sopName,
+                                department: selectedReport.department,
+                                overallScore: selectedReport.overallScore,
+                                complianceStatus: selectedReport.complianceStatus,
+                              }}
+                              index={i}
+                              defaultExpanded={
+                                f.complianceLevel === 'partial' ||
+                                f.complianceLevel === 'non-compliant' ||
+                                f.complianceLevel === 'not-applicable'
+                              }
+                              isSelected={selectedFindingIds.has(i)}
+                              onToggleSelect={(idx) => {
+                                const next = new Set(selectedFindingIds);
+                                if (next.has(idx)) next.delete(idx);
+                                else next.add(idx);
+                                setSelectedFindingIds(next);
+                              }}
+                              onToggleApplicable={handleToggleApplicable}
+                              isApplicable={applicableFindings.has(f.gapId ?? f._id ?? `finding-${i}`)}
+                              showCheckbox
+                              onReviewStatusChange={f.gapId ? handleReviewStatusChange : undefined}
+                              onApplyFix={f.gapId ? handleApplyFix : undefined}
+                              applyingFix={applyingFixGapId === f.gapId}
+                            />
+                          </div>
+                        ))
+                      ) : (
+                        <div className="text-center py-20 text-gray-400">
+                          <p>No findings found.</p>
+                        </div>
+                      )}
+
+                      {visibleFindings.length === 0 && selectedReport.findings && selectedReport.findings.length > 0 && (
+                        <div className="text-center py-20">
+                          <p className="text-gray-400 mb-2">No findings match the current filters</p>
+                          <div className="flex gap-2 justify-center mt-3">
+                            {filterStatus !== 'all' && (
+                              <button
+                                onClick={() => setFilterStatus('all')}
+                                className="text-purple-600 font-medium hover:underline text-sm"
+                              >
+                                Clear Status Filter
+                              </button>
+                            )}
+                            {filterGuideline !== 'all' && (
+                              <button
+                                onClick={() => setFilterGuideline('all')}
+                                className="text-purple-600 font-medium hover:underline text-sm"
+                              >
+                                Clear Guideline Filter
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      )}
                     </div>
-                  ) : (
-                    <div className="space-y-3">
-                      <p className="text-sm font-semibold text-gray-600">{visibleFindings.length} findings shown</p>
-                      {visibleFindings.map(({ f, i }) => (
-                        <FindingCard
-                          key={f.gapId ?? i}
-                          finding={f}
-                          reportContext={selectedReport ? {
-                            sopIdentifier: selectedReport.sopIdentifier,
-                            sopName: selectedReport.sopName,
-                            department: selectedReport.department,
-                            overallScore: selectedReport.overallScore,
-                            complianceStatus: selectedReport.complianceStatus,
-                          } : undefined}
-                          index={i}
-                          defaultExpanded={
-                            f.complianceLevel === 'partial' ||
-                            f.complianceLevel === 'non-compliant' ||
-                            f.complianceLevel === 'not-applicable'
-                          }
-                          isSelected={selectedFindingIds.has(i)}
-                          onToggleSelect={(idx) => {
-                            const next = new Set(selectedFindingIds);
-                            if (next.has(idx)) next.delete(idx); else next.add(idx);
-                            setSelectedFindingIds(next);
-                          }}
-                          onToggleApplicable={(id, checked) => {
-                            setApplicableFindings(prev => { const s = new Set(prev); if (checked) s.add(id); else s.delete(id); return s; });
-                          }}
-                          isApplicable={applicableFindings.has(f.gapId ?? f._id ?? `finding-${i}`)}
-                          showCheckbox
-                          onReviewStatusChange={f.gapId ? handleReviewStatusChange : undefined}
-                          onApplyFix={f.gapId ? handleApplyFix : undefined}
-                          applyingFix={applyingFixGapId === f.gapId}
-                        />
-                      ))}
-                    </div>
-                  )}
+                  </div>
                 </div>
               </div>
             )}
           </div>
         )}
       </div>
+
+      {/* Consolidated Summary Modal */}
+      {showConsolidatedSummary && (
+        <div className={`fixed inset-0 z-[200] flex items-center justify-center bg-black/70 backdrop-blur-sm transition-all duration-300 ${isSummaryFullScreen ? 'p-0' : 'p-4 pt-12'}`}>
+          <div className={`bg-white border border-gray-200 shadow-2xl flex flex-col transition-all duration-300 ${
+            isSummaryFullScreen
+              ? 'fixed inset-0 w-screen h-screen rounded-none'
+              : 'w-full max-w-4xl max-h-[85vh] rounded-2xl'
+          }`}>
+            <div className={`flex flex-shrink-0 items-center justify-between px-6 py-4 border-b border-gray-100 bg-purple-50 ${isSummaryFullScreen ? '' : 'rounded-t-2xl'}`}>
+              <div className="flex items-center gap-3">
+                <div className="p-2 bg-purple-100 rounded-xl">
+                  <Sparkles className="h-5 w-5 text-purple-600" />
+                </div>
+                <div>
+                  <h2 className="text-lg font-bold text-gray-800">Consolidated Compliance Summary</h2>
+                  <p className="text-xs text-gray-500">
+                    {consolidatedSections.length} section{consolidatedSections.length !== 1 ? 's' : ''} • {selectedFindingIds.size} findings merged
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setIsSummaryFullScreen(!isSummaryFullScreen)}
+                  className="p-2 hover:bg-gray-100 rounded-xl text-gray-400 hover:text-gray-700 transition-all mr-2"
+                  title={isSummaryFullScreen ? 'Exit Full Screen' : 'Full Screen'}
+                >
+                  {isSummaryFullScreen ? '↙️' : '↗️'}
+                </button>
+                <button
+                  onClick={() => {
+                    const lines: string[] = [
+                      `CONSOLIDATED COMPLIANCE SUMMARY — ${selectedReport?.sopName || ''}`,
+                      `Generated: ${new Date().toLocaleString()}`,
+                      `Sections: ${consolidatedSections.length} | Findings: ${selectedFindingIds.size}`,
+                      '', '═'.repeat(60), '',
+                    ];
+                    consolidatedSections.forEach((sec, idx) => {
+                      lines.push(`SECTION ${sec.sectionKey}${sec.isMulti ? ` (${sec.findings.length} changes combined)` : ''}`);
+                      lines.push(`Sources: ${sec.sources.join(', ')}`);
+                      if (sec.clauses.length) lines.push(`Clauses: ${sec.clauses.join(', ')}`);
+                      lines.push('');
+                      lines.push(sec.combinedAction);
+                      if (sec.combinedSuggestion) {
+                        lines.push('');
+                        lines.push('PROPOSED VERBIAGE:');
+                        lines.push(sec.combinedSuggestion);
+                      }
+                      if (idx < consolidatedSections.length - 1) {
+                        lines.push('');
+                        lines.push('─'.repeat(60));
+                        lines.push('');
+                      }
+                    });
+                    navigator.clipboard.writeText(lines.join('\n'));
+                  }}
+                  className="flex items-center gap-2 px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white text-xs font-bold rounded-xl transition-all"
+                >
+                  <Copy className="h-3.5 w-3.5" /> Copy All
+                </button>
+                <button
+                  onClick={() => setShowConsolidatedSummary(false)}
+                  className="p-2 hover:bg-gray-100 rounded-xl text-gray-400 hover:text-gray-700 transition-all"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+            </div>
+            <div className="p-6 space-y-5 overflow-y-auto flex-1 bg-gray-50">
+              {consolidatedSections.map((sec) => (
+                <ConsolidatedSectionCard key={sec.sectionKey} sec={sec} />
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

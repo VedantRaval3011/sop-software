@@ -39,10 +39,14 @@ export async function saveComplianceReport(data: {
   const nonCompliantCount = data.findings.filter((f) => f.complianceLevel === "non-compliant").length;
   const notApplicableCount = data.findings.filter((f) => f.complianceLevel === "not-applicable").length;
 
-  // Transparent weighted score — recommendations excluded, criticality-weighted.
+  // Transparent weighted score — V3 uses its own formula; V5 uses classification weights.
+  const isV3Engine = data.analysisEngineVersion?.startsWith("v3");
   const breakdown = data.scoreBreakdown ?? computeWeightedScoreBreakdown(data.findings);
-  const scoreFromFindings =
-    breakdown.totalApplicableRequirements > 0 ? breakdown.score : data.overallScore;
+  const scoreFromFindings = isV3Engine
+    ? data.overallScore
+    : breakdown.totalApplicableRequirements > 0
+      ? breakdown.score
+      : data.overallScore;
 
   const criticalCount = data.findings.filter((f) => f.findingCategory === "Critical Non-Compliance").length;
   const majorCount = data.findings.filter((f) => f.findingCategory === "Major Gap").length;

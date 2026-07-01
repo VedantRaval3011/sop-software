@@ -19,6 +19,7 @@ export async function GET(req: NextRequest, { params }: Params) {
 
   const { sopCode } = await params;
   const mode = req.nextUrl.searchParams.get('mode') === 'trial' ? 'trial' : 'exam';
+  const language = req.nextUrl.searchParams.get('lang') === 'gu' ? 'Gujarati' : 'English';
 
   try {
     await connectDB();
@@ -52,7 +53,7 @@ export async function GET(req: NextRequest, { params }: Params) {
         $match: {
           sopIdentifier: { $regex: new RegExp(`^${escaped}`, 'i') },
           isObsolete: { $ne: true },
-          language: 'English',
+          language,
         },
       },
       { $unwind: '$mcqs' },

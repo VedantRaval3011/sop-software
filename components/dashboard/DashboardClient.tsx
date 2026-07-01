@@ -38,6 +38,9 @@ import {
 } from "./BulkUploadModals";
 import { PipelineDock, ToastNotification } from "./PipelineDock";
 import { AdminToolsModal, ComplianceModal, GuidelinesPanel } from "./ExtraModals";
+import GuidelinesComplianceWizard from "./GuidelinesComplianceWizard";
+import GuidelinesResultPanel, { type ComplianceResult } from "./GuidelinesResultPanel";
+import ComplianceFullViewer from "./ComplianceFullViewer";
 
 export function DashboardClient() {
   const { data: session } = useSession();
@@ -68,6 +71,84 @@ export function DashboardClient() {
   const [allItems, setAllItems] = useState<RegistrySOP[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  const [guidelinesWizardOpen, setGuidelinesWizardOpen] = useState(false);
+  const [wizardMinimized, setWizardMinimized] = useState(false);
+  const [guidelinesWizardPreset, setGuidelinesWizardPreset] = useState<{
+    _id: string;
+    sopNo: string;
+  } | null>(null);
+  const [prefetchedGuidelines, setPrefetchedGuidelines] = useState<unknown[] | null>(null);
+  const [complianceCache, setComplianceCache] = useState<Record<string, ComplianceResult>>({});
+  const [viewingComplianceSopNo, setViewingComplianceSopNo] = useState<string | null>(null);
+  const [viewingComplianceFullSopNo, setViewingComplianceFullSopNo] = useState<string | null>(null);
+
+  const registryRowsForWizard = useMemo(
+    () =>
+      allItems.map((s) => ({
+        _id: s.id,
+        id: s.id,
+        sopNo: s.identifier,
+        identifier: s.identifier,
+        englishName: s.name,
+        sopName: s.name,
+        name: s.name,
+        department: s.department,
+      })),
+    [allItems],
+  );
+
+  const handleComplianceResult = useCallback(
+    (sopNo: string, sopName: string, result: Omit<ComplianceResult, "sopNo" | "sopName" | "runAt">) => {
+      const entry: ComplianceResult = {
+        sopNo,
+        sopName,
+        findings: result.findings ?? [],
+        overallScore: result.overallScore ?? 0,
+        clausesAnalyzed: result.clausesAnalyzed ?? 0,
+        guidelineDocumentsUsed: result.guidelineDocumentsUsed ?? 0,
+        runAt: new Date().toISOString(),
+        source: "dashboard-wizard",
+      };
+      setComplianceCache((prev) => ({ ...prev, [sopNo]: entry }));
+      setViewingComplianceSopNo(sopNo);
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (!guidelinesWizardOpen && !prefetchedGuidelines) {
+      fetch("/api/guidelines/upload?summary=true")
+        .then((r) => r.json())
+        .then((j) => {
+          if (j.success && Array.isArray(j.guidelines)) setPrefetchedGuidelines(j.guidelines);
+        })
+        .catch(() => {});
+    }
+  }, [guidelinesWizardOpen, prefetchedGuidelines]);
+
+  useEffect(() => {
+    fetch("/api/dashboard/sop-guideline-review?listAll=true", { cache: "no-store" })
+      .then((r) => r.json())
+      .then((json) => {
+        if (!json.success || !Array.isArray(json.results)) return;
+        const cache: Record<string, ComplianceResult> = {};
+        for (const r of json.results) {
+          cache[r.sopNo] = {
+            sopNo: r.sopNo,
+            sopName: r.sopName || "",
+            findings: Array.isArray(r.findings) ? r.findings : [],
+            overallScore: r.overallScore ?? 0,
+            clausesAnalyzed: r.clausesAnalyzed ?? 0,
+            guidelineDocumentsUsed: r.guidelineDocumentsUsed ?? 0,
+            runAt: r.runAt ? new Date(r.runAt).toISOString() : new Date().toISOString(),
+            source: r.source,
+          };
+        }
+        setComplianceCache((prev) => ({ ...cache, ...prev }));
+      })
+      .catch(() => {});
+  }, []);
 
   const {
     filters,
@@ -447,6 +528,11 @@ export function DashboardClient() {
         onExport={handleExport}
         canMutate={userCanMutate}
         isAdmin={userIsAdmin}
+        onOpenGuidelinesWizard={() => {
+          setGuidelinesWizardPreset(null);
+          setGuidelinesWizardOpen(true);
+          setWizardMinimized(false);
+        }}
       />
 
       {error && (
@@ -547,6 +633,54 @@ export function DashboardClient() {
       />
       <PipelineDock onComplete={refresh} />
       <ToastNotification />
+
+      <GuidelinesComplianceWizard
+        open={guidelinesWizardOpen}
+        minimized={wizardMinimized}
+        onClose={() => {
+          setGuidelinesWizardOpen(false);
+          setWizardMinimized(false);
+        }}
+        onMinimize={() => setWizardMinimized(true)}
+        registryRows={registryRowsForWizard}
+        prefetchedGuidelines={prefetchedGuidelines}
+        presetSop={guidelinesWizardPreset}
+        onResult={handleComplianceResult}
+      />
+
+      {viewingComplianceSopNo && complianceCache[viewingComplianceSopNo] && (
+        <GuidelinesResultPanel
+          result={complianceCache[viewingComplianceSopNo]}
+          onClose={() => setViewingComplianceSopNo(null)}
+          onRerun={() => {
+            const result = complianceCache[viewingComplianceSopNo];
+            const row = registryRowsForWizard.find((r) => String(r.sopNo) === viewingComplianceSopNo);
+            setViewingComplianceSopNo(null);
+            setGuidelinesWizardPreset({
+              _id: row ? String(row._id) : "",
+              sopNo: result.sopNo,
+            });
+            setGuidelinesWizardOpen(true);
+          }}
+        />
+      )}
+
+      {viewingComplianceFullSopNo && complianceCache[viewingComplianceFullSopNo] && (
+        <ComplianceFullViewer
+          result={complianceCache[viewingComplianceFullSopNo]}
+          onClose={() => setViewingComplianceFullSopNo(null)}
+          onRerun={() => {
+            const result = complianceCache[viewingComplianceFullSopNo];
+            const row = registryRowsForWizard.find((r) => String(r.sopNo) === viewingComplianceFullSopNo);
+            setViewingComplianceFullSopNo(null);
+            setGuidelinesWizardPreset({
+              _id: row ? String(row._id) : "",
+              sopNo: result.sopNo,
+            });
+            setGuidelinesWizardOpen(true);
+          }}
+        />
+      )}
     </div>
   );
 }

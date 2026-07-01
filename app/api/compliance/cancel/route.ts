@@ -31,24 +31,20 @@ export async function POST(request: NextRequest) {
     }
 
     const stopped = requestComplianceRunStop(sopId);
-    if (!stopped) {
-      // Run may have lost in-memory tracking (HMR) — still kill stray Codex children.
-      const killed = await killOrphanComplianceCodexProcesses();
-      if (killed > 0) {
-        return NextResponse.json({
-          success: true,
-          sopId,
-          orphanCodexKilled: killed,
-          status: "stopping",
-        });
-      }
+    const killed = await killOrphanComplianceCodexProcesses();
+    if (!stopped && killed === 0) {
       return NextResponse.json(
         { success: false, error: "No active compliance analysis to stop" },
         { status: 404 },
       );
     }
 
-    return NextResponse.json({ success: true, sopId, status: "stopping" });
+    return NextResponse.json({
+      success: true,
+      sopId,
+      orphanCodexKilled: killed,
+      status: "stopping",
+    });
   } catch (error) {
     return NextResponse.json(
       { success: false, error: error instanceof Error ? error.message : "Failed to stop analysis" },

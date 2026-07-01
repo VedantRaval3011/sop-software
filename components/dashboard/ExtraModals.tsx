@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { RegistrySOP } from "@/lib/types";
 import type { VersionDiagnosticsReport } from "@/lib/version-diagnostics";
 import { useDashboardStore } from "@/lib/store/dashboard-store";
-import { ComplianceFullViewer } from "./ComplianceFullViewer";
+import { ComplianceGuidelineDetail } from "./ComplianceGuidelineDetail";
 import { Badge, Btn, Modal } from "./ui";
 import { displaySopCode } from "@/lib/sop-display";
 
@@ -232,7 +232,7 @@ export function ComplianceModal({
             {running && <p>&gt; Analyzing...</p>}
           </div>
           {resultKey && !running && (
-            <ComplianceFullViewer
+            <ComplianceGuidelineDetail
               sopId={resultKey.sopId}
               guidelineId={resultKey.guidelineId}
               onRerun={runAnalysis}

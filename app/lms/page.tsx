@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   GraduationCap, LogOut, Search, PlayCircle, BookOpen, Clock,
-  CheckCircle2, AlertCircle, ChevronRight, Loader2, RefreshCw,
+  CheckCircle2, AlertCircle, Loader2, RefreshCw,
   FileText, ClipboardList, TrendingUp, Award,
   ArrowDown, ArrowUp, ChevronsUpDown,
 } from 'lucide-react';
@@ -17,6 +17,7 @@ import {
 } from '@/lib/lmsCache';
 import { hasGujaratiScript, isPlaceholderSopName, isInvalidSopAssignmentCode } from '@/lib/sop-name-resolution';
 import { getDeptLabelClasses, normalizeDepartment } from '@/lib/department-colors';
+import type { SopAssetFlags } from '@/app/api/lms/assets/route';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -66,6 +67,7 @@ interface DashboardCache {
   assignments: SopAssignment[];
   progress: ProgressRecord[];
   certificates: CertRecord[];
+  assets?: Record<string, SopAssetFlags>;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -241,22 +243,146 @@ function trainingStatusLabel(
   return 'Not Started';
 }
 
+// ─── Per-SOP resource quick actions ──────────────────────────────────────────
+
+interface ResourceDef {
+  kind: string;
+  label: string;
+  Icon: typeof PlayCircle;
+  enFlag: keyof SopAssetFlags;
+  guFlag: keyof SopAssetFlags;
+  enStep: string;        // journey step id for the English variant
+  guStep: string;        // journey step id for the Gujarati variant
+  primary?: boolean;     // emphasised styling for the assessment
+}
+
+const RESOURCE_DEFS: ResourceDef[] = [
+  { kind: 'video', label: 'Video',      Icon: PlayCircle,    enFlag: 'videoEn',  guFlag: 'videoGu',  enStep: 'videoEn',  guStep: 'videoGu' },
+  { kind: 'ppt',   label: 'PPT',        Icon: FileText,      enFlag: 'slidesEn', guFlag: 'slidesGu', enStep: 'slidesEn', guStep: 'slidesGu' },
+  { kind: 'sop',   label: 'SOP',        Icon: BookOpen,      enFlag: 'sop',      guFlag: 'sopGu',    enStep: 'sopPdf',   guStep: 'sopPdfGu' },
+  { kind: 'test',  label: 'Start Test', Icon: ClipboardList, enFlag: 'mcqEn',    guFlag: 'mcqGu',    enStep: 'quiz',     guStep: 'quizGu', primary: true },
+];
+
+function ResourceButtons({
+  asset,
+  onSelect,
+}: {
+  asset: SopAssetFlags;
+  onSelect: (def: ResourceDef) => void;
+}) {
+  const items = RESOURCE_DEFS.filter((d) => asset[d.enFlag] || asset[d.guFlag]);
+  if (items.length === 0) return null;
+
+  return (
+    <div className="flex flex-nowrap items-center justify-end gap-1">
+      {items.map((d) => {
+        const Icon = d.Icon;
+        const both = asset[d.enFlag] && asset[d.guFlag];
+        return (
+          <button
+            key={d.kind}
+            onClick={() => onSelect(d)}
+            title={d.label}
+            className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[11px] font-semibold transition ${
+              d.primary
+                ? 'border-purple-200 bg-purple-50 text-purple-700 hover:bg-purple-100'
+                : 'border-gray-200 bg-white text-gray-600 hover:bg-gray-50'
+            }`}
+          >
+            <Icon className="h-3.5 w-3.5" />
+            {d.label}
+            {both && (
+              <span className="ml-0.5 rounded bg-indigo-50 px-1 text-[8px] font-bold text-indigo-500">EN/ગુજ</span>
+            )}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// Language chooser shown when a resource exists in both English and Gujarati.
+function LanguagePicker({
+  def,
+  onPick,
+  onClose,
+}: {
+  def: ResourceDef;
+  onPick: (stepId: string) => void;
+  onClose: () => void;
+}) {
+  const Icon = def.Icon;
+  const what = def.kind === 'test' ? 'the assessment' : `the ${def.label}`;
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <div
+        className="mx-4 w-full max-w-xs rounded-2xl border border-gray-200 bg-white p-6 shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-purple-100">
+          <Icon className="h-6 w-6 text-purple-600" />
+        </div>
+        <h3 className="text-base font-bold text-gray-800">Choose language</h3>
+        <p className="mt-1 text-sm text-gray-500">Select the language for {what}.</p>
+        <div className="mt-4 grid grid-cols-2 gap-2">
+          <button
+            onClick={() => onPick(def.enStep)}
+            className="rounded-lg border border-gray-200 py-2.5 text-sm font-semibold text-gray-700 hover:bg-gray-50"
+          >
+            English
+          </button>
+          <button
+            onClick={() => onPick(def.guStep)}
+            className="rounded-lg bg-purple-600 py-2.5 text-sm font-semibold text-white hover:bg-purple-700"
+          >
+            ગુજરાતી
+          </button>
+        </div>
+        <button
+          onClick={onClose}
+          className="mt-3 w-full rounded-lg py-2 text-xs font-medium text-gray-500 hover:bg-gray-50"
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function TrainingTable({
   rows,
   progressMap,
   certMap,
-  onStart,
+  assetsMap,
+  onOpenStep,
   onCertificate,
   onPrefetch,
 }: {
   rows: SopAssignment[];
   progressMap: Map<string, ProgressRecord>;
   certMap: Map<string, CertRecord>;
-  onStart: (sopCode: string) => void;
+  assetsMap: Record<string, SopAssetFlags>;
+  onOpenStep: (sopCode: string, stepId: string) => void;
   onCertificate: (sopCode: string) => void;
   onPrefetch?: (sopCode: string) => void;
 }) {
   const [sort, setSort] = useState<SortState>({ key: 'sopCode', dir: 'asc' });
+  const [picker, setPicker] = useState<{ sopCode: string; def: ResourceDef } | null>(null);
+
+  // Open a resource: jump straight to it, or ask which language when both exist.
+  const selectResource = (sopCode: string, def: ResourceDef) => {
+    const asset = assetsMap[sopCode];
+    const hasEn = Boolean(asset?.[def.enFlag]);
+    const hasGu = Boolean(asset?.[def.guFlag]);
+    if (hasEn && hasGu) {
+      setPicker({ sopCode, def });
+    } else {
+      onOpenStep(sopCode, hasEn ? def.enStep : def.guStep);
+    }
+  };
 
   const sortedRows = useMemo(() => {
     const list = [...rows];
@@ -301,9 +427,10 @@ function TrainingTable({
   }, [rows, progressMap, sort]);
 
   return (
+    <>
     <div className="overflow-hidden rounded-xl border border-gray-200 bg-white shadow-sm">
       <div className="overflow-x-auto">
-        <table className="w-full min-w-[1050px] border-collapse text-sm">
+        <table className="w-full min-w-[1320px] border-collapse text-sm">
           <thead>
             <tr className="border-b border-gray-200 bg-gray-50">
               <th className="w-12 px-3 py-2.5 text-center text-[11px] font-semibold uppercase tracking-wider text-gray-500" />
@@ -314,7 +441,7 @@ function TrainingTable({
               <SortHeader label="Status" sortKey="status" sort={sort} onSort={(k) => setSort((p) => nextSort(p, k))} />
               <SortHeader label="Due" sortKey="due" sort={sort} onSort={(k) => setSort((p) => nextSort(p, k))} />
               <SortHeader label="Progress" sortKey="progress" sort={sort} onSort={(k) => setSort((p) => nextSort(p, k))} />
-              <th className="w-36 px-3 py-2.5 text-right text-[11px] font-semibold uppercase tracking-wider text-gray-500">Action</th>
+              <th className="w-80 whitespace-nowrap px-3 py-2.5 text-right text-[11px] font-semibold uppercase tracking-wider text-gray-500">Action</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-100">
@@ -398,7 +525,13 @@ function TrainingTable({
                     </div>
                   </td>
                   <td className="px-3 py-2.5 text-right">
-                    <div className="flex items-center justify-end gap-1.5">
+                    <div className="flex flex-nowrap items-center justify-end gap-1.5">
+                      {assetsMap[assignment.sopCode] && (
+                        <ResourceButtons
+                          asset={assetsMap[assignment.sopCode]}
+                          onSelect={(def) => selectResource(assignment.sopCode, def)}
+                        />
+                      )}
                       {showCertificate && (
                         <button
                           onClick={() => onCertificate(cert!.sopCode)}
@@ -409,17 +542,6 @@ function TrainingTable({
                           Certificate
                         </button>
                       )}
-                      <button
-                        onClick={() => onStart(assignment.sopCode)}
-                        className={`inline-flex items-center gap-1 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${
-                          status === 'completed'
-                            ? 'bg-gray-100 text-gray-500 hover:bg-gray-200'
-                            : 'bg-purple-600 text-white shadow hover:bg-purple-700'
-                        }`}
-                      >
-                        {status === 'completed' ? 'Review' : status === 'in_progress' ? 'Continue' : 'Start'}
-                        <ChevronRight className="h-3 w-3" />
-                      </button>
                     </div>
                   </td>
                 </tr>
@@ -429,6 +551,14 @@ function TrainingTable({
         </table>
       </div>
     </div>
+    {picker && (
+      <LanguagePicker
+        def={picker.def}
+        onPick={(stepId) => { onOpenStep(picker.sopCode, stepId); setPicker(null); }}
+        onClose={() => setPicker(null)}
+      />
+    )}
+    </>
   );
 }
 
@@ -622,6 +752,7 @@ function Dashboard({ employee, onLogout }: { employee: Employee; onLogout: () =>
   const [assignments, setAssignments] = useState<SopAssignment[]>([]);
   const [progressMap, setProgressMap] = useState<Map<string, ProgressRecord>>(new Map());
   const [certificates, setCertificates] = useState<CertRecord[]>([]);
+  const [assetsMap, setAssetsMap] = useState<Record<string, SopAssetFlags>>({});
   const [loading,  setLoading]  = useState(true);
   const [search,   setSearch]   = useState('');
   const [filter,   setFilter]   = useState<FilterTab>('all');
@@ -634,30 +765,35 @@ function Dashboard({ employee, onLogout }: { employee: Employee; onLogout: () =>
       for (const p of cached.value.progress || []) map.set(p.sopCode, p);
       setProgressMap(map);
       setCertificates(cached.value.certificates || []);
+      setAssetsMap(cached.value.assets || {});
       setLoading(false);
       if (Date.now() - cached.cachedAt <= LMS_CLIENT_FRESH_MS) return;
     } else {
       setLoading(true);
     }
     try {
-      const [meRes, progressRes, certRes] = await Promise.all([
+      const [meRes, progressRes, certRes, assetsRes] = await Promise.all([
         fetch('/api/lms/auth/me'),
         fetch('/api/lms/progress'),
         fetch('/api/lms/certificates'),
+        fetch('/api/lms/assets'),
       ]);
       if (meRes.status === 401) { router.push('/lms'); return; }
       const meData    = await meRes.json();
       const progData  = await progressRes.json();
       const certData  = certRes.ok ? await certRes.json() : { certificates: [] };
+      const assetData = assetsRes.ok ? await assetsRes.json() : { assets: {} };
       const assignments = validAssignments(meData.assignments || []);
       const progress = (progData.progress || []) as ProgressRecord[];
       const certificates = certData.certificates || [];
+      const assets = (assetData.assets || {}) as Record<string, SopAssetFlags>;
       setAssignments(assignments);
       const map = new Map<string, ProgressRecord>();
       for (const p of progress) map.set(p.sopCode, p);
       setProgressMap(map);
       setCertificates(certificates);
-      writeLmsClientCache(lmsClientFields.dashboard, { assignments, progress, certificates });
+      setAssetsMap(assets);
+      writeLmsClientCache(lmsClientFields.dashboard, { assignments, progress, certificates, assets });
     } finally {
       setLoading(false);
     }
@@ -673,6 +809,11 @@ function Dashboard({ employee, onLogout }: { employee: Employee; onLogout: () =>
 
   const handleOpen = useCallback((sopCode: string) => {
     router.push(`/lms/journey/${sopCode}`);
+  }, [router]);
+
+  // Deep-link straight to a specific resource (video / PPT / SOP / assessment).
+  const handleOpenStep = useCallback((sopCode: string, stepId: string) => {
+    router.push(`/lms/journey/${sopCode}?step=${stepId}`);
   }, [router]);
 
   const handleCertificate = useCallback((sopCode: string) => {
@@ -872,7 +1013,8 @@ function Dashboard({ employee, onLogout }: { employee: Employee; onLogout: () =>
                   rows={filtered}
                   progressMap={progressMap}
                   certMap={certMap}
-                  onStart={handleOpen}
+                  assetsMap={assetsMap}
+                  onOpenStep={handleOpenStep}
                   onCertificate={handleCertificate}
                   onPrefetch={prefetchJourney}
                 />

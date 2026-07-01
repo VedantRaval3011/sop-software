@@ -1,5 +1,6 @@
 import type { LlmProvider } from "@/lib/llm";
 import type { ComplianceFinding } from "@/lib/complianceEngine";
+import type { TraceabilityMatrixEntry } from "@/lib/complianceEngine";
 import { analyzeSOPComplianceV5, type SopLibraryEntry } from "@/lib/complianceEngineV5";
 import { saveComplianceReport } from "@/lib/complianceReportStorage";
 import {
@@ -7,6 +8,7 @@ import {
   persistComplianceFindings,
 } from "@/lib/compliance-finding-store";
 import { runIncrementalComplianceReview } from "@/lib/compliance-incremental";
+import { computeWeightedScoreBreakdown } from "@/lib/complianceClassification";
 import { getOrBuildComplianceStructure } from "@/lib/compliance-sop-cache";
 import { hashGuidelineSet, hashSingleGuideline, hashSopContent } from "@/lib/compliance-hashes";
 import type { IComplianceFindingDetail } from "@/models/ComplianceReport";
@@ -35,6 +37,8 @@ export type RunComplianceReviewInput = {
   mode?: ComplianceReviewMode;
   forceRefresh?: boolean;
   runEpoch?: number;
+  /** When set, only these guidelines are re-analyzed; other findings are kept from the last report. */
+  scopedGuidelineIds?: string[];
 };
 
 export type ComplianceReviewOutput = {
@@ -98,7 +102,7 @@ function fromStoredFinding(f: IComplianceFindingDetail): ComplianceFinding {
   };
 }
 
-function deriveComplianceStatus(score: number): string {
+function deriveComplianceStatus(score: number): "Fully Compliant" | "Partially Compliant" | "Non-Compliant" {
   if (score >= 8) return "Fully Compliant";
   if (score >= 5) return "Partially Compliant";
   return "Non-Compliant";
@@ -212,8 +216,19 @@ export async function runComplianceReview(
       const fresh = (existingReport.findings as IComplianceFindingDetail[])
         .filter((f) => f.guidelineId?.toString() === id)
         .map(fromStoredFinding);
-      cachedFindings.push(...fresh);
-      console.log(`[orchestrator] guideline ${id}: cache hit (${fresh.length} findings reused)`);
+      // Don't reuse a cached result where every finding is analysis-failed —
+      // that means the AI call failed last time and we should retry.
+      const allFailed =
+        fresh.length > 0 && fresh.every((f) => f.complianceLevel === "analysis-failed");
+      if (allFailed) {
+        staleClauses.push(...clauses);
+        console.log(
+          `[orchestrator] guideline ${id}: cache invalidated — all ${fresh.length} findings were analysis-failed, retrying`,
+        );
+      } else {
+        cachedFindings.push(...fresh);
+        console.log(`[orchestrator] guideline ${id}: cache hit (${fresh.length} findings reused)`);
+      }
     } else {
       staleClauses.push(...clauses);
     }
@@ -254,48 +269,91 @@ export async function runComplianceReview(
     model: input.model,
   });
 
+  const scopedIds = input.scopedGuidelineIds?.length
+    ? new Set(input.scopedGuidelineIds)
+    : null;
+  const scopedNames = scopedIds
+    ? new Set(input.guidelineClauses.map((c) => c.guidelineName))
+    : null;
+
+  let findingsToSave = result.findings;
+  let traceabilityMatrix = result.traceabilityMatrix ?? [];
+  let scoreBreakdown = result.scoreBreakdown;
+  let overallScore = result.overallScore;
+  let complianceStatus = result.complianceStatus;
+
+  if (scopedIds && scopedNames && existingReport) {
+    const preservedFindings = (existingReport.findings as IComplianceFindingDetail[])
+      .filter((f) => !scopedIds.has(f.guidelineId?.toString() ?? ""))
+      .map(fromStoredFinding);
+    findingsToSave = [...preservedFindings, ...result.findings];
+
+    const preservedMatrix = (existingReport.traceabilityMatrix ?? []).filter(
+      (e) => !scopedNames.has(e.guidelineName),
+    ) as TraceabilityMatrixEntry[];
+    traceabilityMatrix = [...preservedMatrix, ...traceabilityMatrix];
+
+    scoreBreakdown = computeWeightedScoreBreakdown(findingsToSave);
+    overallScore = scoreBreakdown.score;
+    complianceStatus = deriveComplianceStatus(overallScore);
+  }
+
   const saved = await saveComplianceReport({
     sopId: input.sop._id.toString(),
     sopIdentifier: input.sop.identifier,
     sopName: input.sop.name,
     sopVersion: input.sop.version ?? "1.0",
     department: input.sop.department,
-    findings: result.findings,
-    overallScore: result.overallScore,
-    complianceStatus: result.complianceStatus,
-    scoreBreakdown: result.scoreBreakdown,
-    traceabilityMatrix: result.traceabilityMatrix,
+    findings: findingsToSave,
+    overallScore,
+    complianceStatus,
+    scoreBreakdown,
+    traceabilityMatrix,
     crossSopDependencies: result.crossSopDependencies,
     clauseCoveragePct: result.clauseCoveragePct,
     auditCompleteness: result.auditCompleteness,
     analysisEngineVersion: result.analysisEngineVersion,
   });
 
+  const mergedGuidelineHashes =
+    scopedIds && storedHashes
+      ? new Map([...storedHashes.entries(), ...newGuidelineHashes.entries()])
+      : newGuidelineHashes;
+
   await ComplianceReport.updateOne(
     { _id: saved?._id },
-    { $set: { sopContentHash, guidelineSetHash: guidelineHash, guidelineHashes: newGuidelineHashes } },
+    {
+      $set: {
+        sopContentHash,
+        guidelineSetHash:
+          scopedIds && (existingReport as { guidelineSetHash?: string } | null)?.guidelineSetHash
+            ? (existingReport as { guidelineSetHash?: string }).guidelineSetHash
+            : guidelineHash,
+        guidelineHashes: mergedGuidelineHashes,
+      },
+    },
   );
 
   const persistResult = await persistComplianceFindings({
     sopId: input.sop._id.toString(),
     reportId: saved?._id?.toString(),
-    findings: result.findings,
+    findings: findingsToSave,
     structure,
   });
 
   return {
     mode: "initial",
-    overallScore: result.overallScore,
-    complianceStatus: result.complianceStatus,
-    compliantCount: result.compliantCount,
-    partialCount: result.partialCount,
-    nonCompliantCount: result.nonCompliantCount,
-    criticalCount: result.criticalCount ?? 0,
-    majorCount: result.majorCount ?? 0,
-    minorCount: result.minorCount ?? 0,
-    improvementCount: result.improvementCount ?? 0,
+    overallScore,
+    complianceStatus,
+    compliantCount: findingsToSave.filter((f) => f.complianceLevel === "compliant").length,
+    partialCount: findingsToSave.filter((f) => f.complianceLevel === "partial").length,
+    nonCompliantCount: findingsToSave.filter((f) => f.complianceLevel === "non-compliant").length,
+    criticalCount: findingsToSave.filter((f) => f.findingCategory === "Critical Non-Compliance").length,
+    majorCount: findingsToSave.filter((f) => f.findingCategory === "Major Gap").length,
+    minorCount: findingsToSave.filter((f) => f.findingCategory === "Minor Gap").length,
+    improvementCount: findingsToSave.filter((f) => f.findingCategory === "Improvement Opportunity").length,
     clauseCoveragePct: result.clauseCoveragePct ?? 0,
-    totalGuidelinesChecked: result.totalGuidelinesChecked ?? 0,
+    totalGuidelinesChecked: findingsToSave.length,
     processingTimeMs: result.processingTimeMs ?? Date.now() - start,
     findingsPersisted: persistResult.persisted,
     findingsSkipped: persistResult.skipped,

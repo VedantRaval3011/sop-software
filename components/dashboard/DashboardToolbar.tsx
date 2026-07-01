@@ -32,6 +32,7 @@ interface DashboardToolbarProps {
   onExport: () => void;
   canMutate: boolean;
   isAdmin: boolean;
+  onOpenGuidelinesWizard?: () => void;
 }
 
 export function DashboardToolbar({
@@ -40,6 +41,7 @@ export function DashboardToolbar({
   onHardRefresh,
   canMutate,
   isAdmin,
+  onOpenGuidelinesWizard,
 }: DashboardToolbarProps) {
   const router = useRouter();
   const {
@@ -192,6 +194,16 @@ export function DashboardToolbar({
         >
           <Shield className="h-3 w-3" /> Compliance Engine
         </Btn>
+
+        {onOpenGuidelinesWizard && (
+          <Btn
+            size="sm"
+            className="border-indigo-200 bg-indigo-50 text-indigo-700 hover:bg-indigo-100"
+            onClick={onOpenGuidelinesWizard}
+          >
+            <BookOpen className="h-3 w-3" /> Guideline Review
+          </Btn>
+        )}
 
         {/* MCQ Bank – slate outlined */}
         <Btn
